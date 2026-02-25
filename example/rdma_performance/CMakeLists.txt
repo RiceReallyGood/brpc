@@ -66,7 +66,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     endif()
 endif()
 
-set(CMAKE_CPP_FLAGS "${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_RDMA=1")
+set(CMAKE_CPP_FLAGS "${DEFINE_CLOCK_GETTIME}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -DNDEBUG -O2 -D__const__=__unused__ -pipe -W -Wall -Wno-unused-parameter -fPIC -fno-omit-frame-pointer")
 
 if(CMAKE_VERSION VERSION_LESS "3.1.3")
@@ -97,11 +97,7 @@ endif()
 find_package(OpenSSL)
 include_directories(${OPENSSL_INCLUDE_DIR})
 
-find_path(RDMA_INCLUDE_PATH NAMES infiniband/verbs.h)
 find_library(RDMA_LIB NAMES ibverbs)
-if ((NOT RDMA_INCLUDE_PATH) OR (NOT RDMA_LIB))
-    message(FATAL_ERROR "Fail to find ibverbs")
-endif()
 
 set(DYNAMIC_LIB
     ${CMAKE_THREAD_LIBS_INIT}
@@ -113,6 +109,13 @@ set(DYNAMIC_LIB
     ${THRIFT_LIB}
     dl
     )
+
+if (RDMA_LIB)
+    set(DYNAMIC_LIB
+        ${DYNAMIC_LIB}
+        ${RDMA_LIB}
+    )
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(DYNAMIC_LIB ${DYNAMIC_LIB}

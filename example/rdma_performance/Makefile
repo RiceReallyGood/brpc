@@ -58,11 +58,7 @@ else ifeq ($(SYSTEM),Linux)
 endif
 
 .PHONY:all
-ifdef WITH_RDMA
 all: client server
-else
-all: 
-endif
 
 .PHONY:clean
 clean:

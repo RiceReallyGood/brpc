@@ -102,7 +102,7 @@ cc_binary(
     includes = [
         "rdma_performance",
     ],
-    copts = COPTS + ["-DBRPC_WITH_RDMA=1"],
+    copts = COPTS,
     deps = [
         ":cc_rdma_performance_proto",
         "//:brpc",
@@ -117,7 +117,7 @@ cc_binary(
     includes = [
         "rdma_performance",
     ],
-    copts = COPTS + ["-DBRPC_WITH_RDMA=1"],
+    copts = COPTS,
     deps = [
         ":cc_rdma_performance_proto",
         "//:brpc",
