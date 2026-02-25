@@ -16,6 +16,7 @@
 // under the License.
 
 
+#include <dirent.h>
 #include <gflags/gflags.h>
 #include "butil/atomicops.h"
 #include "butil/logging.h"
@@ -24,12 +25,44 @@
 #include "bvar/variable.h"
 #include "test.pb.h"
 
-#ifdef BRPC_WITH_RDMA
-
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_bool(use_rdma, true, "Use RDMA or not");
 
 butil::atomic<uint64_t> g_last_time(0);
+butil::atomic<int> g_use_rdma_transport(0);
+
+namespace {
+
+bool HasRdmaDevice() {
+    DIR* dir = opendir("/sys/class/infiniband");
+    if (!dir) {
+        return false;
+    }
+    bool has_device = false;
+    struct dirent* entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        has_device = true;
+        break;
+    }
+    closedir(dir);
+    return has_device;
+}
+
+bool ShouldTryRdma() {
+    if (!FLAGS_use_rdma) {
+        return false;
+    }
+    if (!HasRdmaDevice()) {
+        LOG(WARNING) << "No RDMA device detected, falling back to TCP.";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 namespace test {
 class PerfTestServiceImpl : public PerfTestService {
@@ -64,6 +97,7 @@ public:
 
 int main(int argc, char* argv[]) {
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    g_use_rdma_transport.store(ShouldTryRdma() ? 1 : 0, butil::memory_order_relaxed);
 
     brpc::Server server;
     test::PerfTestServiceImpl perf_test_service_impl;
@@ -76,22 +110,26 @@ int main(int argc, char* argv[]) {
     g_last_time.store(0, butil::memory_order_relaxed);
 
     brpc::ServerOptions options;
-    options.socket_mode = FLAGS_use_rdma? brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
+    options.socket_mode = g_use_rdma_transport.load(butil::memory_order_relaxed) ?
+        brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
     if (server.Start(FLAGS_port, &options) != 0) {
-        LOG(ERROR) << "Fail to start EchoServer";
-        return -1;
+        if (options.socket_mode == brpc::SOCKET_MODE_RDMA) {
+            g_use_rdma_transport.store(0, butil::memory_order_relaxed);
+            LOG(WARNING) << "Fail to start server with RDMA, fallback to TCP.";
+            options.socket_mode = brpc::SOCKET_MODE_TCP;
+            if (server.Start(FLAGS_port, &options) != 0) {
+                LOG(ERROR) << "Fail to start server with TCP after fallback";
+                return -1;
+            }
+        } else {
+            LOG(ERROR) << "Fail to start EchoServer";
+            return -1;
+        }
     }
 
+    LOG(INFO) << "rdma_performance server started in "
+              << (g_use_rdma_transport.load(butil::memory_order_relaxed) ? "RDMA" : "TCP")
+              << " mode.";
     server.RunUntilAskedToQuit();
     return 0;
 }
-
-#else
-
-
-int main(int argc, char* argv[]) {
-    LOG(ERROR) << " brpc is not compiled with rdma. To enable it, please refer to https://github.com/apache/brpc/blob/master/docs/en/rdma.md";
-    return 0;
-}
-
-#endif

@@ -17,20 +17,18 @@
 
 #include <stdlib.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <vector>
 #include <gflags/gflags.h>
 #include "butil/atomicops.h"
 #include "butil/fast_rand.h"
 #include "butil/logging.h"
-#include "brpc/rdma/rdma_helper.h"
 #include "brpc/server.h"
 #include "brpc/channel.h"
 #include "bthread/bthread.h"
 #include "bvar/latency_recorder.h"
 #include "bvar/variable.h"
 #include "test.pb.h"
-
-#ifdef BRPC_WITH_RDMA
 
 DEFINE_int32(thread_num, 0, "How many threads are used");
 DEFINE_int32(queue_depth, 1, "How many requests can be pending in the queue");
@@ -56,8 +54,43 @@ butil::atomic<uint64_t> g_total_cnt;
 std::vector<std::string> g_servers;
 int rr_index = 0;
 volatile bool g_stop = false;
+butil::atomic<int> g_use_rdma_transport(0);
+butil::atomic<int> g_rdma_fallback_logged(0);
 
 butil::atomic<int64_t> g_token(10000);
+
+namespace {
+
+bool HasRdmaDevice() {
+    DIR* dir = opendir("/sys/class/infiniband");
+    if (!dir) {
+        return false;
+    }
+    bool has_device = false;
+    struct dirent* entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        has_device = true;
+        break;
+    }
+    closedir(dir);
+    return has_device;
+}
+
+bool ShouldTryRdma() {
+    if (!FLAGS_use_rdma) {
+        return false;
+    }
+    if (!HasRdmaDevice()) {
+        LOG(WARNING) << "No RDMA device detected, falling back to TCP.";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 static void* GenerateToken(void* arg) {
     int64_t start_time = butil::monotonic_time_ns();
@@ -102,7 +135,8 @@ public:
 
     int Init() {
         brpc::ChannelOptions options;
-        options.socket_mode = FLAGS_use_rdma? brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
+        options.socket_mode = g_use_rdma_transport.load(butil::memory_order_relaxed) ?
+            brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
         options.protocol = FLAGS_protocol;
         options.connection_type = FLAGS_connection_type;
         options.timeout_ms = FLAGS_rpc_timeout_ms;
@@ -110,8 +144,22 @@ public:
         std::string server = g_servers[(rr_index++) % g_servers.size()];
         _channel = new brpc::Channel();
         if (_channel->Init(server.c_str(), &options) != 0) {
-            LOG(ERROR) << "Fail to initialize channel";
-            return -1;
+            if (options.socket_mode == brpc::SOCKET_MODE_RDMA) {
+                g_use_rdma_transport.store(0, butil::memory_order_relaxed);
+                if (g_rdma_fallback_logged.exchange(1, butil::memory_order_relaxed) == 0) {
+                    LOG(WARNING) << "Fail to initialize channel with RDMA, fallback to TCP.";
+                }
+                delete _channel;
+                _channel = new brpc::Channel();
+                options.socket_mode = brpc::SOCKET_MODE_TCP;
+                if (_channel->Init(server.c_str(), &options) != 0) {
+                    LOG(ERROR) << "Fail to initialize channel with TCP after fallback";
+                    return -1;
+                }
+            } else {
+                LOG(ERROR) << "Fail to initialize channel";
+                return -1;
+            }
         }
         brpc::Controller cntl;
         test::PerfTestResponse response;
@@ -222,7 +270,7 @@ void Test(int thread_num, int attachment_size) {
     std::cout << "[Threads: " << thread_num
         << ", Depth: " << FLAGS_queue_depth
         << ", Attachment: " << attachment_size << "B"
-        << ", RDMA: " << (FLAGS_use_rdma ? "yes" : "no")
+        << ", RDMA: " << (g_use_rdma_transport.load(butil::memory_order_relaxed) ? "yes" : "no")
         << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no]")
         << std::endl;
     g_total_bytes.store(0, butil::memory_order_relaxed);
@@ -273,11 +321,7 @@ void Test(int thread_num, int attachment_size) {
 
 int main(int argc, char* argv[]) {
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
-
-    // Initialize RDMA environment in advance.
-    if (FLAGS_use_rdma) {
-        brpc::rdma::GlobalRdmaInitializeOrDie();
-    }
+    g_use_rdma_transport.store(ShouldTryRdma() ? 1 : 0, butil::memory_order_relaxed);
 
     brpc::StartDummyServerAt(FLAGS_dummy_port);
 
@@ -310,12 +354,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
-#else
-
-int main(int argc, char* argv[]) {
-    LOG(ERROR) << " brpc is not compiled with rdma. To enable it, please refer to https://github.com/apache/brpc/blob/master/docs/en/rdma.md";
-    return 0;
-}
-
-#endif
