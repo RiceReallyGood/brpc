@@ -42,6 +42,9 @@
 | D8 | `Socket::WriteRequest` 在 `BRPC_LATENCY_TRACE` 编译开关下由 64 字节扩到 128 | 该结构体当前正好占满一个 cacheline 且零填充（`socket.cpp:2954` 有 `BAIDU_CASSERT(sizeof(WriteRequest) == 64)`），无空位可用 |
 | D9 | 重试/backup request 每次 attempt 独立一条记录，带 attempt 序号 | HTML 默认只画最终成功的那次，失败 attempt 可勾选显示 |
 | D10 | 同步与异步 RPC 都支持 | 区别仅在「客户端回调处理」跑在哪个执行体，点位本身不变 |
+| D11 | 服务端**不**为「`svc->CallMethod()` 返回」单设点位 | 该时刻与 `S10`（`SendRpcResponse` 入口）的先后**在同步/异步实现下相反**，插入线性序列会破坏单调性。见 §4.3 |
+| D12 | `srv_dispatch`（S06→S07）暂不再细拆出 `ConcurrencyLimiter` | 用户决定；若后续怀疑限流排队是长尾主因，再单独加点位 |
+| D13 | 单次打点开销由 Phase 0 在 suzhou950 上实测 | 用户处无现成数据 |
 
 ---
 
@@ -130,6 +133,26 @@
 | S15 | `write_enqueue` | `Socket::Write()` 入口 |
 | S16 | `write_start` | `Socket::DoWrite()` 中 `CutFromIOBufList()` 前 |
 | S17 | `write_end` | 同 C08 |
+
+
+### 4.3 为什么不为「`svc->CallMethod()` 返回」设点位
+
+服务端的 `done` 是一个包裹 `SendRpcResponse` 的 closure（`baidu_rpc_protocol.cpp:853-857`），经 `svc->CallMethod(..., done)` 传给用户实现（`:867` / `:872`）。**它何时执行完全由用户的 service 实现决定**，brpc 不介入：
+
+- **同步实现**：`brpc::ClosureGuard done_guard(done);` 置于函数开头，作用域结束时析构并 `_done->Run()`（`closure_guard.h:37-41`）。于是 `SendRpcResponse` 在 `CallMethod` **返回之前**已经跑完。
+- **异步实现**：调用 `done_guard.release()` 交出所有权后立即返回，`done->Run()` 由后续某个执行体触发。
+
+因此两个候选点位的先后顺序在两种实现下**相反**：
+
+| 点位 | 同步实现 | 异步实现 |
+|---|---|---|
+| `S09` = `svc->CallMethod()` 调用前 | 1 | 1 |
+| `S10` = `SendRpcResponse` 入口 | 2 | 3 |
+| （候选）`svc->CallMethod()` 返回 | 3 | 2 |
+
+增设该候选点位仅在异步实现下有价值（可把业务处理拆为「占用框架执行体的同步部分」与「执行体已释放的异步等待」两段），但它会破坏 36 点位序列的单调性，而「相邻点位之差 = 一个分解项」与 §10 的单调性断言均以单调为前提。故不设。
+
+`S10` 取 `SendRpcResponse` 入口在两种实现下语义一致：即「业务宣告处理完成」的时刻。若日后需要分析异步 service 的等待分解，应另设可选点位，不并入主序列。
 
 ---
 
