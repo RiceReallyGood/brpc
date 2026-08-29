@@ -295,8 +295,8 @@ link_up = link_down = L / 2
 |---|---|---|
 | `trace_id` | `uint64` | 跨进程唯一 |
 | `base_counter` | `uint64` | 本进程原始计数器基准（aarch64: `cntvct_el0`；x86: TSC） |
-| `ts[36]` | `uint32 × 36` | 相对 `base_counter` 的偏移，`0` = 未采集 |
-| `handle_seq` | `uint64` | generation 校验用 |
+| `slot_seq` | `uint64` | generation 校验用。**置于 `ts[]` 之前**，与实现一致 |
+| `ts[36]` | `uint32 × 36` | 相对 `base_counter` 的偏移，`0` = 未采集；`0xFFFFFFFF` = 该模式下不存在（见 §8.5） |
 | `socket_id` | `uint32` | |
 | `remote_ip` / `remote_port` | `uint32` / `uint16` | |
 | `role` / `attempt` | `uint8` / `uint8` | client / server；重试序号 |
