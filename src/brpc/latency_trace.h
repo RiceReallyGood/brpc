@@ -19,7 +19,6 @@
 #define BRPC_LATENCY_TRACE_H
 
 #include <stdint.h>
-#include <type_traits>
 
 namespace brpc {
 
