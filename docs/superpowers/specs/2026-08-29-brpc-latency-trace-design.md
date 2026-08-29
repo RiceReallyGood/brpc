@@ -73,7 +73,10 @@
 | `RpcRequestMeta` 已用 tag 1-8，tag 9 空闲 | `baidu_rpc_meta.proto:42-49` | 新字段用 tag 9 |
 | rpcz 的 `trace_id`/`span_id` 填充绑死在 `IsTraceable()` 上 | `channel.cpp:539`，`baidu_rpc_protocol.cpp:671` | 复用会牵动 rpcz 采样逻辑，故新增独立字段 |
 | RDMA 写侧完全共用 `Socket::Write` → `DoWrite` → `_transport->CutFromIOBufList()` | `socket.cpp:1902`，`rdma_transport.cpp:100` | 写侧点位零增量 |
-| RDMA 数据面 `_on_edge_trigger` 亦为 `InputMessenger::OnNewMessages` | `rdma_transport.cpp:54` | 收侧仅 wake 点位需单独处理 |
+| RDMA **数据面**另建一个 CQ 专用 socket（fd = `comp_channel->fd`），其 `on_edge_triggered_events = PollCq` | `rdma_endpoint.cpp:1135`，`PollCq` 在 `:1469` | 收侧 OnEdge 回调是 `PollCq` 而**非** `InputMessenger::OnNewMessages` |
+| `rdma_transport.cpp:52/54` 的 if/else 只管**握手**（走 RDMA socket 的 TCP fd），与数据面无关 | `rdma_transport.cpp:44-56` 及其注释 | 不可据此推断数据面路径 |
+| 轮询模式（`-rdma_use_polling`）由独立 poller 线程死循环调 `PollCq`，不经 epoll、无 OnEdge bthread | `rdma_endpoint.cpp:1733` | `wake` / `onedge_start` 两个点位在该模式下**物理上不存在** |
+| RDMA 与 TCP 两条收包路径在 `InputMessenger::ProcessNewMessage` 汇合 | `rdma_endpoint.cpp:1599` | `msg_recv_done` 可共用 |
 | aarch64 上 `cpuwide_time_ns()` 读 `cntvct_el0`，架构保证全系统一致 | `butil/time.h:227` | 同机跨核可比；跨机需靠 D1 的公式 |
 
 ---
@@ -331,14 +334,18 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 
 ### 8.4 RDMA 差异
 
-| 侧 | 差异 |
-|---|---|
-| 写 | **零增量**。共用 `Socket::Write` → `StartWrite`/`KeepWrite` → `DoWrite`，仅末跳换成 `_rdma_ep->CutFromIOBufList()`（`rdma_transport.cpp:100`） |
-| 收 | 仅 `wake` 点位不同：轮询模式下换成「该 CQE 被 `ibv_poll_cq` 取出的时刻」（`rdma_endpoint.cpp:1500` 附近）。`OnEdge` / `readv_start` / `msg_recv_done` 共用（`rdma_transport.cpp:54`） |
+**写侧零增量**：共用 `Socket::Write` → `StartWrite`/`KeepWrite` → `DoWrite`，仅末跳换成 `_rdma_ep->CutFromIOBufList()`（`socket.cpp:1902`，`rdma_transport.cpp:100`）。`write_end` 一律取 `ibv_post_send` 返回时刻，**不取 send CQE**：RC 的 send completion 隐含对端 ACK，会把一个单程链路时间错算进「write 接口时间」，破坏 §6 的语义。
 
-`write_end` 一律取 `ibv_post_send` 返回时刻，**不取 send CQE**：RC 的 send completion 隐含对端 ACK，会把一个单程链路时间错算进「write 接口时间」，破坏 §6 的语义。
+**收侧不共用**。RDMA 数据面另建一个 CQ 专用 socket，其 OnEdge 回调是 `RdmaEndpoint::PollCq`（`rdma_endpoint.cpp:1135` / `:1469`），而不是 `InputMessenger::OnNewMessages`。且 RDMA 有两种收包模式，点位语义各不相同：
 
----
+| 点位 | TCP | RDMA 事件模式 | RDMA 轮询模式（`-rdma_use_polling`） |
+|---|---|---|---|
+| `wake` | `epoll_wait` 返回 | `comp_channel->fd` 的 epoll 唤醒（`GetAndAckEvents`） | **不存在**：无唤醒事件 |
+| `onedge_start` | `Transport::OnEdge` 入口 | 同左（回调为 `PollCq`） | **不存在**：poller 线程直接调 `PollCq`（`:1733`），无 bthread 切换 |
+| `readv_start` | `m->DoRead()` 前 | `ibv_poll_cq()` 前（`:1500`） | 同左 |
+| `msg_recv_done` | `ProcessNewMessage` 内 | **共用**（`:1599` 调用同一函数） | **共用** |
+
+**轮询模式下 `wake` 与 `onedge_start` 记为哨兵值而非 0**，分析工具将 `cli_wake_to_onedge` / `cli_onedge_to_readv` / `srv_wake_to_onedge` / `srv_onedge_to_readv` 四项判定为 N/A 并在 HTML 中显式标注「该模式下不存在」。这四项恒为零是物理真实（轮询以 CPU 占用换掉了这段延迟），但若不标注会被误读为埋点缺失。Σ 恒等式不受影响 —— N/A 项以 0 参与求和，而这些区间的真实长度确实为 0。
 
 ## 9. 分析工具 `tools/latency_trace/`
 
@@ -404,7 +411,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 | 2 | TCP + baidu_std 全部 36 点位埋点 | 端到端跑通，36 点位齐全且单调 |
 | 3 | 落盘 + `merge.py` | `Σ` 恒等断言通过，join 率 100% |
 | 4 | HTML 渲染 | 1 万~10 万条可交互，hover 与缩放可用 |
-| 5 | RDMA（仅 `wake` 点位） | TCP / RDMA 分解对比图 |
+| 5 | RDMA 收侧三点位（`wake` / `onedge_start` / `readv_start`）在 `PollCq` 中重新实现，并区分事件模式与轮询模式；写侧零增量 | TCP / RDMA 分解对比图；轮询模式下四项正确标注为 N/A |
 
 ---
 
@@ -417,3 +424,4 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 | 跨机网络本身上下行不对称 | 模型 A 强制对称，模型 B 的 `O` 会带该不对称的系统性偏差；但**两模型的总链路时间与总柱高均不受影响** |
 | 追踪构建与生产构建 ABI 不同 | 文档明示；两端必须使用同一构建配置 |
 | 缓冲满后停止记录导致窗口截断 | 文件头记录丢弃数；HTML 显式提示窗口是否被截断 |
+| RDMA 轮询模式下收包排队相关四项恒为 0，易被误读为埋点缺失 | 记哨兵值而非 0，HTML 标注「该模式下不存在」；见 §8.4 |
