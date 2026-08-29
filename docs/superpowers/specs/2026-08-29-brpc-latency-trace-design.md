@@ -1,0 +1,419 @@
+# brpc 请求级时延打点与端到端分解分析 — 设计文档
+
+- 日期：2026-08-29
+- 分支：`latency-trace`
+- 基准：`master @ 4047c4e0`（BRPC_REVISION 1.17.0）
+
+---
+
+## 1. 目标
+
+在 brpc 的客户端与服务端各插入一组细粒度时间戳，使得**单次 RPC 的端到端时延可以被无损分解**成 35 个分解项（33 个连续区间 + 2 个派生链路项）；两端数据各自落盘后离线合并，生成一个可交互的 HTML 累积柱状图 —— 横轴按端到端时延排序，纵轴为累积时延，从而直接读出长尾时延的来源。
+
+### 1.1 成功判据
+
+1. 对每条成功 join 的记录，`Σ(35 个分解项) == C19 − C01`（客户端 RPC 起止之差），代数恒等，单测断言。
+2. 36 个点位在正常路径上全部非零且时间戳单调不减。
+3. 打点开销经 microbenchmark 实测，并据此确定最终点位集。
+4. HTML 支持 1 万~10 万条记录的渲染与逐请求 hover 下钻。
+
+### 1.2 非目标
+
+- 不替代、不修改 rpcz 的现有行为。两套机制独立共存。
+- 不覆盖 baidu_std 以外的协议（HTTP/h2、nshead 系、redis 等）。
+- 不做在线聚合、不做分布式采集服务。数据靠人工汇总。
+- 不追求生产环境常开。这是压测/诊断工具，默认编译期关闭。
+
+---
+
+## 2. 已确定的关键决策
+
+以下决策来自与用户的逐条讨论，是本设计的输入，不再重新论证。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D1 | 支持跨机测试；链路时间用 `((t_cli_wake − t_cli_write_end) − (t_srv_write_end − t_srv_wake)) / 2` | 两个括号都是进程内差值，同时免疫时钟**偏移**与**频率漂移** |
+| D2 | 链路拆分同时实现「逐请求对半分」与「每连接滑窗估 offset」两种模型，HTML 下拉切换 | 二者总链路时间恒等，仅上下行劈分不同；结果差异大的请求即归因污染重的请求，本身是信号 |
+| D3 | 覆盖范围：baidu_std + TCP + RDMA | RDMA 写侧完全共用 `Socket::DoWrite`，增量仅「wake」一个点位 |
+| D4 | 两端各自落本地文件，人工汇总后喂给分析工具 | 零网络依赖，压测期间不引入额外流量 |
+| D5 | 相邻点位之间的**每一段**都是具名分解项（共 35 项），不设「其它」兜底桶 | 长尾若出在 LB 选连接或服务端限流排队上，必须能直接看到 |
+| D6 | 数据量级 1 万~10 万条；Canvas 渲染，每条一根柱子 + 命中测试 + 框选缩放 | 保真度最高，无需聚合 |
+| D7 | 采用「定长记录槽 + 8 字节 handle 透传」方案 | 见 §7 的方案对比 |
+| D8 | `Socket::WriteRequest` 在 `BRPC_LATENCY_TRACE` 编译开关下由 64 字节扩到 128 | 该结构体当前正好占满一个 cacheline 且零填充（`socket.cpp:2954` 有 `BAIDU_CASSERT(sizeof(WriteRequest) == 64)`），无空位可用 |
+| D9 | 重试/backup request 每次 attempt 独立一条记录，带 attempt 序号 | HTML 默认只画最终成功的那次，失败 attempt 可勾选显示 |
+| D10 | 同步与异步 RPC 都支持 | 区别仅在「客户端回调处理」跑在哪个执行体，点位本身不变 |
+
+---
+
+## 3. 现状与约束
+
+### 3.1 rpcz 为什么不能直接复用
+
+| 方面 | rpcz 现状 | 对本需求的障碍 |
+|---|---|---|
+| 点位数 | `Span` 只有 5 个时间戳：`received` / `start_parse` / `start_callback` / `start_send` / `sent` | 需要的 36 个点位绝大多数不存在，且事件级点位与 write 侧点位 Span 完全没有覆盖 |
+| 存储 | 每进程两个 leveldb（`id_db` + `time_db`），每 span 一次 protobuf 序列化 + 两次写（`span.cpp:689`） | 单条开销在微秒级，正好污染要测量的长尾 |
+| 采样 | `bvar::Collector` 自适应限速采样 | 无法保证覆盖尾部请求 |
+| 数据模型 | 树形嵌套（`repeated RpczSpan client_spans`） | 需要的是扁平定长向量 |
+| 副作用 | 服务端为拿 `sent_us` 会 `bthread_id_create` + `bthread_id_join(response_id)` 阻塞响应 bthread（`baidu_rpc_protocol.cpp:414` / `:481`） | 开启后改变服务端行为，本设计必须避开 |
+
+结论：新建独立模块，与 rpcz 并存互不影响。
+
+### 3.2 已核实的代码事实
+
+| 事实 | 位置 | 影响 |
+|---|---|---|
+| `sizeof(Socket::WriteRequest) == 64`，`BAIDU_CACHELINE_ALIGNMENT`，零填充 | `socket.cpp:310`，断言在 `socket.cpp:2954` | 加字段必然涨到 128，故走编译期开关 |
+| `IOBuf` 为 32 字节（`SmallView` = 2 × `BlockRef`(16)） | `iobuf.h:82-101` | 上一行的推导依据 |
+| `ReturnSuccessfulWriteRequest` 在 `butil::return_object(p)` 之前读 `p->id_wait` 与控制位 | `socket.cpp:509-517` | 在同处读 handle 安全 |
+| 该函数是「WriteRequest 写完」的唯一汇聚点，快路径与 `KeepWrite` 都收敛于此 | `socket.cpp:1772` / `1871` | `write_end` 的落点 |
+| `PackedPtr<Socket>` 的 extra 仅用 2 bit，余 14 bit | `socket.cpp:317-334` | 不足以放 handle（需约 40 bit），故排除「偷位」方案 |
+| 客户端 `IssueRPC` 设 `wopt.id_wait = cid` | `controller.cpp:1511` | `id_wait` 已被占用，不可复用 |
+| `ProcessRpcResponse` 先解 meta（`:940`）再 `bthread_id_lock`（`:950`） | `baidu_rpc_protocol.cpp:936-950` | meta 反序列化点位拿不到 handle，需先落局部变量 |
+| `RpcRequestMeta` 已用 tag 1-8，tag 9 空闲 | `baidu_rpc_meta.proto:42-49` | 新字段用 tag 9 |
+| rpcz 的 `trace_id`/`span_id` 填充绑死在 `IsTraceable()` 上 | `channel.cpp:539`，`baidu_rpc_protocol.cpp:671` | 复用会牵动 rpcz 采样逻辑，故新增独立字段 |
+| RDMA 写侧完全共用 `Socket::Write` → `DoWrite` → `_transport->CutFromIOBufList()` | `socket.cpp:1902`，`rdma_transport.cpp:100` | 写侧点位零增量 |
+| RDMA 数据面 `_on_edge_trigger` 亦为 `InputMessenger::OnNewMessages` | `rdma_transport.cpp:54` | 收侧仅 wake 点位需单独处理 |
+| aarch64 上 `cpuwide_time_ns()` 读 `cntvct_el0`，架构保证全系统一致 | `butil/time.h:227` | 同机跨核可比；跨机需靠 D1 的公式 |
+
+---
+
+## 4. 点位清单（36 个）
+
+点位 ID 在代码中为编译期常量，落盘后由分析工具按 ID 解释。`0` 表示未采集。
+
+### 4.1 客户端（19 个）
+
+| ID | 名称 | 落点 |
+|---|---|---|
+| C01 | `rpc_start` | `Channel::CallMethod` 入口 |
+| C02 | `req_payload_ser_start` | `_serialize_request()` 调用前（`channel.cpp:592`） |
+| C03 | `req_payload_ser_end` | `_serialize_request()` 返回后 |
+| C04 | `req_meta_ser_start` | `PackRpcRequest` 中 `RpcMeta meta;` 构造前（`baidu_rpc_protocol.cpp:1096`） |
+| C05 | `req_meta_ser_end` | `SerializeRpcHeaderAndMeta()` 返回后 |
+| C06 | `write_enqueue` | `Socket::Write()` 入口（`socket.cpp:1617`） |
+| C07 | `write_start` | `Socket::DoWrite()` 中 `CutFromIOBufList()` 调用前（`socket.cpp:1902`） |
+| C08 | `write_end` | `ReturnSuccessfulWriteRequest()`（`socket.cpp:509`） |
+| C09 | `wake` | `epoll_wait` 返回（RDMA：CQE 被 poll 出） |
+| C10 | `onedge_start` | `Transport::OnEdge` 入口（`transport.h:31`） |
+| C11 | `readv_start` | `InputMessenger::OnNewMessages` 循环内 `m->DoRead()` 前 |
+| C12 | `msg_recv_done` | 该消息在 `ProcessNewMessage` 中切分成功 |
+| C13 | `rsp_meta_deser_start` | `ProcessRpcResponse` 入口（`baidu_rpc_protocol.cpp:937`） |
+| C14 | `rsp_meta_deser_end` | `ParsePbFromIOBuf(&meta, ...)` 返回后（`:940`） |
+| C15 | `rsp_payload_deser_start` | response 的 `ParseFromIOBuf()` 前 |
+| C16 | `rsp_payload_deser_end` | 之后 |
+| C17 | `rsp_process_start` | `OnRPCReturned` / `done->Run()` 前 |
+| C18 | `rsp_process_end` | 之后 |
+| C19 | `rpc_end` | `Controller::OnRPCEnd`（`channel.cpp:662`） |
+
+### 4.2 服务端（17 个）
+
+| ID | 名称 | 落点 |
+|---|---|---|
+| S01 | `wake` | 同 C09 |
+| S02 | `onedge_start` | 同 C10 |
+| S03 | `readv_start` | 同 C11 |
+| S04 | `msg_recv_done` | 同 C12（**用户原清单未列，本设计补充**；无此点则「服务端收包时间」与「服务端处理排队时间」无分界） |
+| S05 | `req_meta_deser_start` | `ProcessRpcRequest` 入口 |
+| S06 | `req_meta_deser_end` | `ParsePbFromIOBuf(&meta, ...)` 返回后 |
+| S07 | `req_payload_deser_start` | request 的 `ParseFromIOBuf()` 前 |
+| S08 | `req_payload_deser_end` | 之后 |
+| S09 | `service_start` | `svc->CallMethod()` 调用前 |
+| S10 | `service_end` | `SendRpcResponse` 入口（`baidu_rpc_protocol.cpp:282`） |
+| S11 | `rsp_payload_ser_start` | `SerializeResponse()` 前（`:331`） |
+| S12 | `rsp_payload_ser_end` | 之后 |
+| S13 | `rsp_meta_ser_start` | `RpcMeta meta;` 构造前（`:346`） |
+| S14 | `rsp_meta_ser_end` | `SerializeRpcHeaderAndMeta()` 返回后（`:401`） |
+| S15 | `write_enqueue` | `Socket::Write()` 入口 |
+| S16 | `write_start` | `Socket::DoWrite()` 中 `CutFromIOBufList()` 前 |
+| S17 | `write_end` | `ReturnSuccessfulWriteRequest()` |
+
+---
+
+## 5. 分解项（35 项）
+
+客户端 19 点产生 18 段，其中 `C08 → C09` 一段按 D1 展开为「上行链路 + 服务端 16 段 + 下行链路」。故：
+
+```
+17 (客户端其余段) + 16 (服务端段) + 2 (链路) = 35
+```
+
+**恒等式**：由 D1 的定义，`上行 + 下行 ≡ (C09 − C08) − (S17 − S01)`，因此
+
+```
+Σ(35 项) = (C19 − C01)
+```
+
+是代数恒等，不是近似。此式作为单测断言。
+
+标记 ★ 的对应用户原始清单的 22 项（HTML 中高饱和色，其中 2 项各拆为 2 个区间，见本节末小结），标记 ○ 的为本设计补充的间隙项（灰阶）。
+
+### 5.1 客户端发送段（7 项）
+
+| 分解项 | 区间 | 说明 |
+|---|---|---|
+| ○ `cli_pre_serialize` | C01→C02 | `bthread_id_lock_and_reset_range`、选项合并、Span 创建 |
+| ★ `cli_req_payload_ser` | C02→C03 | 客户端 payload 序列化 |
+| ○ `cli_issue_rpc` | C03→C04 | **负载均衡选 socket、建连检查、装超时定时器**。冷连接或 LB 抖动时可能很大 |
+| ★ `cli_req_meta_ser` | C04→C05 | 客户端 metadata 序列化 |
+| ○ `cli_pack_to_write` | C05→C06 | `PackRpcRequest` 收尾、IOBuf 拼装 |
+| ★ `cli_write_queue` | C06→C07 | 客户端 write 排队（含 bthread 调度与写竞争） |
+| ★ `cli_write_syscall` | C07→C08 | 客户端 write 接口 |
+
+### 5.2 链路与服务端（18 项）
+
+| 分解项 | 区间 | 说明 |
+|---|---|---|
+| ★ `link_up` | 派生 | 上行链路时间 |
+| ★ `srv_wake_to_onedge` | S01→S02 | 服务端 wake → 收包 bthread 启动 |
+| ★ `srv_onedge_to_readv` | S02→S03 | 服务端收包 bthread 内排队 |
+| ★ `srv_readv` | S03→S04 | 服务端收包 |
+| ★ `srv_recv_to_deser` | S04→S05 | 服务端处理排队 |
+| ★ `srv_req_meta_deser` | S05→S06 | 服务端 metadata 反序列化 |
+| ○ `srv_dispatch` | S06→S07 | **查 service/method、并发限制（`ConcurrencyLimiter`）、建 Controller**。限流排队即卡在此段 |
+| ★ `srv_req_payload_deser` | S07→S08 | 服务端 payload 反序列化 |
+| ○ `srv_to_service` | S08→S09 | 进入业务前的一次可能的 bthread 调度 |
+| ★ `srv_service` | S09→S10 | 服务端服务处理 |
+| ○ `srv_service_to_ser` | S10→S11 | done 进入、Controller 状态收尾 |
+| ★ `srv_rsp_payload_ser` | S11→S12 | 服务端 payload 序列化 |
+| ○ `srv_compress_checksum` | S12→S13 | 压缩、checksum 计算 |
+| ★ `srv_rsp_meta_ser` | S13→S14 | 服务端 metadata 序列化 |
+| ○ `srv_pack_to_write` | S14→S15 | 组包到入队 |
+| ★ `srv_write_queue` | S15→S16 | 服务端 write 排队 |
+| ★ `srv_write_syscall` | S16→S17 | 服务端 write 接口 |
+| ★ `link_down` | 派生 | 下行链路时间 |
+
+### 5.3 客户端接收段（10 项）
+
+| 分解项 | 区间 | 说明 |
+|---|---|---|
+| ★ `cli_wake_to_onedge` | C09→C10 | 客户端 wake → 收包 bthread 启动 |
+| ★ `cli_onedge_to_readv` | C10→C11 | 客户端收包 bthread 内排队 |
+| ★ `cli_readv` | C11→C12 | 客户端收包 |
+| ★ `cli_recv_to_deser` | C12→C13 | 客户端处理排队 |
+| ★ `cli_rsp_meta_deser` | C13→C14 | 客户端 metadata 反序列化 |
+| ○ `cli_lookup_cntl` | C14→C15 | 按 correlation_id 取回 Controller（`bthread_id_lock`） |
+| ★ `cli_rsp_payload_deser` | C15→C16 | 客户端 payload 反序列化 |
+| ○ `cli_post_deser` | C16→C17 | 错误码判定、重试决策 |
+| ★ `cli_callback` | C17→C18 | 客户端回调处理 |
+| ○ `cli_rpc_finish` | C18→C19 | `SubmitSpan`、`OnRPCEnd`；同步 RPC 下含唤醒发起方 bthread |
+
+合计：★ 24 项（含 2 个派生链路项），○ 11 项，共 33 个区间项 + 2 个派生项 = 35。
+
+注意 ★ 是 24 而非 22：用户原始清单的「服务端收包排队时间」与「客户端收包排队时间」各自跨越了两个点位区间（`wake → onedge_start` 与 `onedge_start → readv_start`），本设计按 D5 各拆为 2 项，故 22 + 2 = 24。
+
+---
+
+## 6. 链路时间的两种模型
+
+对每条 join 成功的记录，令：
+
+```
+a = C08 (client write_end)      d = C09 (client wake)      —— 客户端时钟
+b = S01 (server wake)           c = S17 (server write_end) —— 服务端时钟
+
+RTT = d − a          （纯客户端时钟）
+S   = c − b          （纯服务端时钟）
+L   = RTT − S        （总链路时间，与时钟偏移无关，恒精确）
+```
+
+### 6.1 模型 A：逐请求对半分（默认）
+
+```
+link_up = link_down = L / 2
+```
+
+免疫时钟偏移与频率漂移。缺点：强制上下行对称，把归因噪声均摊掉。`L < 0` 的记录单独标记，HTML 中可筛选，**不静默裁剪为 0**。
+
+### 6.2 模型 B：每连接滑窗估 offset
+
+设 `O = 客户端时钟 − 服务端时钟`，则 `link_up = (b + O) − a`，`link_down = d − (c + O)`，二者之和恒为 `L`，`O` 仅决定劈分。
+
+估计方法：以 `(client_process, server_process)` 为分组键，在滑动窗口（默认 1 秒）内取 `L` 最小的样本，用其 `O_i = a + L_i/2 − b` 作为整窗的 `O`。取最小值的依据同 NTP：链路时间最小的样本排队污染最轻，对称假设最可能成立。窗口化是为了跟踪两机时钟的**频率漂移**（未同步时典型 10~100 ppm，即每分钟 0.6~6 ms）。
+
+副产物：`link_up < 0` 精确指示「该请求的 `S01` 时间戳不可信」—— 服务端记录的唤醒时刻早于客户端写完时刻，因果上不可能，只能是该消息继承了更早批次的 wake 值（见 §8.2）。这是一个**探测器**而非噪声。
+
+### 6.3 两模型的关系
+
+总链路时间、乃至累积柱状图的**总柱高**，两模型完全一致。差异仅在上下行劈分，以及归因污染是被暴露还是被均摊。HTML 提供下拉切换与「两模型差值」列，供交叉验证。
+
+---
+
+## 7. 方案选型（已决）
+
+| 方案 | 描述 | 结论 |
+|---|---|---|
+| **定长记录槽 + handle 透传** | 每次 RPC 分配一个定长槽，跨执行体只传 8 字节 handle | **采纳** |
+| 事件流 | 每点位追加 `(trace_id, point_id, ts)` 三元组，离线 group by | 否决。`wake` 发生时消息尚未解析，**根本不知道 trace_id**，事件级点位仍需在 Socket 上暂存并二次关联 —— 简洁性优势恰在最难处失效；数据量还大 4 倍 |
+| 扩展 rpcz `Span` | 加 36 个字段复用现有传递 | 否决。Span 只覆盖 process 阶段，事件级与 write 侧点位同样没有；且继承 §3.1 的全部开销 |
+
+### 7.1 handle 载体的备选（已决 D8）
+
+| 备选 | 结论 |
+|---|---|
+| `#ifdef` 下把 `WriteRequest` 扩到 128 字节 | **采纳**。默认构建一个字节不变，可上游合入 |
+| per-socket 写序号 + 离线 join，零内存增长 | 否决。依赖「返还顺序 == 提交顺序」不变量；失败路径（`ReleaseAllFailedWriteRequests` / `ReturnFailedWriteRequest`）漏计一个，该连接后续所有请求的 `write_end` **永久静默错位** |
+| 复用 `id_wait` 空槽 | 否决。破坏失败路径的 `bthread_id_error2`；客户端该字段已被 correlation_id 占用 |
+| 复用 `_pc_and_udmsg` 指针位 | 否决。`reset_pipelined_count_and_user_message()` 在失败路径仍会读它 |
+| 偷 `PackedPtr` 的 extra 位 | 否决。仅余 14 bit，handle 需约 40 bit |
+
+---
+
+## 8. 运行时模块
+
+### 8.1 `src/brpc/latency_trace.{h,cpp}`
+
+**记录结构**（POD，8 字节对齐后 200 字节）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `trace_id` | `uint64` | 跨进程唯一 |
+| `base_counter` | `uint64` | 本进程原始计数器基准（aarch64: `cntvct_el0`；x86: TSC） |
+| `ts[36]` | `uint32 × 36` | 相对 `base_counter` 的偏移，`0` = 未采集 |
+| `handle_seq` | `uint64` | generation 校验用 |
+| `socket_id` | `uint32` | |
+| `remote_ip` / `remote_port` | `uint32` / `uint16` | |
+| `role` / `attempt` | `uint8` / `uint8` | client / server；重试序号 |
+| `error_code` | `int32` | |
+| `req_size` / `rsp_size` / `method_id` | `uint32 × 3` | method 名走离线查表，避免变长字段 |
+
+存**相对偏移**而非绝对值，把 `36 × 8` 压到 `36 × 4`。`uint32` 在 3 GHz TSC 下可表示 1.43 秒，足够覆盖单次 RPC。
+
+存**原始计数值**、不做频率转换：`butil::cpuwide_time_ns()` 每次调用要做一次乘法与移位（`butil/time.h:283`），全部省掉，换算移至离线。
+
+**缓冲**：分片环形数组，分片数取「worker 数向上取 2 的幂」。分配槽为 `cursor.fetch_add(1)`；`handle = (shard << 56) | seq`，槽下标 `seq & mask`。每次写入前校验槽内 `handle_seq` 是否仍等于 handle 携带的 seq，不等则丢弃该次写入 —— 防止迟到的回填（例如卡住很久的 `KeepWrite`）写脏已被复用的槽。
+
+**缓冲满的策略：停止记录，不覆盖。** 覆盖式会让两端各自保留「最近 N 条」，两端窗口对不上；停止记录则两端都是「最早 N 条」，天然对齐。丢弃计数写入文件头。
+
+**不起后台线程**：10 万条 × 200 B = 20 MB，全程只写内存，`atexit` 或显式调用 `LatencyTrace::Dump()` 时一次性落盘。这消除了后台 flush 线程对被测系统的干扰。
+
+**打点接口**：
+
+```cpp
+LT_STAMP(handle, POINT_ID)   // BRPC_LATENCY_TRACE 未定义时展开为空语句
+```
+
+**gflags**：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `-latency_trace_enabled` | `false` | 运行时总开关 |
+| `-latency_trace_capacity` | `100000` | 记录条数上限 |
+| `-latency_trace_dump_path` | 空 | 落盘路径；空则不落盘 |
+| `-latency_trace_point_set` | `full` | `full` / `lite`（见 §11 Phase 0 结论） |
+
+**时钟校准**：dump 文件头写入若干组 `(raw_counter, CLOCK_REALTIME)` 采样对与计数器频率（频率取自 `butil` 现有的 `read_cpu_frequency()` 路径），供离线换算成实时并做跨进程对齐的辅助校验。
+
+### 8.2 三类点位的载体与透传
+
+| 类别 | 载体 | 说明 |
+|---|---|---|
+| 请求内点位 | `Controller` 存 8 字节 handle | 客户端全程可用 |
+| 事件级点位<br>（C09–C11 / S01–S03） | `Socket` 增 3 个字段 → `ProcessNewMessage` 时拷入 `InputMessageBase`（增 4 字段）→ 解析出 handle 后拷入槽 | **同一批次的多条消息共享同一个 `wake` 值**。这是 §6.2 所述污染的来源，在数据中可见（时间戳相同即同批），不隐藏 |
+| 写完成点位<br>（C08 / S17） | `WriteRequest` 增 8 字节 handle（`#ifdef` 内） | `ReturnSuccessfulWriteRequest` 直接按 handle 回填，**不阻塞**，不使用 rpcz 那套 `bthread_id_join` |
+| handle 尚不可得的点位<br>（C13/C14、S05/S06） | 先落函数局部变量，`bthread_id_lock` 取回 Controller 后一次性写入槽 | 因 `ProcessRpcResponse` 是先解 meta 再 lock（`baidu_rpc_protocol.cpp:940` / `:950`） |
+
+`epoll_wait` 返回的时间戳存入 TLS，同一次返回的 N 个事件共享该值 —— 这是正确语义（它们确实是同一次唤醒）。
+
+### 8.3 跨进程关联
+
+`baidu_rpc_meta.proto` 的 `RpcRequestMeta` 增加：
+
+```protobuf
+optional uint64 latency_trace_id = 9;
+```
+
+tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端忽略之。
+
+不复用 rpcz 的 `trace_id`/`span_id`（tag 4/5），因其填充条件绑死在 `IsTraceable()` 亦即 `bvar::Collector` 采样上，复用将牵动 rpcz 自身行为。
+
+`trace_id` 生成：进程启动时取一个 64 位随机 `g_process_tag`，`trace_id = (g_process_tag & 0xFFFFFFFF00000000ULL) | seq`，保证跨进程唯一。
+
+### 8.4 RDMA 差异
+
+| 侧 | 差异 |
+|---|---|
+| 写 | **零增量**。共用 `Socket::Write` → `StartWrite`/`KeepWrite` → `DoWrite`，仅末跳换成 `_rdma_ep->CutFromIOBufList()`（`rdma_transport.cpp:100`） |
+| 收 | 仅 `wake` 点位不同：轮询模式下换成「该 CQE 被 `ibv_poll_cq` 取出的时刻」（`rdma_endpoint.cpp:1500` 附近）。`OnEdge` / `readv_start` / `msg_recv_done` 共用（`rdma_transport.cpp:54`） |
+
+`write_end` 一律取 `ibv_post_send` 返回时刻，**不取 send CQE**：RC 的 send completion 隐含对端 ACK，会把一个单程链路时间错算进「write 接口时间」，破坏 §6 的语义。
+
+---
+
+## 9. 分析工具 `tools/latency_trace/`
+
+### 9.1 `merge.py`
+
+输入两端 dump 文件，输出中间 JSON：
+
+1. 读文件头，取频率与校准对，把 `base_counter + ts[i]` 换算为各自进程时钟下的纳秒值。
+2. 按 `trace_id` join 客户端与服务端记录。未配对的记录单独统计并报告（数量、原因分类）。
+3. 按 §6 的两种模型分别计算 `link_up` / `link_down`。
+4. 计算 35 个分解项。
+5. **断言 `Σ(35 项) == C19 − C01`**，容差为 0（整数运算）。不通过则报错退出，指出违例记录。
+
+### 9.2 `render.py`
+
+生成单文件 HTML。
+
+| 能力 | 说明 |
+|---|---|
+| 主图 | Canvas 累积柱状图；x = 按端到端时延排序的排名，y = 累积时延 |
+| 配色 | 22 个具名项高饱和，11 个间隙项灰阶；遵循 `dataviz` skill 的配色规范，明暗主题各自可读 |
+| hover | 命中测试 → 浮层显示该请求的 36 个时间戳与 35 个分段值 |
+| 缩放 | 框选缩放到任意排名区间（用于放大尾部） |
+| 链路模型 | 下拉切换模型 A / B，并提供「两模型差值」列 |
+| 图例 | 点击隐藏/显示单个分段 |
+| 统计 | 顶部 p50 / p90 / p99 / p99.9 各分段贡献表 |
+| 筛选 | 按 `L < 0`、按 attempt、按 error_code、按 socket_id 筛选 |
+
+---
+
+## 10. 验证
+
+| 类别 | 内容 |
+|---|---|
+| 不变量单测 | 逐请求断言 `Σ(35 项) == C19 − C01` |
+| 单调性单测 | 36 个点位非零且时间戳单调不减 |
+| 缓冲单测 | generation 覆盖语义、handle 校验拒绝迟到写入、容量满后停止记录并正确计数 |
+| microbenchmark | 单次 `LT_STAMP` 成本（Phase 0 的出口） |
+| 端到端 | 起 server + client 跑 N 个请求，验证两端记录可 100% join，且分解项全部非负（模型 A 下） |
+| 回归 | 未定义 `BRPC_LATENCY_TRACE` 时，`sizeof(WriteRequest) == 64` 断言仍成立；现有测试全绿 |
+
+---
+
+## 11. 开销与 Phase 0
+
+36 个点位，每个约一次计数器读 + 一次 store。aarch64 的 `cntvct_el0` 是跨时钟域的系统计数器读，量级估计在 10~40 ns（各实现差异大，**必须实测**）。全程估计 0.4~1.4 μs。
+
+| 场景 | 端到端量级 | 打点占比（估） |
+|---|---|---|
+| TCP loopback | 30~60 μs | 1~5%，可接受 |
+| RDMA | 5~15 μs | 3~28%，**可能改变待观察的分布形状** |
+
+**Phase 0 是硬性前置**：先写 microbenchmark 实测单次打点成本，拿到真实数字后再决定 RDMA 下默认使用全量 36 点还是 `lite` 点位集（约 12 个跨阶段边界点，牺牲「payload 序列化 vs metadata 序列化」这类细分）。
+
+---
+
+## 12. 交付顺序
+
+| Phase | 内容 | 出口判据 |
+|---|---|---|
+| 0 | microbenchmark 实测打点成本 | 拿到真实数字，据此确定最终点位集 |
+| 1 | `latency_trace` 模块 + 单测 | 缓冲语义、handle 校验、容量策略全部通过 |
+| 2 | TCP + baidu_std 全部 36 点位埋点 | 端到端跑通，36 点位齐全且单调 |
+| 3 | 落盘 + `merge.py` | `Σ` 恒等断言通过，join 率 100% |
+| 4 | HTML 渲染 | 1 万~10 万条可交互，hover 与缩放可用 |
+| 5 | RDMA（仅 `wake` 点位） | TCP / RDMA 分解对比图 |
+
+---
+
+## 13. 风险与已知限制
+
+| 风险 | 缓解 |
+|---|---|
+| 打点开销在 RDMA 下占比过高 | Phase 0 实测 + `lite` 点位集；同一二进制下 gflag 开关对照，量化影响 |
+| 一次 wake 覆盖多条消息导致 `S01` 归因失真 | 数据中可见（同批时间戳相同）；模型 B 将其暴露为 `link_up < 0`；HTML 可筛选 |
+| 跨机网络本身上下行不对称 | 模型 A 强制对称，模型 B 的 `O` 会带该不对称的系统性偏差；但**两模型的总链路时间与总柱高均不受影响** |
+| 追踪构建与生产构建 ABI 不同 | 文档明示；两端必须使用同一构建配置 |
+| 缓冲满后停止记录导致窗口截断 | 文件头记录丢弃数；HTML 显式提示窗口是否被截断 |
