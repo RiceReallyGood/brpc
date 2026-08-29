@@ -9,11 +9,15 @@ leveldb / protoc. All building and testing happens on `suzhou950`
 Every later task's "run the tests" step starts with this:
 
 ```bash
-./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
+./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
 ```
 
 Any plan step written as `cd test && make ... && ./...` should be read as
 this remote form. Edit locally, build/run on suzhou950, commit locally.
+
+`NEED_GPERFTOOLS=0` is a deliberate, permanent part of this recipe — see
+"gperftools: deliberately not installed" below for why, and for what it
+does and does not cover.
 
 ## One-time setup / regenerating config.mk
 
@@ -23,7 +27,7 @@ once in `~/brpc-lt` survives every later sync. You only need to
 (re)generate it after a fresh clone of `~/brpc-lt` or if it's ever deleted:
 
 ```bash
-ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64'
+./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64
 ```
 
 **Do not use `--headers=/usr/include --libs=/usr/lib`** (the values that
@@ -70,17 +74,40 @@ and generates `CXXFLAGS=-std=c++17` plus the full `-labsl_*` link list —
 needs regenerating, always go through `config_brpc.sh`; do not hand-patch
 the generated file.
 
-## Known open issue: gperftools is missing on suzhou950
+## gperftools: deliberately not installed
 
-`test/Makefile` unconditionally sets `NEED_GPERFTOOLS=1`, which every
-test target depends on via `config.mk`'s
-`$(error "Fail to find gperftools")` guard. `gperftools` (providing
-`libtcmalloc_and_profiler`) is not installed on suzhou950 and is not in
-this host's originally-verified dependency list. It exists in the
-openEuler repo (`gperftools`, `gperftools-devel`, `gperftools-libs`) and
-the repo is reachable directly (no xray proxy needed), but installing it
-needs `sudo`, which requires a password not available in this session.
+`gperftools` (providing `libtcmalloc_and_profiler`) is not installed on
+suzhou950 and was not in this host's originally-verified dependency
+list. `test/Makefile` hardcodes `NEED_GPERFTOOLS=1` by default, which
+every test target depends on via `config.mk`'s
+`$(error "Fail to find gperftools")` guard, so an un-overridden
+`make brpc_<name>_unittest` fails with `"Fail to find gperftools"`.
 
-Until this is resolved, `make brpc_<name>_unittest` on suzhou950 will
-fail with `"Fail to find gperftools"`. See `task-0-report.md` in the SDD
-task folder for full diagnostics and options.
+The package does exist in the openEuler repo (`gperftools`,
+`gperftools-devel`, `gperftools-libs`, confirmed via `dnf --cacheonly
+search`) and the repo is reachable directly (no xray proxy needed), but
+installing it needs `sudo`, and no sudo password is available in this
+environment. Rather than block the whole plan on that, the canonical
+recipe above passes `NEED_GPERFTOOLS=0` on the `make` command line,
+which is a standard, reversible Make variable override (no file is
+patched) that skips linking `-ltcmalloc_and_profiler`.
+
+**What this does and does not cover:** the only targets this plan needs
+are `brpc_latency_trace_unittest` (all later tasks) and
+`brpc_controller_unittest` (smoke check) — neither calls gperftools
+profiler APIs directly, and `brpc_controller_unittest` is verified to
+link and pass 5/5 with this override. It is not a safe blanket
+assumption for every test binary in `test/`: any unittest that calls
+gperftools APIs directly (profiler start/stop, heap profiler, etc.)
+would still fail to link under `NEED_GPERFTOOLS=0`, so don't lift this
+override onto an arbitrary `brpc_*_unittest` target without checking it
+first.
+
+**Consequence for benchmarks, not unit tests:** a binary built without
+tcmalloc has different allocation/latency characteristics than one with
+it (tcmalloc's fast paths and thread caches materially change alloc
+latency). Unit test correctness is unaffected, but before running the
+*real latency benchmark* (as opposed to `gtest` unit tests), gperftools
+should be installed for representative numbers. That's a call for
+whoever runs the benchmark, later, with a sudo-capable session — not a
+blocker now.
