@@ -22,6 +22,18 @@
 - 新增源文件放在 `src/brpc/` 下即被 Make 与 CMake 自动收录（`Makefile:209` 的 `wildcard`、`CMakeLists.txt:575` 的 `GLOB_RECURSE`），**无需改构建文件**
 - 新增单测文件名须匹配 `test/brpc_*unittest.cpp`，即被 `test/Makefile:182` 自动收录
 - **编辑在本机，构建与测试在 suzhou950，git 提交在本机。** 每次跑测试前先 `./tools/latency_trace/sync950.sh`（Task 0 产出）
+- **suzhou950 上 `config_brpc.sh` 的唯一正确调用**（两个参数都不能少，理由见 Task 0 报告）：
+  ```bash
+  ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64
+  ```
+  `--libs=/usr/lib64`：库在 lib64；写成 `/usr/lib` 时 `find_dir_of_lib_or_die` 的 `exit 1` 只杀子 shell，
+  脚本静默继续并生成 `-l -l`（无库名的裸 `-l`），直到链接期才暴露。
+  `--headers` 里 `/usr/include/gtest` 必须排在前：该主机装了两份 gtest，且 GCC 会把指向自身默认
+  系统目录的显式 `-I` 静默降级到搜索顺序末尾，导致 `<gtest/gtest.h>` 命中 llvm-googletest 那份，
+  链接时报 `llvm::raw_ostream` 未定义。
+- **所有 `make` 测试目标都要带 `NEED_GPERFTOOLS=0`**：该主机未装 gperftools，而 `test/Makefile:18`
+  硬编码 `NEED_GPERFTOOLS=1`，`config_brpc.sh:592` 会因此在 `config.mk` 里生成
+  `$(error "Fail to find gperftools")`。见 Task 0 的裁决。
 - suzhou950 的 VPN 闲置会断。长任务开始前在后台起保活：`for i in $(seq 1 240); do ssh suzhou950 'date>/dev/null'; sleep 60; done &`
 
 ---
@@ -74,7 +86,7 @@ echo "synced to $HOST:$DEST"
 
 ```bash
 ./tools/latency_trace/sync950.sh
-ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers=/usr/include --libs=/usr/lib 2>&1 | tail -20'
+ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64 2>&1 | tail -20'
 ```
 
 Expected: 生成 `config.mk` 与 `src/butil/config.h`，无 "Fail to find" 报错
@@ -96,7 +108,7 @@ Expected: 产出 `libbrpc.a` 与 `libbrpc.so`。
 - [ ] **Step 4: 验证测试工具链可用**
 
 ```bash
-ssh suzhou950 'cd ~/brpc-lt/test && make brpc_controller_unittest -j64 2>&1 | tail -20 && ./brpc_controller_unittest 2>&1 | tail -5'
+ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_controller_unittest -j64 2>&1 | tail -20 && ./brpc_controller_unittest 2>&1 | tail -5'
 ```
 
 Expected: 编译通过且全部 PASS。这一步确认 gtest 链接正常、`test/Makefile` 的 `$(wildcard brpc_*unittest.cpp)` 机制可用，后续任务的 TDD 循环才有意义。
@@ -106,7 +118,7 @@ Expected: 编译通过且全部 PASS。这一步确认 gtest 链接正常、`tes
 把下面这行写进 `tools/latency_trace/README.md`，后续任务全部照抄：
 
 ```bash
-./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
+./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
 ```
 
 - [ ] **Step 6: Commit**
@@ -325,7 +337,7 @@ TEST(LatencyTraceTest, RecordIsExactly200Bytes) {
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64'
+./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64'
 ```
 
 Expected: 编译失败，`brpc/latency_trace.h: No such file or directory`
@@ -442,7 +454,7 @@ struct LatencyTraceRecord {
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
+./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
 ```
 
 Expected: 2 tests PASS。若 `sizeof` 不是 200，**不要改断言去迁就**，先核对字段：`8+8+8 + 36*4 + 4*5 + 4 + 2 + 1 + 1 = 196`，8 字节对齐补到 200。
@@ -565,7 +577,7 @@ TEST_F(LatencyTraceBufferTest, StopsRecordingWhenFullInsteadOfOverwriting) {
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64'
+./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64'
 ```
 
 Expected: 编译失败，`'LatencyTraceBuffer' is not a member of 'brpc'`
@@ -768,7 +780,7 @@ size_t LatencyTraceBuffer::dropped_count() const {
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
+./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
 ```
 
 Expected: 7 tests PASS
@@ -824,7 +836,7 @@ TEST(LatencyTraceMacroTest, StampRecordsWhenEnabled) {
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64'
+./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64'
 ```
 
 Expected: 编译失败，`'LT_STAMP' was not declared`
@@ -856,12 +868,12 @@ Expected: 编译失败，`'LT_STAMP' was not declared`
 ./tools/latency_trace/sync950.sh
 
 # 默认构建：LT_STAMP 展开为空语句，测试走 #else 分支
-ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers=/usr/include --libs=/usr/lib && make -j64 \
-  && cd test && make -B brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
+ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64 && make -j64 \
+  && cd test && make NEED_GPERFTOOLS=0 -B brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
 
 # 追踪构建：测试走 #if 分支
-ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-latency-trace && make -j64 \
-  && cd test && make -B brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
+ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64 --with-latency-trace && make -j64 \
+  && cd test && make NEED_GPERFTOOLS=0 -B brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'
 ```
 
 Expected: 两次都全 PASS，且 `#else` 分支与 `#if` 分支各被覆盖一次。
@@ -928,7 +940,7 @@ TEST_F(LatencyTraceBufferTest, DumpRoundTripsHeaderAndRecords) {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64'`
 Expected: 编译失败，`'LatencyTraceFileHeader' is not a member of 'brpc'`
 
 - [ ] **Step 3: 写实现**
@@ -997,7 +1009,7 @@ TEST_F(LatencyTraceBufferTest, DumpPathFlagRegistersAtexitHook) {
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'`
 Expected: 9 tests PASS
 
 - [ ] **Step 6: Commit**
@@ -1053,7 +1065,7 @@ TEST(LatencyTraceBuildTest, WriteRequestSizeMatchesBuildMode) {
 #endif
 ```
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-latency-trace && make -j64 2>&1 | grep -i cassert'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64 --with-latency-trace && make -j64 2>&1 | grep -i cassert'`
 Expected: 编译失败 —— 此时结构体还是 64 字节，`sizeof_write_request_is_128` 断言不成立。这证明断言真的在起作用。
 
 - [ ] **Step 3: 加字段**
@@ -1075,8 +1087,8 @@ Expected: 编译失败 —— 此时结构体还是 64 字节，`sizeof_write_re
 
 ```bash
 ./tools/latency_trace/sync950.sh
-ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-latency-trace && make -j64'
-ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers=/usr/include --libs=/usr/lib && make -j64'
+ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64 --with-latency-trace && make -j64'
+ssh suzhou950 'cd ~/brpc-lt && ./config_brpc.sh --headers="/usr/include/gtest /usr/include" --libs=/usr/lib64 && make -j64'
 ```
 
 Expected: 两次都编译成功。第二次证明默认构建仍是 64 字节。
@@ -1139,7 +1151,7 @@ TEST(LatencyTraceIdTest, MetaCarriesTraceIdOnTag9) {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64'`
 Expected: 编译失败，`'set_latency_trace_id' is not a member` 与 `'MakeLatencyTraceId' is not a member of 'brpc'`
 
 - [ ] **Step 3: 写实现**
@@ -1182,7 +1194,7 @@ uint64_t MakeLatencyTraceId(uint64_t seq) {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'`
 Expected: 10 tests PASS
 
 - [ ] **Step 5: Commit**
@@ -1284,7 +1296,7 @@ static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest' --gtest_filter='LatencyTraceE2ETest.*'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest' --gtest_filter='LatencyTraceE2ETest.*'`
 Expected: FAIL —— `r` 为 nullptr，或各点位全为 0
 
 - [ ] **Step 3: 逐点位加埋点**
@@ -1335,7 +1347,7 @@ Expected: FAIL —— `r` 为 nullptr，或各点位全为 0
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest' --gtest_filter='LatencyTraceE2ETest.*'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest' --gtest_filter='LatencyTraceE2ETest.*'`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1558,7 +1570,7 @@ Expected: FAIL —— C13 之后的点位为 0
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest'`
 Expected: 全部 PASS，尤其 `SumIsIdentity` 与 `LinkTimeIsNonNegative`
 
 - [ ] **Step 5: Commit**
@@ -1714,7 +1726,7 @@ TEST(LatencyTraceMetaTest, EachRetryAttemptGetsItsOwnRecord) {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest' --gtest_filter='LatencyTraceMetaTest.*'`
+Run: `./tools/latency_trace/sync950.sh && ssh suzhou950 'cd ~/brpc-lt/test && make NEED_GPERFTOOLS=0 brpc_latency_trace_unittest -j64 && ./brpc_latency_trace_unittest' --gtest_filter='LatencyTraceMetaTest.*'`
 Expected: FAIL —— 各元数据字段为 0，且只有 1 条客户端记录
 
 - [ ] **Step 3: 写实现**
