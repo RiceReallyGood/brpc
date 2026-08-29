@@ -31,6 +31,10 @@
   `--headers` 里 `/usr/include/gtest` 必须排在前：该主机装了两份 gtest，且 GCC 会把指向自身默认
   系统目录的显式 `-I` 静默降级到搜索顺序末尾，导致 `<gtest/gtest.h>` 命中 llvm-googletest 那份，
   链接时报 `llvm::raw_ostream` 未定义。
+- **提交时只 `git add` 本任务明确列出的文件，禁止 `git add -A` / `git add .` / `git add -u`。**
+  仓库工作区里长期存放着用户的 34 个未跟踪个人文档（`brpc_*.md`、`*.html`、`*.pptx`、
+  `问题记录.txt` 等），它们是**故意不跟踪**的。Task 2 曾因 `git add -A` 把这 34 个文件
+  全部提交进分支（36 files, 33188 insertions），需要 controller 做历史手术回退。
 - **所有 `make` 测试目标都要带 `NEED_GPERFTOOLS=0`**：该主机未装 gperftools，而 `test/Makefile:18`
   硬编码 `NEED_GPERFTOOLS=1`，`config_brpc.sh:592` 会因此在 `config.mk` 里生成
   `$(error "Fail to find gperftools")`。见 Task 0 的裁决。
