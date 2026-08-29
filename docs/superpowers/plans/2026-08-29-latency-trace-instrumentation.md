@@ -1761,95 +1761,15 @@ git commit -m "feat(latency-trace): fill record metadata and give each retry att
 
 ---
 
-## Task 14（条件任务）: `lite` 点位集
+## Task 14（条件任务）: `lite` 点位集 — **已取消**
 
-**只有当 Task 1 的 `phase0-results.md` 首行为 `DECISION: lite-point-set = REQUIRED` 时才执行。** 否则跳过本任务，并从 spec §8.1 的 gflag 表中删去 `-latency_trace_point_set` 一行。
+Task 1 的实测结论为 `DECISION: lite-point-set = NOT_REQUIRED`
+（`docs/superpowers/plans/phase0-results.md` 首行）：36 点总开销 0.263~0.268 μs，
+仅占 RDMA 5~15 μs 端到端时延的 1.8~5.4%，远低于 10% 阈值，最严的一端仍有 1.86 倍余量。
+经两轮独立复核（含算术重算）后结论稳定。
 
-**Files:**
-- Modify: `src/brpc/latency_trace.h`, `src/brpc/latency_trace.cpp`
-- Test: `test/brpc_latency_trace_unittest.cpp`
-
-**Interfaces:**
-- Produces: gflag `-latency_trace_point_set`（`full` / `lite`）；`bool LatencyTraceBuffer::point_enabled(int point) const;`
-
-- [ ] **Step 1: 写失败的测试**
-
-```cpp
-TEST_F(LatencyTraceBufferTest, LitePointSetKeepsOnlyStageBoundaries) {
-    // The 12 lite points are the stage boundaries needed to keep the sigma
-    // identity meaningful; the intra-stage detail points are dropped.
-    FLAGS_latency_trace_point_set = "lite";
-    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
-    b->ReloadPointSetForTest();
-    ASSERT_TRUE(b->point_enabled(brpc::LT_C_RPC_START));
-    ASSERT_TRUE(b->point_enabled(brpc::LT_C_WRITE_END));
-    ASSERT_TRUE(b->point_enabled(brpc::LT_C_WAKE));
-    ASSERT_TRUE(b->point_enabled(brpc::LT_S_WAKE));
-    ASSERT_TRUE(b->point_enabled(brpc::LT_S_WRITE_END));
-    ASSERT_TRUE(b->point_enabled(brpc::LT_C_RPC_END));
-    // Intra-stage detail is off.
-    ASSERT_FALSE(b->point_enabled(brpc::LT_C_REQ_META_SER_START));
-    ASSERT_FALSE(b->point_enabled(brpc::LT_S_RSP_PAYLOAD_SER_END));
-
-    const brpc::LatencyTraceHandle h = b->AllocSlot(1, brpc::LT_ROLE_CLIENT);
-    b->Stamp(h, brpc::LT_C_REQ_META_SER_START);
-    ASSERT_EQ(0u, b->GetForTest(h)->ts[brpc::LT_C_REQ_META_SER_START])
-        << "a disabled point must not be written";
-
-    FLAGS_latency_trace_point_set = "full";
-    b->ReloadPointSetForTest();
-}
-```
-
-- [ ] **Step 2: 跑测试确认失败**
-
-Run: `ssh suzhou950 'cd ~/brpc-lt/test && ./brpc_latency_trace_unittest --gtest_filter='*LitePointSet*'`
-Expected: 编译失败，`'point_enabled' is not a member`
-
-- [ ] **Step 3: 写实现**
-
-在 `LatencyTraceBuffer` 中加一个 `bool _point_enabled[LT_POINT_COUNT]` 位图，构造时按 gflag 填充。`lite` 集合的 12 个点位为：`LT_C_RPC_START`、`LT_C_WRITE_ENQUEUE`、`LT_C_WRITE_END`、`LT_C_WAKE`、`LT_C_READV_START`、`LT_C_RPC_END`、`LT_S_WAKE`、`LT_S_READV_START`、`LT_S_SERVICE_START`、`LT_S_SERVICE_END`、`LT_S_WRITE_ENQUEUE`、`LT_S_WRITE_END`。`Stamp()` 开头加一行位图判断后再写。
-
-**Σ 恒等式在 `lite` 下仍然成立**，但求和方式不同：Task 11 的 `SumIsIdentity` 对**相邻点位**求和，禁用点位的 `ts` 为 0，直接套用会得出负数与错误的总和。因此不要复用那条测试，另写一条：
-
-```cpp
-TEST(LatencyTraceE2ETest, SumIsIdentityUnderLitePointSet) {
-    // Sum over consecutive ENABLED points only. The identity survives
-    // because dropping an interior point merges two adjacent intervals
-    // into one -- it never changes the endpoints.
-    const brpc::LatencyTraceRecord* c = FindClientRecordForTest();
-    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
-    int prev = -1;
-    int64_t sum = 0;
-    for (int p = brpc::LT_C_RPC_START; p <= brpc::LT_C_RPC_END; ++p) {
-        if (!b->point_enabled(p)) {
-            continue;
-        }
-        if (prev >= 0 && prev != brpc::LT_C_WRITE_END) {
-            sum += (int64_t)c->ts[p] - (int64_t)c->ts[prev];
-        }
-        prev = p;
-    }
-    // ... plus the server span and the link halves, as in SumIsIdentity
-    const int64_t e2e = (int64_t)c->ts[brpc::LT_C_RPC_END] -
-                        (int64_t)c->ts[brpc::LT_C_RPC_START];
-    ASSERT_EQ(e2e, sum + LinkAndServerSpanForTest(c));
-}
-```
-
-`LinkAndServerSpanForTest(c)` 复用 Task 11 中 `rtt - srv + srv_sum` 的算法，在本任务提取成测试内的辅助函数，Task 11 的 `SumIsIdentity` 同步改为调用它 —— 避免同一段算法在两处各写一遍。
-
-- [ ] **Step 4: 跑测试确认通过**
-
-Run: `ssh suzhou950 'cd ~/brpc-lt/test && ./brpc_latency_trace_unittest`
-Expected: 全部 PASS，含 `lite` 与 `full` 两种模式下的 Σ 恒等
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/brpc/latency_trace.h src/brpc/latency_trace.cpp test/brpc_latency_trace_unittest.cpp
-git commit -m "feat(latency-trace): add the lite point set for low-overhead RDMA runs"
-```
+因此**本任务不执行**，`-latency_trace_point_set` gflag 整体不实现，
+spec §8.1 的 flags 表中该行已删除。点位数恒为 36。
 
 ---
 

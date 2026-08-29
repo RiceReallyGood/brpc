@@ -328,7 +328,6 @@ LT_STAMP(handle, POINT_ID)   // BRPC_LATENCY_TRACE 未定义时展开为空语�
 | `-latency_trace_enabled` | `false` | 运行时总开关 |
 | `-latency_trace_capacity` | `100000` | 记录条数上限 |
 | `-latency_trace_dump_path` | 空 | 落盘路径；空则不落盘 |
-| `-latency_trace_point_set` | `full` | `full` / `lite`（见 §11 Phase 0 结论） |
 
 **时钟校准**：dump 文件头写入若干组 `(raw_counter, CLOCK_REALTIME)` 采样对（进程启动时与 dump 时各一组），供离线换算。
 
@@ -447,7 +446,9 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 | TCP loopback | 30~60 μs | 1~5%，可接受 |
 | RDMA | 5~15 μs | 3~28%，**可能改变待观察的分布形状** |
 
-**Phase 0 是硬性前置**：先写 microbenchmark 实测单次打点成本，拿到真实数字后再决定 RDMA 下默认使用全量 36 点还是 `lite` 点位集（约 12 个跨阶段边界点，牺牲「payload 序列化 vs metadata 序列化」这类细分）。
+**Phase 0 已完成，结论：全量 36 点。** 实测单次打点 5.9~7.2 ns（`butil::detail::clock_cycles()` 直读计数器），36 点总开销 **0.263~0.268 μs**，占 RDMA 5~15 μs 端到端的 1.8~5.4%，远低于 10% 阈值。`lite` 点位集与 `-latency_trace_point_set` gflag **均不实现**。完整数据见 `docs/superpowers/plans/phase0-results.md`。
+
+同时实测确认：两台 aarch64 机器的计数器经验频率分别为 100.001 MHz 与 99.994 MHz，**互差 0.007%**，远低于本节要求的 0.1% 告警阈值 —— §6 的 `L = RTT − S` 所依赖的「两端时钟频率一致」前提成立。另外 `clock_gettime(CLOCK_MONOTONIC)` 实测 23.2 ns/次，比直读计数器贵 3.6~4.5 倍，坐实了 §8.1 不使用 `cpuwide_time_ns()` 的选择。
 
 ---
 
@@ -475,5 +476,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 | 追踪构建与生产构建 ABI 不同 | 文档明示；两端必须使用同一构建配置 |
 | 缓冲满后停止记录导致窗口截断 | 文件头记录丢弃数；HTML 显式提示窗口是否被截断 |
 | RDMA 轮询模式下收包排队相关四项恒为 0，易被误读为埋点缺失 | 记哨兵值而非 0，HTML 标注「该模式下不存在」；见 §8.5 |
+| **计数器分辨率 10 ns/tick 淹没最小的分解项** | 100 MHz 计数器每 10 ns 才跳一次。一次 5 μs 的 RDMA RPC 只有约 500 个 tick 要分给 35 项，而 `srv_dispatch`、`srv_to_service`、`srv_service_to_ser`、`cli_lookup_cntl`、`cli_post_deser`、`cli_rpc_finish` 这几个间隙项的真实值可能只有几十纳秒 —— 相邻两次打点若相距不足 10 ns 会读到**同一个 tick**，该项显示为 0。缓解：这是硬件下限，无法消除；`merge.py` 对量化到 0 的项标注「低于计数器分辨率」，HTML 中以不同纹理绘制，避免被读成「这一段不耗时」。聚合视图（1 万~10 万请求的分布）中量化噪声会被平均掉，逐请求 hover 值则天生是 10 ns 的整数倍 |
+| **每个区间含一次打点自身的执行时间，构成系统性正偏置** | 区间恒为 `ts[N+1] − ts[N]`，其中必然包含后一次打点自身的 5.9~7.2 ns。绝对值很小，但对上一行那几个几十纳秒的间隙项，相对偏差可达 10~20%。缓解：在 `merge.py` 与 HTML 的说明中写明该偏置的量级；不做自动扣减 —— 扣减需要假设每次打点成本恒定，而实测本身是最好情形下的值 |
 | 分解项出现负值 | 瀑布式渲染，斜纹标记，默认全部绘制并统计占比；柱高不变量不受影响。见 §9.3 |
 | `write_end` 埋点位置不当会系统性制造负 RTT | 落点定在 `DoWrite` 中 `CutFromIOBufList()` 返回后，而非 `ReturnSuccessfulWriteRequest`。见 §8.4 |
