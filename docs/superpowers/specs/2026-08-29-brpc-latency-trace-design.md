@@ -96,7 +96,7 @@
 | C05 | `req_meta_ser_end` | `SerializeRpcHeaderAndMeta()` 返回后 |
 | C06 | `write_enqueue` | `Socket::Write()` 入口（`socket.cpp:1617`） |
 | C07 | `write_start` | `Socket::DoWrite()` 中 `CutFromIOBufList()` 调用前（`socket.cpp:1902`） |
-| C08 | `write_end` | `ReturnSuccessfulWriteRequest()`（`socket.cpp:509`） |
+| C08 | `write_end` | `Socket::DoWrite()` 中 `CutFromIOBufList()` **返回后**立即遍历本批次，对 `data` 已清空的 WriteRequest 就地打戳（见 §8.4） |
 | C09 | `wake` | `epoll_wait` 返回（RDMA：CQE 被 poll 出） |
 | C10 | `onedge_start` | `Transport::OnEdge` 入口（`transport.h:31`） |
 | C11 | `readv_start` | `InputMessenger::OnNewMessages` 循环内 `m->DoRead()` 前 |
@@ -129,7 +129,7 @@
 | S14 | `rsp_meta_ser_end` | `SerializeRpcHeaderAndMeta()` 返回后（`:401`） |
 | S15 | `write_enqueue` | `Socket::Write()` 入口 |
 | S16 | `write_start` | `Socket::DoWrite()` 中 `CutFromIOBufList()` 前 |
-| S17 | `write_end` | `ReturnSuccessfulWriteRequest()` |
+| S17 | `write_end` | 同 C08 |
 
 ---
 
@@ -226,7 +226,7 @@ L   = RTT − S        （总链路时间，与时钟偏移无关，恒精确）
 link_up = link_down = L / 2
 ```
 
-免疫时钟偏移与频率漂移。缺点：强制上下行对称，把归因噪声均摊掉。`L < 0` 的记录单独标记，HTML 中可筛选，**不静默裁剪为 0**。
+免疫时钟偏移与频率漂移。缺点：强制上下行对称，把归因噪声均摊掉。`L < 0` 的记录单独标记，HTML 中可筛选，**不静默裁剪为 0**（渲染方式见 §9.3）。
 
 ### 6.2 模型 B：每连接滑窗估 offset
 
@@ -313,7 +313,7 @@ LT_STAMP(handle, POINT_ID)   // BRPC_LATENCY_TRACE 未定义时展开为空语�
 |---|---|---|
 | 请求内点位 | `Controller` 存 8 字节 handle | 客户端全程可用 |
 | 事件级点位<br>（C09–C11 / S01–S03） | `Socket` 增 3 个字段 → `ProcessNewMessage` 时拷入 `InputMessageBase`（增 4 字段）→ 解析出 handle 后拷入槽 | **同一批次的多条消息共享同一个 `wake` 值**。这是 §6.2 所述污染的来源，在数据中可见（时间戳相同即同批），不隐藏 |
-| 写完成点位<br>（C08 / S17） | `WriteRequest` 增 8 字节 handle（`#ifdef` 内） | `ReturnSuccessfulWriteRequest` 直接按 handle 回填，**不阻塞**，不使用 rpcz 那套 `bthread_id_join` |
+| 写完成点位<br>（C08 / S17） | `WriteRequest` 增 8 字节 handle（`#ifdef` 内） | 时间戳在 `DoWrite` 中 `CutFromIOBufList()` 返回后就地打戳（见 §8.4），按 handle 直接回填，**不阻塞**，不使用 rpcz 那套 `bthread_id_join` |
 | handle 尚不可得的点位<br>（C13/C14、S05/S06） | 先落函数局部变量，`bthread_id_lock` 取回 Controller 后一次性写入槽 | 因 `ProcessRpcResponse` 是先解 meta 再 lock（`baidu_rpc_protocol.cpp:940` / `:950`） |
 
 `epoll_wait` 返回的时间戳存入 TLS，同一次返回的 N 个事件共享该值 —— 这是正确语义（它们确实是同一次唤醒）。
@@ -332,7 +332,17 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 
 `trace_id` 生成：进程启动时取一个 64 位随机 `g_process_tag`，`trace_id = (g_process_tag & 0xFFFFFFFF00000000ULL) | seq`，保证跨进程唯一。
 
-### 8.4 RDMA 差异
+### 8.4 `write_end` 为什么不落在 `ReturnSuccessfulWriteRequest`
+
+初版设计把 `write_end` 放在 `ReturnSuccessfulWriteRequest()`（`socket.cpp:509`），因为那是「WriteRequest 写完」的唯一汇聚点。**这个位置会产生系统性的负值**，必须避开。
+
+原因：`ReturnSuccessfulWriteRequest` 是 `writev` / `ibv_post_send` 返回**之后**的一个额外步骤。在 `KeepWrite` 路径上它还要先经过 `IsWriteComplete()`（`socket.cpp:1871`）。也就是说字节早已交给内核或网卡，`write_end` 却尚未打戳。在 RDMA 或 loopback 这类极快路径上，**响应的 `wake` 完全可能早于本请求的 `write_end`**，于是 `RTT = C09 − C08 < 0`，进而 `L = RTT − S` 大幅为负。这不是归因污染，是埋点位置错误。
+
+正确落点：`Socket::DoWrite()` 中 `_transport->CutFromIOBufList()` 返回后（`socket.cpp:1902`）立即遍历本次批处理的 WriteRequest 链，对 `data` 已清空者就地打戳。这既精确表达「本请求最后一个字节交给内核/网卡的时刻」，又完全躲开 `KeepWrite` 的调度延迟。
+
+`ReturnSuccessfulWriteRequest` 仍然是 handle 回填与记录收尾的落点，但时间戳取自上述更早、更准的位置。
+
+### 8.5 RDMA 差异
 
 **写侧零增量**：共用 `Socket::Write` → `StartWrite`/`KeepWrite` → `DoWrite`，仅末跳换成 `_rdma_ep->CutFromIOBufList()`（`socket.cpp:1902`，`rdma_transport.cpp:100`）。`write_end` 一律取 `ibv_post_send` 返回时刻，**不取 send CQE**：RC 的 send completion 隐含对端 ACK，会把一个单程链路时间错算进「write 接口时间」，破坏 §6 的语义。
 
@@ -376,6 +386,16 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 
 ---
 
+### 9.3 负分解项的渲染
+
+分解项可以为负，主要出现在两个链路项上（模型 B 下更常见）。**负值不被裁剪、不被隐藏、不被均摊**。
+
+渲染按**瀑布图**语义而非普通堆叠图：令 `y_k = Σ_{i≤k} seg_i`，第 k 段占据纵向区间 `[y_{k-1}, y_k]`。若 `seg_k < 0` 则 `y_k < y_{k-1}`，该段是一条**向下回退、与前序段重叠**的带子，用斜纹半透明填充加明显描边绘制，斜纹透出下层颜色使两段同时可见。
+
+**柱高不变量不受影响**：因 `y_35 = Σ(35 项) = C19 − C01` 是恒等式，柱子最高点始终精确等于端到端时延，与各段符号无关。
+
+**默认全部绘制**，不过滤任何请求。含负段的柱子在基线处加红色标记；顶部显示「N 条含负分段（x%）」并可一键筛选。这样做的理由：若负值与长尾相关（例如都源于同一批 epoll 唤醒下的批处理），默认隐藏恰好会藏起最该看的那批请求。另提供两个可选视图 —— 隐藏含负段请求、负段画到零线以下不重叠。
+
 ## 10. 验证
 
 | 类别 | 内容 |
@@ -384,7 +404,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 | 单调性单测 | 36 个点位非零且时间戳单调不减 |
 | 缓冲单测 | generation 覆盖语义、handle 校验拒绝迟到写入、容量满后停止记录并正确计数 |
 | microbenchmark | 单次 `LT_STAMP` 成本（Phase 0 的出口） |
-| 端到端 | 起 server + client 跑 N 个请求，验证两端记录可 100% join，且分解项全部非负（模型 A 下） |
+| 端到端 | 起 server + client 跑 N 个请求，验证两端记录可 100% join。**低并发（每连接 outstanding=1）下**额外断言模型 A 的分解项全部非负 —— 此条件下不存在批处理归因失真，出现负值即表明埋点位置有误（参见 §8.4 的教训）。高并发下不做非负断言，只统计负值比例 |
 | 回归 | 未定义 `BRPC_LATENCY_TRACE` 时，`sizeof(WriteRequest) == 64` 断言仍成立；现有测试全绿 |
 
 ---
@@ -424,4 +444,6 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 | 跨机网络本身上下行不对称 | 模型 A 强制对称，模型 B 的 `O` 会带该不对称的系统性偏差；但**两模型的总链路时间与总柱高均不受影响** |
 | 追踪构建与生产构建 ABI 不同 | 文档明示；两端必须使用同一构建配置 |
 | 缓冲满后停止记录导致窗口截断 | 文件头记录丢弃数；HTML 显式提示窗口是否被截断 |
-| RDMA 轮询模式下收包排队相关四项恒为 0，易被误读为埋点缺失 | 记哨兵值而非 0，HTML 标注「该模式下不存在」；见 §8.4 |
+| RDMA 轮询模式下收包排队相关四项恒为 0，易被误读为埋点缺失 | 记哨兵值而非 0，HTML 标注「该模式下不存在」；见 §8.5 |
+| 分解项出现负值 | 瀑布式渲染，斜纹标记，默认全部绘制并统计占比；柱高不变量不受影响。见 §9.3 |
+| `write_end` 埋点位置不当会系统性制造负 RTT | 落点定在 `DoWrite` 中 `CutFromIOBufList()` 返回后，而非 `ReturnSuccessfulWriteRequest`。见 §8.4 |
