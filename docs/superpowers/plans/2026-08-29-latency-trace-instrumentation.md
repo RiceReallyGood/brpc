@@ -471,6 +471,7 @@ git commit -m "feat(latency-trace): define the 36 trace points and the record la
   - `LatencyTraceHandle AllocSlot(uint64_t trace_id, LatencyTraceRole role);`
   - `void Stamp(LatencyTraceHandle h, int point);`
   - `LatencyTraceRecord* GetForTest(LatencyTraceHandle h);`
+  - `const LatencyTraceRecord* GetBySeqForTest(uint64_t global_seq) const;` —— 按全局序号遍历所有分片中已写入的槽，越界返回 `nullptr`；Task 8 起的端到端测试靠它找记录
   - `size_t recorded_count() const;` / `size_t dropped_count() const;`
   - gflags: `-latency_trace_enabled`（默认 false）、`-latency_trace_capacity`（默认 100000）
 
@@ -544,7 +545,9 @@ TEST_F(LatencyTraceBufferTest, StopsRecordingWhenFullInsteadOfOverwriting) {
     // Spec D-decision: a full buffer stops recording rather than wrapping,
     // so both ends keep the SAME earliest-N window and stay joinable.
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
-    b->ResetForTest(8);
+    // Capacity is per-shard after division, and one thread only ever uses
+    // one shard -- so ask for SHARD_COUNT*8 to get 8 usable slots here.
+    b->ResetForTest(brpc::LatencyTraceBuffer::SHARD_COUNT * 8);
     b->set_stop_when_full(true);
     for (int i = 0; i < 8; ++i) {
         ASSERT_NE(brpc::LT_INVALID_HANDLE, b->AllocSlot(i, brpc::LT_ROLE_CLIENT));
@@ -590,6 +593,11 @@ public:
     // Returns nullptr when the handle is stale.
     LatencyTraceRecord* Get(LatencyTraceHandle h);
     LatencyTraceRecord* GetForTest(LatencyTraceHandle h) { return Get(h); }
+
+    // Iterates every written slot across all shards by a flat index, so a
+    // test can find records without knowing the sharding. Returns nullptr
+    // once `global_seq` is past the last written slot.
+    const LatencyTraceRecord* GetBySeqForTest(uint64_t global_seq) const;
 
     size_t recorded_count() const;
     size_t dropped_count() const;
@@ -686,8 +694,17 @@ LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
     if (!FLAGS_latency_trace_enabled) {
         return LT_INVALID_HANDLE;
     }
-    // Spread shards by thread id; exact distribution does not matter.
-    const int shard = (int)(((uintptr_t)&trace_id >> 6) & (SHARD_COUNT - 1));
+    // One shard per thread, assigned round-robin on first use. Do NOT
+    // derive this from a stack address: the address of a parameter is
+    // effectively constant within a thread, which happens to give the
+    // right answer while looking like it hashes something.
+    static butil::atomic<int> s_next_shard(0);
+    static __thread int tls_shard = -1;
+    if (tls_shard < 0) {
+        tls_shard = s_next_shard.fetch_add(1, butil::memory_order_relaxed)
+                    & (SHARD_COUNT - 1);
+    }
+    const int shard = tls_shard;
     Shard& sh = _shards[shard];
     const uint64_t seq = sh.cursor.fetch_add(1, butil::memory_order_relaxed);
     if (_stop_when_full && seq >= (uint64_t)_per_shard_capacity) {
@@ -746,7 +763,7 @@ size_t LatencyTraceBuffer::dropped_count() const {
 }  // namespace brpc
 ```
 
-**注意 `StopsRecordingWhenFull` 测试用 `ResetForTest(8)`，8 / 16 分片会得到每分片 1 槽。** 若测试因分片导致计数对不上，把该测试改为 `ResetForTest(SHARD_COUNT * 8)` 并相应调整期望值 —— 不要为了让测试通过而弱化「满了停止」的语义。
+**容量语义：`ResetForTest(n)` 的 `n` 是总容量，除以 `SHARD_COUNT` 后向上取 2 的幂得到每分片容量。单线程只用一个分片，所以测试要拿到 8 个可用槽必须传 `SHARD_COUNT * 8`。** 不要为了让测试通过而弱化「满了停止」的语义。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -937,11 +954,15 @@ struct LatencyTraceFileHeader {
     uint64_t record_count;
     uint64_t dropped_count;
     uint64_t process_tag;         // random per process, high bits of trace_id
-    char     padding[128 - 88];
+    uint64_t method_table_offset; // byte offset of the method-name table,
+                                  // written by Task 13; 0 until then
+    char     padding[128 - 96];
 };
 ```
 
 在 `LatencyTraceBuffer` 中加 `int Dump(const char* path);` 与私有成员 `uint64_t _head_counter; int64_t _head_realtime_ns; uint64_t _process_tag;`，在构造函数中初始化。`Dump` 实现：取尾部标定对，算经验频率，写头，再顺序写出每个分片中 `slot_seq != UINT64_MAX` 的记录。
+
+**标定窗口下限**：经验频率是 `Δcounter / Δrealtime`，窗口太短则商完全是噪声 —— 单测里 `ResetForTest` 之后立刻 `Dump`，两个采样点可能只差几微秒，算出的频率毫无意义。因此 `Dump()` 必须先检查 `tail_realtime_ns - _head_realtime_ns`，**不足 100 ms 时先 `nanosleep` 补足再取尾部采样对**。这在真实的退出时 dump 路径上永远不会触发（进程早跑过 100 ms），只在单测里生效。
 
 `cntfrq_el0_hz` 的读取：
 
@@ -1259,8 +1280,6 @@ static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
 }
 ```
 
-这要求 `LatencyTraceBuffer` 再暴露一个 `const LatencyTraceRecord* GetBySeqForTest(uint64_t global_seq) const;` —— 按全局序号遍历所有分片中已写入的槽，越界返回 `nullptr`。**在本任务补进 Task 3 建立的类**，并补一条单测断言其遍历顺序稳定。
-
 `EchoServiceImpl` 需在测试文件内实现 `test::EchoService`（`test/echo.proto:55`，package 为 `test`），`Echo` 方法用 `brpc::ClosureGuard done_guard(done);` 开头并把 `request->message()` 原样写入 `response`。
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1287,11 +1306,11 @@ Expected: FAIL —— `r` 为 nullptr，或各点位全为 0
     {
         static butil::atomic<uint64_t> s_lt_seq(0);
         const uint64_t seq = s_lt_seq.fetch_add(1, butil::memory_order_relaxed);
-        ControllerPrivateAccessor(cntl).set_latency_trace(
-            MakeLatencyTraceId(seq),
-            LT_ALLOC(MakeLatencyTraceId(seq), LT_ROLE_CLIENT));
-        LT_STAMP(ControllerPrivateAccessor(cntl).latency_trace_handle(),
-                 LT_C_RPC_START);
+        const uint64_t trace_id = MakeLatencyTraceId(seq);
+        ControllerPrivateAccessor accessor(cntl);
+        accessor.set_latency_trace(trace_id,
+                                   LT_ALLOC(trace_id, LT_ROLE_CLIENT));
+        LT_STAMP(accessor.latency_trace_handle(), LT_C_RPC_START);
     }
 #endif
 ```
@@ -1710,7 +1729,7 @@ Expected: FAIL —— 各元数据字段为 0，且只有 1 条客户端记录
 | `socket_id` / `remote_ip` / `remote_port` | `IssueRPC` 拿到 socket 后 | `ProcessRpcRequest` 中 `msg->socket()` |
 | `method_id` | 见下 |
 
-`method_id` 用一个进程内的字符串→序号表：`uint32_t brpc::LatencyTraceMethodId(const std::string& full_name);` 加在 `latency_trace.cpp`，内部用 `butil::FlatMap<std::string, uint32_t>` 加互斥量，首次出现时分配递增序号。**该表随 dump 一起落盘**，追加在记录之后，格式为 `uint32 count` 后跟 `count` 个 `uint32 len + bytes`。`LatencyTraceFileHeader` 增加 `uint64_t method_table_offset;`，从 `padding` 中扣出 8 字节。
+`method_id` 用一个进程内的字符串→序号表：`uint32_t brpc::LatencyTraceMethodId(const std::string& full_name);` 加在 `latency_trace.cpp`，内部用 `butil::FlatMap<std::string, uint32_t>` 加互斥量，首次出现时分配递增序号。**该表随 dump 一起落盘**，追加在记录之后，格式为 `uint32 count` 后跟 `count` 个 `uint32 len + bytes`，其字节偏移写入 Task 5 已预留的 `LatencyTraceFileHeader::method_table_offset`（在此之前该字段恒为 0）。
 
 重试 attempt：`Controller::IssueRPC` 中，若 `_lt_handle` 已有值（说明这是重试而非首发），则**重新 `AllocSlot`** 拿一个新槽，`attempt` 置为当前重试次数，并把新 trace_id 写进 meta。旧槽保持原样，作为一条独立记录留在缓冲里。
 
@@ -1779,7 +1798,34 @@ Expected: 编译失败，`'point_enabled' is not a member`
 
 在 `LatencyTraceBuffer` 中加一个 `bool _point_enabled[LT_POINT_COUNT]` 位图，构造时按 gflag 填充。`lite` 集合的 12 个点位为：`LT_C_RPC_START`、`LT_C_WRITE_ENQUEUE`、`LT_C_WRITE_END`、`LT_C_WAKE`、`LT_C_READV_START`、`LT_C_RPC_END`、`LT_S_WAKE`、`LT_S_READV_START`、`LT_S_SERVICE_START`、`LT_S_SERVICE_END`、`LT_S_WRITE_ENQUEUE`、`LT_S_WRITE_END`。`Stamp()` 开头加一行位图判断后再写。
 
-**注意：`lite` 下 Σ 恒等式仍然成立**（相邻已启用点位之间的差值求和仍等于端到端），只是分解粒度从 35 项降到 11 项。Task 11 的 `SumIsIdentity` 测试需在 `lite` 模式下另跑一遍，断言同样通过。
+**Σ 恒等式在 `lite` 下仍然成立**，但求和方式不同：Task 11 的 `SumIsIdentity` 对**相邻点位**求和，禁用点位的 `ts` 为 0，直接套用会得出负数与错误的总和。因此不要复用那条测试，另写一条：
+
+```cpp
+TEST(LatencyTraceE2ETest, SumIsIdentityUnderLitePointSet) {
+    // Sum over consecutive ENABLED points only. The identity survives
+    // because dropping an interior point merges two adjacent intervals
+    // into one -- it never changes the endpoints.
+    const brpc::LatencyTraceRecord* c = FindClientRecordForTest();
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    int prev = -1;
+    int64_t sum = 0;
+    for (int p = brpc::LT_C_RPC_START; p <= brpc::LT_C_RPC_END; ++p) {
+        if (!b->point_enabled(p)) {
+            continue;
+        }
+        if (prev >= 0 && prev != brpc::LT_C_WRITE_END) {
+            sum += (int64_t)c->ts[p] - (int64_t)c->ts[prev];
+        }
+        prev = p;
+    }
+    // ... plus the server span and the link halves, as in SumIsIdentity
+    const int64_t e2e = (int64_t)c->ts[brpc::LT_C_RPC_END] -
+                        (int64_t)c->ts[brpc::LT_C_RPC_START];
+    ASSERT_EQ(e2e, sum + LinkAndServerSpanForTest(c));
+}
+```
+
+`LinkAndServerSpanForTest(c)` 复用 Task 11 中 `rtt - srv + srv_sum` 的算法，在本任务提取成测试内的辅助函数，Task 11 的 `SumIsIdentity` 同步改为调用它 —— 避免同一段算法在两处各写一遍。
 
 - [ ] **Step 4: 跑测试确认通过**
 
