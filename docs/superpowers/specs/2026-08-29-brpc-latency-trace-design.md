@@ -309,7 +309,21 @@ link_up = link_down = L / 2
 
 不使用 `butil::cpuwide_time_ns()` 的理由：两个构建系统的 `WITH_CPU_FREQUENCY` **默认均为 0**（`config_brpc.sh:70`，`CMakeLists.txt:81`），此时 `cpuwide_time_ns()` 退化为 `clock_gettime(CLOCK_MONOTONIC)` 的 vDSO 调用（`butil/time.h:279-284`），比一条 `mrs` 指令贵得多。Phase 0 将实测二者差值。
 
-**缓冲**：分片环形数组，分片数取「worker 数向上取 2 的幂」。分配槽为 `cursor.fetch_add(1)`；`handle = (shard << 56) | seq`，槽下标 `seq & mask`。每次写入前校验槽内 `handle_seq` 是否仍等于 handle 携带的 seq，不等则丢弃该次写入 —— 防止迟到的回填（例如卡住很久的 `KeepWrite`）写脏已被复用的槽。
+**缓冲**：分片环形数组，分片数取「worker 数向上取 2 的幂」。分配槽为 `cursor.fetch_add(1)`；`handle = (shard << 56) | seq`，槽下标 `seq & mask`。每次写入前校验槽内 `slot_seq` 是否仍等于 handle 携带的 seq，不等则丢弃该次写入 —— 防止迟到的回填（例如卡住很久的 `KeepWrite`）写脏已被复用的槽。
+
+**`slot_seq` 的写入顺序是这套机制的全部要害，必须是**：
+
+1. 先把 `slot_seq` 置为 `UINT64_MAX` 哨兵（「正在改写，任何 handle 都不匹配」）
+2. 再 memset `ts[]`、重置元数据字段、写 `trace_id` / `base_counter` / `role`
+3. **最后**以 release 语义写入真实的 `seq`
+
+`Get()` 以 acquire 语义读 `slot_seq`。
+
+**若把第 3 步的写入放在最前或中间，守卫就是失效的**：占坑与写入 `seq` 之间的窗口里，`slot_seq` 仍是**前一个占用者的真实 seq**，恰好那一代的迟到 handle 会「匹配成功」并写进一条正在初始化的记录 —— 正是本机制要防的那件事。
+
+release/acquire 配对同时解决发布问题：`cursor.fetch_add` 发生在写入负载**之前**，因此 cursor 无论用什么内存序都不能充当发布点，跨线程读取（§8.1 的 `Dump`）必须依赖 `slot_seq` 这一对。
+
+**「满了停止」不是可调策略**：关闭它会同时破坏跨端 join 的窗口对齐（见下）并重新打开上述竞态，因此其开关只能是测试专用的。
 
 **缓冲满的策略：停止记录，不覆盖。** 覆盖式会让两端各自保留「最近 N 条」，两端窗口对不上；停止记录则两端都是「最早 N 条」，天然对齐。丢弃计数写入文件头。
 
