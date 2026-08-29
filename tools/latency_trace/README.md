@@ -19,6 +19,35 @@ this remote form. Edit locally, build/run on suzhou950, commit locally.
 "gperftools: deliberately not installed" below for why, and for what it
 does and does not cover.
 
+## Overriding host/destination: `LT_BUILD_HOST` / `LT_BUILD_DIR`
+
+`sync950.sh` reads two optional environment variables:
+
+- `LT_BUILD_HOST` (default `suzhou950`) — the ssh target.
+- `LT_BUILD_DIR` (default `brpc-lt`, i.e. `~/brpc-lt` on the remote) — the
+  destination directory, given as a path **on the remote host**.
+
+```bash
+LT_BUILD_HOST=other-host LT_BUILD_DIR=brpc-lt-2 ./tools/latency_trace/sync950.sh
+```
+
+**`LT_BUILD_DIR` must stay relative (or be an explicit remote-absolute
+path), never a `~`-prefixed one, even though the default looks like it
+should support that.** The default is the bare word `brpc-lt` — no
+tilde — precisely so it resolves correctly: a non-interactive
+`ssh host cmd` starts in the remote user's home directory, so a plain
+relative path always lands under the *remote* `$HOME` with no tilde
+expansion needed anywhere. If you instead write
+`LT_BUILD_DIR=~/other-dir ./sync950.sh`, this local shell expands the
+`~` immediately, against your *local* `$HOME`, before the script ever
+runs — turning `~/other-dir` into e.g. `/home/alice/other-dir` locally,
+which then gets sent to the remote host as an absolute path that has
+nothing to do with the remote home. Without a guard, that would sync
+"successfully" to a nonsense location on the remote filesystem with no
+error at all. `sync950.sh` detects this specific case — a `LT_BUILD_DIR`
+that already starts with your local `$HOME` — and refuses to run,
+printing an explanation, instead of syncing to the wrong place.
+
 ## One-time setup / regenerating config.mk
 
 `sync950.sh` only pushes `src test tools Makefile config_brpc.sh
@@ -36,7 +65,7 @@ look like the obvious default) — both are wrong on this host:
 - `--libs=/usr/lib64`, not `/usr/lib`: gflags/protobuf/leveldb/absl `.so`/`.a`
   files live under `/usr/lib64` on this openEuler aarch64 host. `/usr/lib`
   is a near-empty separate directory. Passing `/usr/lib` makes
-  `config_brpc.sh`'s `find_dir_of_header_or_die` fail *inside a `$(...)`
+  `config_brpc.sh`'s `find_dir_of_lib_or_die` fail *inside a `$(...)`
   subshell*, so the `exit 1` only kills the subshell — the top-level
   script does not stop, it just silently records an empty lib dir. The
   result is a `config.mk` with bare `-l -l` (no library name) in
