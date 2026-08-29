@@ -305,7 +305,9 @@ link_up = link_down = L / 2
 
 存**相对偏移**而非绝对值，把 `36 × 8` 压到 `36 × 4`。`uint32` 在 3 GHz TSC 下可表示 1.43 秒，足够覆盖单次 RPC。
 
-存**原始计数值**、不做频率转换：`butil::cpuwide_time_ns()` 每次调用要做一次乘法与移位（`butil/time.h:283`），全部省掉，换算移至离线。
+存**原始计数值**，换算移至离线。计数器读取直接复用 `butil::detail::clock_cycles()`（`butil/time.h:217-266`），它已封装各架构实现，aarch64 即 `mrs cntvct_el0`。
+
+不使用 `butil::cpuwide_time_ns()` 的理由：两个构建系统的 `WITH_CPU_FREQUENCY` **默认均为 0**（`config_brpc.sh:70`，`CMakeLists.txt:81`），此时 `cpuwide_time_ns()` 退化为 `clock_gettime(CLOCK_MONOTONIC)` 的 vDSO 调用（`butil/time.h:279-284`），比一条 `mrs` 指令贵得多。Phase 0 将实测二者差值。
 
 **缓冲**：分片环形数组，分片数取「worker 数向上取 2 的幂」。分配槽为 `cursor.fetch_add(1)`；`handle = (shard << 56) | seq`，槽下标 `seq & mask`。每次写入前校验槽内 `handle_seq` 是否仍等于 handle 携带的 seq，不等则丢弃该次写入 —— 防止迟到的回填（例如卡住很久的 `KeepWrite`）写脏已被复用的槽。
 
@@ -328,7 +330,11 @@ LT_STAMP(handle, POINT_ID)   // BRPC_LATENCY_TRACE 未定义时展开为空语�
 | `-latency_trace_dump_path` | 空 | 落盘路径；空则不落盘 |
 | `-latency_trace_point_set` | `full` | `full` / `lite`（见 §11 Phase 0 结论） |
 
-**时钟校准**：dump 文件头写入若干组 `(raw_counter, CLOCK_REALTIME)` 采样对与计数器频率（频率取自 `butil` 现有的 `read_cpu_frequency()` 路径），供离线换算成实时并做跨进程对齐的辅助校验。
+**时钟校准**：dump 文件头写入若干组 `(raw_counter, CLOCK_REALTIME)` 采样对（进程启动时与 dump 时各一组），供离线换算。
+
+**频率必须由本模块自行标定，不能依赖 `butil`**：`BUTIL_USE_CPU_FREQUENCY=0` 时 `detail::invariant_cpu_freq` 根本不计算。标定方式为**经验测量** —— 用首尾两组采样对求 `Δcounter / Δrealtime`。这比读 `CNTFRQ_EL0` 更可靠：它与架构无关（x86 无对应寄存器），且反映实际速率而非标称值。同时额外读取 `CNTFRQ_EL0`（aarch64）写入文件头作**交叉校验**，两者偏差超过 0.1% 时 `merge.py` 告警。
+
+这一项是 D1 公式的正确性前提：`L = RTT − S` 用客户端时钟的时长减服务端时钟的时长，任一台机器的频率标定错误都会给 `L` 引入系统性偏差。
 
 ### 8.2 三类点位的载体与透传
 
@@ -464,6 +470,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 |---|---|
 | 打点开销在 RDMA 下占比过高 | Phase 0 实测 + `lite` 点位集；同一二进制下 gflag 开关对照，量化影响 |
 | 一次 wake 覆盖多条消息导致 `S01` 归因失真 | 数据中可见（同批时间戳相同）；模型 B 将其暴露为 `link_up < 0`；HTML 可筛选 |
+| 两台机器的计数器频率标定不准，导致 `L = RTT − S` 系统性偏差 | 频率由首尾采样对经验标定，并与 `CNTFRQ_EL0` 交叉校验；偏差超 0.1% 时 `merge.py` 告警。见 §8.1 |
 | 跨机网络本身上下行不对称 | 模型 A 强制对称，模型 B 的 `O` 会带该不对称的系统性偏差；但**两模型的总链路时间与总柱高均不受影响** |
 | 追踪构建与生产构建 ABI 不同 | 文档明示；两端必须使用同一构建配置 |
 | 缓冲满后停止记录导致窗口截断 | 文件头记录丢弃数；HTML 显式提示窗口是否被截断 |
