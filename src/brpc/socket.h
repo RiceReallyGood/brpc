@@ -43,6 +43,7 @@
 #include "brpc/versioned_ref_with_id.h"
 #include "brpc/health_check_option.h"
 #include "brpc/socket_mode.h"
+#include "brpc/latency_trace.h"
 
 namespace brpc {
 namespace policy {
@@ -416,6 +417,13 @@ public:
         // Default: false
         bool shutdown_write;
 
+#if defined(BRPC_LATENCY_TRACE)
+        // Trace record this write belongs to, and which side is writing.
+        // Default: LT_INVALID_HANDLE / LT_ROLE_CLIENT
+        LatencyTraceHandle lt_handle;
+        LatencyTraceRole lt_role;
+#endif
+
         WriteOptions()
             : id_wait(INVALID_BTHREAD_ID)
             , notify_on_success(false)
@@ -424,7 +432,12 @@ public:
             , auth_flags(0)
             , ignore_eovercrowded(false)
             , write_in_background(false)
-            , shutdown_write(false) {}
+            , shutdown_write(false)
+#if defined(BRPC_LATENCY_TRACE)
+            , lt_handle(LT_INVALID_HANDLE)
+            , lt_role(LT_ROLE_CLIENT)
+#endif
+        {}
     };
 
     // True if write of socket is shutdown.

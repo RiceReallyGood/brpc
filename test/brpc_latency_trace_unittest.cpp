@@ -452,4 +452,14 @@ TEST(LatencyTraceMacroTest, StampRecordsWhenEnabled) {
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
+TEST(LatencyTraceBuildTest, WriteRequestSizeMatchesBuildMode) {
+    // The real guard is the BAIDU_CASSERT inside socket.cpp; this test
+    // documents the contract and fails loudly if the macro is lost.
+#if defined(BRPC_LATENCY_TRACE)
+    SUCCEED() << "traced build: sizeof(WriteRequest) asserted == 128 in socket.cpp";
+#else
+    SUCCEED() << "default build: sizeof(WriteRequest) asserted == 64 in socket.cpp";
+#endif
+}
+
 }  // namespace

@@ -37,6 +37,7 @@
 #include "butil/class_name.h"                     // butil::class_name
 #include "butil/memory/scope_guard.h"
 #include "brpc/log.h"
+#include "brpc/latency_trace.h"
 #include "brpc/reloadable_flags.h"          // BRPC_VALIDATE_GFLAG
 #include "brpc/errno.pb.h"
 #include "brpc/event_dispatcher.h"          // RemoveConsumer
@@ -313,6 +314,12 @@ struct BAIDU_CACHELINE_ALIGNMENT Socket::WriteRequest {
     butil::IOBuf data;
     WriteRequest* next;
     bthread_id_t id_wait;
+#if defined(BRPC_LATENCY_TRACE)
+    // Which trace record this write belongs to. Written at Socket::Write()
+    // entry, read back when the batch drains. Lives in the second cacheline
+    // so the hot fields (data/next/id_wait/control bits) stay in the first.
+    LatencyTraceHandle lt_handle;
+#endif
 
     void clear_and_set_control_bits(bool notify_on_success,
                                     bool shutdown_write) {
@@ -2951,7 +2958,11 @@ int Socket::PeekAgentSocket(SocketUniquePtr* out) const {
 
 void Socket::GetStat(SocketStat* s) const {
     BAIDU_CASSERT(offsetof(Socket, _preferred_index) >= 64, different_cacheline);
+#if defined(BRPC_LATENCY_TRACE)
+    BAIDU_CASSERT(sizeof(WriteRequest) == 128, sizeof_write_request_is_128);
+#else
     BAIDU_CASSERT(sizeof(WriteRequest) == 64, sizeof_write_request_is_64);
+#endif
 
     SharedPart* sp = GetSharedPart();
     if (sp != nullptr && sp->extended_stat != nullptr) {
