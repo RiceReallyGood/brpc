@@ -87,6 +87,18 @@ uint64_t MakeLatencyTraceId(uint64_t seq) {
     return (tag << 32) | (uint32_t)seq;
 }
 
+// ts[] stores offset+1, never the raw offset -- see LatencyTraceRecord::ts
+// for why 0 must mean exactly one thing ("never stamped"). Saturates
+// rather than wraps: an offset of exactly UINT32_MAX would otherwise
+// become 0 after +1, recreating the exact ambiguity this encoding exists
+// to remove. `offset` is intentionally 64-bit so a caller (Stamp() and
+// StampAt() both compute it via unsigned subtraction) can pass a value
+// that already overflows 32 bits without this function seeing a
+// pre-truncated, wrapped-around number.
+static uint32_t EncodeOffset(uint64_t offset) {
+    return (offset >= 0xFFFFFFFFULL) ? 0xFFFFFFFFu : ((uint32_t)offset + 1);
+}
+
 static uint64_t NextPowerOfTwo(uint64_t v) {
     uint64_t r = 1;
     while (r < v) {
@@ -156,6 +168,17 @@ LatencyTraceBuffer* LatencyTraceBuffer::instance() {
 
 LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
                                                  LatencyTraceRole role) {
+    // Client convenience: base_counter == "now". AllocSlot runs at
+    // Channel::CallMethod's entry, immediately before C01 -- allocation
+    // and this record's timeline origin coincide there. See the
+    // 3-argument overload's comment for why the server cannot use this
+    // one.
+    return AllocSlot(trace_id, role, butil::detail::clock_cycles());
+}
+
+LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
+                                                 LatencyTraceRole role,
+                                                 uint64_t base_counter) {
     if (!FLAGS_latency_trace_enabled) {
         return LT_INVALID_HANDLE;
     }
@@ -202,7 +225,7 @@ LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
     butil::atomic_thread_fence(butil::memory_order_release);
     memset(r->ts, 0, sizeof(r->ts));
     r->trace_id = trace_id;
-    r->base_counter = butil::detail::clock_cycles();
+    r->base_counter = base_counter;
     r->role = (uint8_t)role;
     r->attempt = 0;
     // Reset metadata left over from whichever request last owned this
@@ -264,12 +287,14 @@ void LatencyTraceBuffer::Stamp(LatencyTraceHandle h, int point) {
     // cli_write_queue and into cli_write_syscall. Every point being
     // written at most once is a property this data structure guarantees,
     // not something every call site has to remember -- see design doc
-    // sec.10.1. `0` already means "not stamped" everywhere ts[] is read,
-    // so it is the natural sentinel for "not yet written".
+    // sec.10.1. Since ts[] encodes offset+1 (see LatencyTraceRecord::ts),
+    // `0` unambiguously means "not stamped" here -- unlike a raw offset,
+    // it cannot also be a legitimate value this branch would wrongly
+    // treat as "already written".
     if (r->ts[point] != 0) {
         return;
     }
-    r->ts[point] = (uint32_t)(butil::detail::clock_cycles() - r->base_counter);
+    r->ts[point] = EncodeOffset(butil::detail::clock_cycles() - r->base_counter);
 }
 
 void LatencyTraceBuffer::StampAt(LatencyTraceHandle h, int point,
@@ -284,22 +309,25 @@ void LatencyTraceBuffer::StampAt(LatencyTraceHandle h, int point,
     }
     // `raw_counter` is a *historical* sample taken before this record's
     // handle existed (e.g. a Socket wake-up recorded ahead of the slot
-    // that will end up describing it), so it can legitimately predate
-    // `base_counter` -- a wake-up can precede the slot's allocation.
-    // Subtracting unsigned integers in that case would wrap around to a
-    // huge value that would masquerade as a real (and wildly wrong)
-    // timestamp downstream. Clamp to 0 instead: 0 already means "not
-    // stamped" everywhere this array is read, so a point whose true
-    // value is "at or before this record's start" collapses to the same
-    // sentinel as "not observed" rather than fabricating a bogus delta.
-    // The tradeoff: such a clamped write is then indistinguishable from
-    // an unstamped point, so a later legitimate write to the same point
-    // is free to (over)write it -- acceptable because this only happens
-    // when the true value was already unrepresentable in this record's
-    // timeline.
-    r->ts[point] = (raw_counter >= r->base_counter)
-                       ? (uint32_t)(raw_counter - r->base_counter)
-                       : 0;
+    // that will end up describing it). AllocSlot's 3-argument overload
+    // now lets the caller supply `base_counter` as this record's true
+    // timeline origin (the server passes the wake timestamp itself), so
+    // in normal operation `raw_counter >= base_counter` always -- this
+    // clamp is a guard against a case that should no longer occur (a
+    // clock-read reordering or other instrumentation skew), not the
+    // server's default path. Subtracting unsigned integers when it does
+    // happen would wrap around to a huge value that would masquerade as
+    // a real (and wildly wrong) timestamp downstream, so clamp the
+    // offset to 0 instead -- encoded (see EncodeOffset) as 1, a real,
+    // distinguishable stamp meaning "at or before this record's start",
+    // not the unstamped sentinel (0). That distinction matters now that
+    // 0 unambiguously means "never stamped": collapsing this clamp to
+    // literal 0 would silently un-stamp the point and let a later write
+    // clobber it, defeating first-write-wins for no reason the caller
+    // asked for.
+    const uint64_t offset =
+        (raw_counter >= r->base_counter) ? (raw_counter - r->base_counter) : 0;
+    r->ts[point] = EncodeOffset(offset);
 }
 
 const LatencyTraceRecord* LatencyTraceBuffer::GetBySeqForTest(

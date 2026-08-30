@@ -132,6 +132,8 @@ TEST_F(LatencyTraceBufferTest, StampAtWritesHistoricalDeltaIntoRecord) {
     // timestamp sampled earlier (e.g. a Socket-level wake-up copied into
     // an InputMessageBase before any LatencyTraceHandle for it existed)
     // rather than "now", by taking the raw counter value directly.
+    // ts[] stores offset+1 (see LatencyTraceRecord::ts), so a 12345-tick
+    // offset reads back as 12346.
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
     const brpc::LatencyTraceHandle h = b->AllocSlot(1, brpc::LT_ROLE_SERVER);
     ASSERT_NE(brpc::LT_INVALID_HANDLE, h);
@@ -139,22 +141,23 @@ TEST_F(LatencyTraceBufferTest, StampAtWritesHistoricalDeltaIntoRecord) {
 
     const uint64_t base = b->GetForTest(h)->base_counter;
     b->StampAt(h, brpc::LT_S_WAKE, base + 12345);
-    ASSERT_EQ(12345u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+    ASSERT_EQ(12346u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
 }
 
 TEST_F(LatencyTraceBufferTest, StampAtIsFirstWriteWins) {
     // Same rule as Stamp() (see design doc sec.10.1), and it has to hold
-    // regardless of which of the two APIs makes the first write.
+    // regardless of which of the two APIs makes the first write. Encoded
+    // value is offset+1, so a 100-tick offset reads back as 101.
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
     const brpc::LatencyTraceHandle h = b->AllocSlot(2, brpc::LT_ROLE_SERVER);
     const uint64_t base = b->GetForTest(h)->base_counter;
 
     b->StampAt(h, brpc::LT_S_WAKE, base + 100);
-    ASSERT_EQ(100u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+    ASSERT_EQ(101u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
     b->StampAt(h, brpc::LT_S_WAKE, base + 999);   // later StampAt: discarded
-    ASSERT_EQ(100u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+    ASSERT_EQ(101u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
     b->Stamp(h, brpc::LT_S_WAKE);                 // later Stamp: also discarded
-    ASSERT_EQ(100u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+    ASSERT_EQ(101u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
 }
 
 TEST_F(LatencyTraceBufferTest, StampAtRejectsStaleHandle) {
@@ -173,20 +176,87 @@ TEST_F(LatencyTraceBufferTest, StampAtRejectsStaleHandle) {
     b->StampAt(stale, brpc::LT_S_WAKE, 42);       // must be a silent no-op
 }
 
-TEST_F(LatencyTraceBufferTest, StampAtClampsPreBaseCounterValueToZero) {
-    // A historical sample can legitimately predate base_counter -- e.g. a
-    // wake-up recorded on the Socket before AllocSlot ever ran for this
-    // request. raw_counter - base_counter would underflow as unsigned
-    // arithmetic and produce a huge, bogus-looking positive delta; verify
-    // StampAt clamps to 0 (== "not stamped", same sentinel used
-    // everywhere else) instead of letting that happen.
+TEST_F(LatencyTraceBufferTest, StampAtClampsPreBaseCounterValueToOffsetZero) {
+    // A historical sample can still predate base_counter in rare cases
+    // (e.g. a clock-read reordering or other instrumentation skew) even
+    // though AllocSlot's 3-argument overload now lets the caller choose
+    // base_counter to be at or before every point on the record's
+    // timeline (see fix-round item 1) -- so this clamp is a guard
+    // against an anomaly, not the server's normal path anymore.
+    // raw_counter - base_counter would underflow as unsigned arithmetic
+    // and produce a huge, bogus-looking positive delta; verify StampAt
+    // clamps the offset to 0 instead. Encoded, offset 0 is 1 -- a real,
+    // distinguishable stamp ("at or before this record's start"), not
+    // the unstamped sentinel (0): collapsing it to literal 0 would
+    // silently un-stamp the point and let a later write clobber it.
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
     const brpc::LatencyTraceHandle h = b->AllocSlot(4, brpc::LT_ROLE_SERVER);
     const uint64_t base = b->GetForTest(h)->base_counter;
     ASSERT_GT(base, 0u);  // otherwise "predates" can't be constructed below
     b->StampAt(h, brpc::LT_S_WAKE, base - 1);
-    ASSERT_EQ(0u, b->GetForTest(h)->ts[brpc::LT_S_WAKE])
-        << "must clamp, not wrap around to a huge uint32_t";
+    ASSERT_EQ(1u, b->GetForTest(h)->ts[brpc::LT_S_WAKE])
+        << "must clamp to the encoded offset-zero (1), not wrap around "
+           "to a huge uint32_t, and not collide with the unstamped "
+           "sentinel (0)";
+}
+
+TEST_F(LatencyTraceBufferTest,
+       ExplicitBaseCounterAvoidsClampingServerReceivePoints) {
+    // Fix-round item 1: the server can only call AllocSlot after
+    // ProcessRpcRequest parses the trace id -- well after S01 (wake)
+    // through S04 already happened. Before this fix, AllocSlot always
+    // sampled base_counter at allocation time, so every one of those
+    // four points would have predated base_counter and hit StampAt's
+    // clamp. The 3-argument AllocSlot lets the caller supply the
+    // server's actual timeline origin (the wake timestamp already
+    // parked on Socket) instead, so a point captured before the slot
+    // was allocated -- but at or after the true origin -- now records
+    // as a real, unclamped offset instead of going through the clamp.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const uint64_t wake = butil::detail::clock_cycles();
+    const brpc::LatencyTraceHandle h =
+        b->AllocSlot(9, brpc::LT_ROLE_SERVER, wake);
+    ASSERT_NE(brpc::LT_INVALID_HANDLE, h);
+    ASSERT_EQ(wake, b->GetForTest(h)->base_counter);
+
+    // Busy-wait so onedge_start is measurably after wake -- this models
+    // a point that happened before AllocSlot's call site
+    // (ProcessRpcRequest) but at/after the true origin.
+    const uint64_t start = butil::detail::clock_cycles();
+    while (butil::detail::clock_cycles() - start < 1000) {}
+    const uint64_t onedge_start = butil::detail::clock_cycles();
+    b->StampAt(h, brpc::LT_S_ONEDGE_START, onedge_start);
+
+    const uint32_t encoded = b->GetForTest(h)->ts[brpc::LT_S_ONEDGE_START];
+    ASSERT_GT(encoded, 1u)
+        << "must be a real positive offset, not the clamp's offset-zero "
+           "encoding (1) and not the unstamped sentinel (0)";
+    ASSERT_EQ(onedge_start - wake, (uint64_t)(encoded - 1));
+}
+
+TEST_F(LatencyTraceBufferTest,
+       PointStampedAtBaseCounterIsDistinguishableFromUnstamped) {
+    // The motivating case for the offset+1 encoding: AllocSlot and the
+    // C01 stamp are adjacent statements, and the counter ticks once per
+    // ~10ns, so a client record can naturally produce an exact offset-0
+    // stamp on a perfectly good capture. Verify it reads back as
+    // non-zero and distinct from a point that was genuinely never
+    // stamped, rather than colliding with that sentinel.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const brpc::LatencyTraceHandle h = b->AllocSlot(10, brpc::LT_ROLE_CLIENT);
+    ASSERT_NE(brpc::LT_INVALID_HANDLE, h);
+    const uint64_t base = b->GetForTest(h)->base_counter;
+
+    // Stamp a point at exactly base_counter (offset 0) via StampAt so
+    // the scenario is deterministic rather than racing the clock.
+    b->StampAt(h, brpc::LT_C_RPC_START, base);
+    const uint32_t at_base = b->GetForTest(h)->ts[brpc::LT_C_RPC_START];
+    const uint32_t never_stamped = b->GetForTest(h)->ts[brpc::LT_C_RPC_END];
+
+    ASSERT_NE(0u, at_base)
+        << "offset 0 must not collide with the unstamped sentinel";
+    ASSERT_EQ(0u, never_stamped);
+    ASSERT_NE(at_base, never_stamped);
 }
 
 TEST_F(LatencyTraceBufferTest, StaleHandleIsRejectedAfterWrapAround) {

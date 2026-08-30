@@ -92,18 +92,39 @@ uint64_t MakeLatencyTraceId(uint64_t seq);
 typedef uint64_t LatencyTraceHandle;
 const LatencyTraceHandle LT_INVALID_HANDLE = 0;
 
-// Fixed-size POD, 200 bytes. Timestamps are raw counter deltas relative
-// to `base_counter`; conversion to nanoseconds happens offline.
+// Fixed-size POD, 200 bytes. Timestamps encode counter deltas (offset+1;
+// see `ts` below) relative to `base_counter`; conversion to nanoseconds
+// happens offline.
 struct LatencyTraceRecord {
     uint64_t trace_id;       // unique across processes
-    uint64_t base_counter;   // raw counter at slot allocation
+    // Origin of this record's timeline -- NOT necessarily "the moment
+    // the slot was allocated". Supplied by the caller of AllocSlot (see
+    // its two overloads): on the client the two coincide (AllocSlot runs
+    // at Channel::CallMethod's entry, immediately before C01), but the
+    // server can only allocate its slot once ProcessRpcRequest has
+    // parsed the metadata and recovered the trace id -- well after
+    // S01-S04 (the epoll wake-up through the message being cut out of
+    // the read buffer) already happened -- so the server passes the
+    // wake timestamp it already parked on Socket instead. Every point on
+    // a correctly-instrumented record has a raw counter value >=
+    // base_counter.
+    uint64_t base_counter;
     // Generation guard, see LatencyTraceBuffer. Atomic so AllocSlot can
     // publish it with release semantics and Get() can pair that with an
     // acquire load -- verified to keep this struct exactly 200 bytes and
     // trivially copyable (butil::atomic<uint64_t> matches uint64_t in both
     // size and object representation when lock-free, which it is here).
     butil::atomic<uint64_t> slot_seq;
-    uint32_t ts[LT_POINT_COUNT];  // 0 == not stamped
+    // Encodes offset+1 relative to base_counter, NOT the raw offset --
+    // 0 unambiguously means "never stamped". A raw offset would not do:
+    // AllocSlot and the C01 stamp are adjacent statements, and the
+    // counter ticks once per ~10ns, so ts[LT_C_RPC_START] == 0 (offset
+    // exactly 0) is a likely outcome of a perfectly correct capture on
+    // the client, which would collide with the "not stamped" sentinel.
+    // Consumers -- including merge.py -- must subtract 1 from a non-zero
+    // entry to recover the real offset. See LatencyTraceBuffer::Stamp()/
+    // StampAt() (and design doc sec.8.1) for the full reasoning.
+    uint32_t ts[LT_POINT_COUNT];
     uint32_t socket_id;
     uint32_t remote_ip;
     uint32_t req_size;
@@ -156,8 +177,22 @@ public:
 
     static LatencyTraceBuffer* instance();
 
-    // Returns LT_INVALID_HANDLE when tracing is off or the buffer is full.
+    // Returns LT_INVALID_HANDLE when tracing is off or the buffer is
+    // full. Samples the counter itself as this record's timeline origin
+    // (base_counter) -- the client's case, where allocation and origin
+    // coincide. See the 3-argument overload for the server's case.
     LatencyTraceHandle AllocSlot(uint64_t trace_id, LatencyTraceRole role);
+
+    // Same, but the caller supplies base_counter explicitly instead of
+    // "now". Needed on the server: AllocSlot can only run once
+    // ProcessRpcRequest has parsed the metadata and recovered the trace
+    // id, well after S01-S04 (the epoll wake-up through the message
+    // being cut out of the read buffer) already happened, so the server
+    // passes the wake timestamp it already parked on Socket -- keeping
+    // base_counter at or before every point actually observed for this
+    // record, rather than after some of them.
+    LatencyTraceHandle AllocSlot(uint64_t trace_id, LatencyTraceRole role,
+                                  uint64_t base_counter);
 
     // Silently ignores an invalid or stale handle. First-write-wins: if
     // ts[point] already holds a non-zero value, this call is a no-op.
@@ -165,13 +200,17 @@ public:
 
     // Like Stamp(), but for a timestamp that was already sampled earlier
     // (e.g. a Socket-level wake-up copied into an InputMessageBase before
-    // any LatencyTraceHandle for it existed) rather than "now". Writes
-    // `raw_counter - record->base_counter` into ts[point], through the
+    // any LatencyTraceHandle for it existed) rather than "now". Encodes
+    // `raw_counter - record->base_counter` into ts[point] (see
+    // LatencyTraceRecord::ts for the offset+1 encoding), through the
     // same generation-guarded Get() and the same first-write-wins rule
-    // as Stamp(). If `raw_counter` predates `base_counter` -- possible,
-    // since the historical event can precede the slot's allocation --
-    // the result is clamped to 0 rather than left to wrap around; see
-    // the .cpp for why.
+    // as Stamp(). `raw_counter` predating `base_counter` should no
+    // longer happen in normal operation now that AllocSlot's 3-argument
+    // overload lets the server pick a base_counter at or before every
+    // point on its record -- if it still does (e.g. a clock-read
+    // reordering), the offset is clamped to 0 rather than left to wrap
+    // around; see the .cpp for why that clamp target is 0, not the
+    // unstamped sentinel.
     void StampAt(LatencyTraceHandle h, int point, uint64_t raw_counter);
 
     // Returns nullptr when the handle is stale.
