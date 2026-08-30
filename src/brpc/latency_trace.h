@@ -77,10 +77,12 @@ enum LatencyTraceRole {
     LT_ROLE_SERVER = 1
 };
 
-// Generates a trace id unique across processes: the high 32 bits are a
-// random per-process tag (never zero, so two untagged processes can't
-// collide), the low 32 bits are `seq`. `seq` only needs to be unique
-// within this process.
+// Generates a trace id unique across processes: the high 32 bits are
+// LatencyTraceBuffer's per-process tag (never zero, so two untagged
+// processes can't collide; also what LatencyTraceFileHeader::process_tag
+// records -- there is exactly one tag, reused for both purposes), the
+// low 32 bits are `seq`. `seq` only needs to be unique within this
+// process; see the .cpp for why its wraparound is safe.
 uint64_t MakeLatencyTraceId(uint64_t seq);
 
 // Opaque reference to one slot in the ring buffer.
@@ -169,6 +171,13 @@ public:
 
     size_t recorded_count() const;
     size_t dropped_count() const;
+
+    // The single per-process tag: written into every dumped file's header
+    // (LatencyTraceFileHeader::process_tag) and reused, via
+    // MakeLatencyTraceId(), as the high 32 bits of every trace id this
+    // process produces. There is exactly one tag -- do not mint a second,
+    // independent one for either purpose.
+    uint32_t process_tag() const { return (uint32_t)_process_tag; }
 
     // DANGEROUS outside tests: "stop when full, never overwrite" is what
     // keeps both ends of a distributed trace on the same earliest-N

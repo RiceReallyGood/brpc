@@ -22,7 +22,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <time.h>
-#include <unistd.h>
 #include "butil/time.h"
 #include "butil/logging.h"
 #include "butil/fast_rand.h"
@@ -38,16 +37,40 @@ DEFINE_string(latency_trace_dump_path, "",
               "Dump latency trace records to this file at exit; empty "
               "disables dumping");
 
+// Never returns zero: MakeLatencyTraceId() OR's this into the high 32
+// bits of every trace id from this process, and PackRpcRequest only puts
+// the field on the wire when the id is non-zero -- a zero tag combined
+// with the very first seq (0) would silently look like "not tracing".
+// fast_rand() is used (rather than e.g. clock_cycles() ^ getpid()) partly
+// for entropy and partly because getpid() is commonly 1 inside a
+// container's PID namespace, which would otherwise leave differentiation
+// between containers on one host to the counter reading alone.
+static uint32_t MakeProcessTag() {
+    uint32_t t = 0;
+    while (t == 0) {
+        t = (uint32_t)butil::fast_rand();
+    }
+    return t;
+}
+
+// Calling LatencyTraceBuffer::instance() here cannot recurse into or
+// race with the buffer's own construction: instance() lazily constructs
+// the singleton via a function-local static pointer, which C++11 gives
+// thread-safe one-time init for (concurrent first callers block on the
+// same initialization; no re-entrant construction is possible), and
+// LatencyTraceBuffer's constructor never calls MakeLatencyTraceId (or
+// anything that does), so there is no path back into an unfinished
+// construction.
 uint64_t MakeLatencyTraceId(uint64_t seq) {
-    static const uint32_t s_process_tag = []() {
-        uint32_t t = 0;
-        while (t == 0) {   // never return a zero tag
-            t = (uint32_t)(butil::detail::clock_cycles() ^
-                           ((uint64_t)getpid() << 16));
-        }
-        return t;
-    }();
-    return ((uint64_t)s_process_tag << 32) | (uint32_t)seq;
+    const uint64_t tag = LatencyTraceBuffer::instance()->process_tag();
+    // The low 32 bits (`seq`) wrap after ~4B calls from this process.
+    // That is safe only because the ring buffer -- bounded by
+    // -latency_trace_capacity, 100000 records by default -- gets dumped
+    // (and its cursors reset for the next dump) long before any one
+    // shard's cursor reaches anywhere near 2^32 allocations, so no two
+    // records that end up in the same dump can ever share a trace id.
+    // Raising -latency_trace_capacity toward 2^32 would break that.
+    return (tag << 32) | (uint32_t)seq;
 }
 
 static uint64_t NextPowerOfTwo(uint64_t v) {
@@ -62,7 +85,7 @@ LatencyTraceBuffer::LatencyTraceBuffer()
     : _dropped(0), _stop_when_full(true), _per_shard_capacity(0),
       _head_counter(butil::detail::clock_cycles()),
       _head_realtime_ns(butil::monotonic_time_ns()),
-      _process_tag(butil::fast_rand()),
+      _process_tag(MakeProcessTag()),
       _atexit_registered(false) {
     ResetForTest(FLAGS_latency_trace_capacity);
     if (!FLAGS_latency_trace_dump_path.empty()) {
