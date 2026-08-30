@@ -86,7 +86,12 @@ const LatencyTraceHandle LT_INVALID_HANDLE = 0;
 struct LatencyTraceRecord {
     uint64_t trace_id;       // unique across processes
     uint64_t base_counter;   // raw counter at slot allocation
-    uint64_t slot_seq;       // generation guard, see LatencyTraceBuffer
+    // Generation guard, see LatencyTraceBuffer. Atomic so AllocSlot can
+    // publish it with release semantics and Get() can pair that with an
+    // acquire load -- verified to keep this struct exactly 200 bytes and
+    // trivially copyable (butil::atomic<uint64_t> matches uint64_t in both
+    // size and object representation when lock-free, which it is here).
+    butil::atomic<uint64_t> slot_seq;
     uint32_t ts[LT_POINT_COUNT];  // 0 == not stamped
     uint32_t socket_id;
     uint32_t remote_ip;
@@ -126,7 +131,14 @@ public:
     size_t recorded_count() const;
     size_t dropped_count() const;
 
-    void set_stop_when_full(bool v) { _stop_when_full = v; }
+    // DANGEROUS outside tests: "stop when full, never overwrite" is what
+    // keeps both ends of a distributed trace on the same earliest-N
+    // window so an offline join lines up. Flipping this to false makes
+    // the buffer wrap and overwrite instead, which (a) breaks that
+    // joinability guarantee and (b) is the only way to exercise the
+    // generation-guard/recycling path in a test -- there is no
+    // production caller for this and there should not be one.
+    void set_stop_when_full_for_test(bool v) { _stop_when_full = v; }
 
     // Test-only: re-create the buffer with `capacity` slots in total.
     void ResetForTest(int capacity);

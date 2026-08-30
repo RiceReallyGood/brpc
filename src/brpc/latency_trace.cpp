@@ -62,7 +62,8 @@ void LatencyTraceBuffer::ResetForTest(int capacity) {
         // slot_seq starts at UINT64_MAX so that no live handle (whose seq
         // starts at 0) can ever match an untouched slot.
         for (uint64_t j = 0; j < per_shard; ++j) {
-            _shards[i].records[j].slot_seq = UINT64_MAX;
+            _shards[i].records[j].slot_seq.store(UINT64_MAX,
+                                                  butil::memory_order_relaxed);
         }
         _shards[i].mask = per_shard - 1;
         _shards[i].cursor.store(0, butil::memory_order_relaxed);
@@ -98,12 +99,52 @@ LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
         return LT_INVALID_HANDLE;
     }
     LatencyTraceRecord* r = &sh.records[seq & sh.mask];
+    // Invalidate the slot FIRST, before touching anything else in it. The
+    // previous occupant's real seq must not still be sitting in slot_seq
+    // while we mutate the payload underneath it -- a stale handle for that
+    // previous generation would pass Get()'s check during that window and
+    // stamp a record that is midway through being reinitialized for a
+    // completely different trace. UINT64_MAX can never equal any embedded
+    // handle seq, so this is a hard "nothing matches" state.
+    //
+    // A plain release *store* here is NOT enough: release only stops
+    // writes that precede it (in program order) from being reordered
+    // after it -- it says nothing about the writes that follow it (the
+    // payload below), which remain free to become visible to another core
+    // before this one on a weak memory model. Measured on this project's
+    // aarch64 build host: without the explicit fence below, a concurrent
+    // stress test saw thousands of records where the read-back trace_id
+    // didn't match the allocation that (per its own handle) should still
+    // have owned the slot -- exactly this reordering. The fence below
+    // (not the store's own order) is what actually closes the gap: it
+    // forbids any write after it (the payload) from being reordered
+    // ahead of any write before it (this store), in both directions of
+    // observation by other threads.
+    r->slot_seq.store(UINT64_MAX, butil::memory_order_relaxed);
+    butil::atomic_thread_fence(butil::memory_order_release);
     memset(r->ts, 0, sizeof(r->ts));
     r->trace_id = trace_id;
     r->base_counter = butil::detail::clock_cycles();
     r->role = (uint8_t)role;
     r->attempt = 0;
-    r->slot_seq = seq;
+    // Reset metadata left over from whichever request last owned this
+    // slot -- otherwise a request that fails before these get filled in
+    // (e.g. an early error) would dump with a stale socket/method/size
+    // from a previous, unrelated trace.
+    r->socket_id = 0;
+    r->remote_ip = 0;
+    r->remote_port = 0;
+    r->req_size = 0;
+    r->rsp_size = 0;
+    r->method_id = 0;
+    r->error_code = 0;
+    // Publish: release-store makes every write above visible-before this
+    // store to any thread that acquire-loads the same value via Get().
+    // This is the only valid publication point -- `cursor.fetch_add`
+    // above happens BEFORE any of this is written, so no memory_order on
+    // the cursor could ever make it one; a reader on another thread (e.g.
+    // Task 5's Dump) must synchronize through slot_seq instead.
+    r->slot_seq.store(seq, butil::memory_order_release);
     // Handle carries seq; slot_seq is the generation guard.
     return ((uint64_t)(shard + 1) << SHARD_SHIFT) | (seq & 0x00FFFFFFFFFFFFFFULL);
 }
@@ -119,8 +160,12 @@ LatencyTraceRecord* LatencyTraceBuffer::Get(LatencyTraceHandle h) {
     Shard& sh = _shards[shard];
     const uint64_t seq = h & 0x00FFFFFFFFFFFFFFULL;
     LatencyTraceRecord* r = &sh.records[seq & sh.mask];
-    if (r->slot_seq != seq) {
-        return nullptr;   // recycled; the handle is stale
+    // Acquire pairs with AllocSlot's release-store: seeing `seq` here
+    // means every write AllocSlot made to this record before that store
+    // is visible to us too, so it is safe to read (or, from Stamp, write
+    // a timestamp field of) this record.
+    if (r->slot_seq.load(butil::memory_order_acquire) != seq) {
+        return nullptr;   // recycled, in-flight, or never written
     }
     return r;
 }
