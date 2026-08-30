@@ -681,6 +681,14 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         span->set_request_size(msg->payload.size() + msg->meta.size() + 12);
     }
 
+#if defined(BRPC_LATENCY_TRACE)
+    if (request_meta.has_latency_trace_id()) {
+        const LatencyTraceHandle lt_handle =
+            LT_ALLOC(request_meta.latency_trace_id(), LT_ROLE_SERVER);
+        accessor.set_latency_trace(request_meta.latency_trace_id(), lt_handle);
+    }
+#endif
+
     MethodStatus* method_status = nullptr;
     do {
         if (!server->IsRunning()) {
@@ -1171,6 +1179,12 @@ void PackRpcRequest(butil::IOBuf* req_buf,
         request_meta->set_span_id(span->span_id());
         request_meta->set_parent_span_id(span->parent_span_id());
     }
+
+#if defined(BRPC_LATENCY_TRACE)
+    if (accessor.latency_trace_id() != 0) {
+        request_meta->set_latency_trace_id(accessor.latency_trace_id());
+    }
+#endif
 
     SerializeRpcHeaderAndMeta(req_buf, meta, req_size + attached_size);
     req_buf->append(request_body);

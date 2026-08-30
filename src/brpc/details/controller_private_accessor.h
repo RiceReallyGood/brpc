@@ -23,6 +23,7 @@
 #include "brpc/socket.h"
 #include "brpc/controller.h"
 #include "brpc/stream.h"
+#include "brpc/latency_trace.h"
 
 namespace google {
 namespace protobuf {
@@ -48,6 +49,25 @@ public:
         const Controller::CompletionInfo info = { id, true };
         _cntl->OnVersionedRPCReturned(info, false, saved_error);
     }
+
+#if defined(BRPC_LATENCY_TRACE)
+    void set_latency_trace(uint64_t trace_id, LatencyTraceHandle h) {
+        _cntl->_lt_trace_id = trace_id;
+        _cntl->_lt_handle = h;
+    }
+
+    uint64_t latency_trace_id() const {
+        return _cntl->_lt_trace_id;
+    }
+
+    LatencyTraceHandle latency_trace_handle() const {
+        return _cntl->_lt_handle;
+    }
+#else
+    void set_latency_trace(uint64_t /*trace_id*/, LatencyTraceHandle /*h*/) {}
+    uint64_t latency_trace_id() const { return 0; }
+    LatencyTraceHandle latency_trace_handle() const { return LT_INVALID_HANDLE; }
+#endif
 
     ControllerPrivateAccessor &set_peer_id(SocketId peer_id) {
         _cntl->_current_call.peer_id = peer_id;

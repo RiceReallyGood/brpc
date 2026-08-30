@@ -48,6 +48,9 @@ message RpcRequestMeta {
     optional int64 parent_span_id = 6;
     optional string request_id = 7; // correspond to x-request-id in http header
     optional int32 timeout_ms = 8;  // client's timeout setting for current call
+    // Correlates client and server latency-trace records. Independent of
+    // trace_id/span_id above, which are gated on rpcz's sampler.
+    optional uint64 latency_trace_id = 9;
 }
 
 message RpcResponseMeta {

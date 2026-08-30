@@ -48,6 +48,9 @@
 #include "brpc/grpc.h"
 #include "brpc/kvmap.h"
 #include "brpc/rpc_dump.h"
+#if defined(BRPC_LATENCY_TRACE)
+#include "brpc/latency_trace.h"
+#endif
 
 // EAUTH is defined in MAC
 #ifndef EAUTH
@@ -1016,6 +1019,14 @@ private:
 
     // The point in time when the rpc is read from the socket
     int64_t _rpc_received_us;
+
+#if defined(BRPC_LATENCY_TRACE)
+    // Trace id/handle for this call's latency-trace record, if tracing is
+    // active. Set by ControllerPrivateAccessor::set_latency_trace(); see
+    // controller_private_accessor.h.
+    uint64_t _lt_trace_id;
+    LatencyTraceHandle _lt_handle;
+#endif
 };
 
 // Advises the RPC system that the caller desires that the RPC call be

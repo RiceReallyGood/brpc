@@ -77,6 +77,12 @@ enum LatencyTraceRole {
     LT_ROLE_SERVER = 1
 };
 
+// Generates a trace id unique across processes: the high 32 bits are a
+// random per-process tag (never zero, so two untagged processes can't
+// collide), the low 32 bits are `seq`. `seq` only needs to be unique
+// within this process.
+uint64_t MakeLatencyTraceId(uint64_t seq);
+
 // Opaque reference to one slot in the ring buffer.
 // Layout: (shard << 56) | seq. Zero means "not tracing".
 typedef uint64_t LatencyTraceHandle;

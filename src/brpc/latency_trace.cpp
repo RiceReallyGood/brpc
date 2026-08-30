@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <time.h>
+#include <unistd.h>
 #include "butil/time.h"
 #include "butil/logging.h"
 #include "butil/fast_rand.h"
@@ -36,6 +37,18 @@ DEFINE_int32(latency_trace_capacity, 100000,
 DEFINE_string(latency_trace_dump_path, "",
               "Dump latency trace records to this file at exit; empty "
               "disables dumping");
+
+uint64_t MakeLatencyTraceId(uint64_t seq) {
+    static const uint32_t s_process_tag = []() {
+        uint32_t t = 0;
+        while (t == 0) {   // never return a zero tag
+            t = (uint32_t)(butil::detail::clock_cycles() ^
+                           ((uint64_t)getpid() << 16));
+        }
+        return t;
+    }();
+    return ((uint64_t)s_process_tag << 32) | (uint32_t)seq;
+}
 
 static uint64_t NextPowerOfTwo(uint64_t v) {
     uint64_t r = 1;

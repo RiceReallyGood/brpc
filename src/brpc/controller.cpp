@@ -525,6 +525,10 @@ void Controller::ResetPods() {
     _session_data = nullptr;
     _auth_flags = 0;
     _rpc_received_us = 0;
+#if defined(BRPC_LATENCY_TRACE)
+    _lt_trace_id = 0;
+    _lt_handle = LT_INVALID_HANDLE;
+#endif
 }
 
 Controller::Call::Call(Controller::Call* rhs)

@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <vector>
 #include "brpc/latency_trace.h"
+#include "brpc/policy/baidu_rpc_meta.pb.h"
 #include "butil/time.h"
 
 namespace {
@@ -470,6 +471,31 @@ TEST(LatencyTraceBuildTest, WriteRequestSizeMatchesBuildMode) {
 #else
     SUCCEED() << "default build: sizeof(WriteRequest) asserted == 64 in socket.cpp";
 #endif
+}
+
+TEST(LatencyTraceIdTest, IdsAreUniqueWithinAndAcrossProcesses) {
+    const uint64_t a = brpc::MakeLatencyTraceId(1);
+    const uint64_t b = brpc::MakeLatencyTraceId(2);
+    ASSERT_NE(a, b);
+    // High 32 bits identify the process and must be identical within it.
+    ASSERT_EQ(a >> 32, b >> 32);
+    // ...and must not be zero, or two untagged processes would collide.
+    ASSERT_NE(0u, (uint32_t)(a >> 32));
+    ASSERT_EQ(1u, (uint32_t)a);
+    ASSERT_EQ(2u, (uint32_t)b);
+}
+
+TEST(LatencyTraceIdTest, MetaCarriesTraceIdOnTag9) {
+    brpc::policy::RpcRequestMeta meta;
+    meta.set_service_name("s");
+    meta.set_method_name("m");
+    meta.set_latency_trace_id(0x1234567890ABCDEFULL);
+    std::string buf;
+    ASSERT_TRUE(meta.SerializeToString(&buf));
+    brpc::policy::RpcRequestMeta parsed;
+    ASSERT_TRUE(parsed.ParseFromString(buf));
+    ASSERT_TRUE(parsed.has_latency_trace_id());
+    ASSERT_EQ(0x1234567890ABCDEFULL, parsed.latency_trace_id());
 }
 
 }  // namespace
