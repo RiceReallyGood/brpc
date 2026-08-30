@@ -83,4 +83,13 @@ if [ "$tar_status" -ge 2 ]; then
     exit "$tar_status"
 fi
 
-echo "synced to $HOST:$DEST"
+# Report which configuration the destination tree is pinned to. Two trees
+# exist so neither has to be reconfigured in place (config.mk is not a
+# prerequisite of any object file, so flipping it in place silently reuses
+# objects built under the previous flags). But that only helps if you can
+# see which tree you just synced to -- a tree left in the wrong state once
+# stays wrong silently, and has: ~/brpc-lt spent a while configured as a
+# traced build because two earlier tasks reconfigured it in place.
+cfg=$(ssh "$HOST" "grep -q 'BRPC_LATENCY_TRACE=1' \"$DEST\"/config.mk 2>/dev/null \
+        && echo TRACED || { [ -f \"$DEST\"/config.mk ] && echo default || echo 'NOT CONFIGURED'; }")
+echo "synced to $HOST:$DEST  [config: $cfg]"
