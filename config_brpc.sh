@@ -54,7 +54,7 @@ else
     LDD=ldd
 fi
 
-TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,with-riscv-zvbc,with-riscv-zbc,with-cpu-frequency,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
+TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,with-riscv-zvbc,with-riscv-zbc,with-cpu-frequency,with-latency-trace,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
 WITH_GLOG=0
 WITH_THRIFT=0
 WITH_RDMA=0
@@ -68,6 +68,7 @@ DEBUGSYMBOLS=-g
 WERROR=
 BRPC_DEBUG_LOCK=0
 WITH_CPU_FREQUENCY=0
+WITH_LATENCY_TRACE=0
 
 if [ $? != 0 ] ; then >&2 $ECHO "Terminating..."; exit 1 ; fi
 
@@ -95,6 +96,7 @@ while true; do
         --with-debug-bthread-sche-safety ) BRPC_DEBUG_BTHREAD_SCHE_SAFETY=1; shift 1 ;;
         --with-debug-lock ) BRPC_DEBUG_LOCK=1; shift 1 ;;
         --with-cpu-frequency ) WITH_CPU_FREQUENCY=1; shift 1 ;;
+        --with-latency-trace ) WITH_LATENCY_TRACE=1; shift 1 ;;
         --with-asan) WITH_ASAN=1; shift 1 ;;
         --with-riscv-zvbc) WITH_RISCV_ZVBC=1; shift 1 ;;
         --with-riscv-zbc) WITH_RISCV_ZBC=1; shift 1 ;;
@@ -483,6 +485,14 @@ append_to_output "DYNAMIC_LINKINGS=$DYNAMIC_LINKINGS"
 # CPP means C PreProcessing, not C PlusPlus
 CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_GLOG=$WITH_GLOG -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=$BRPC_DEBUG_BTHREAD_SCHE_SAFETY -DBRPC_DEBUG_LOCK=$BRPC_DEBUG_LOCK -DBUTIL_USE_CPU_FREQUENCY=$WITH_CPU_FREQUENCY"
 
+# BRPC_LATENCY_TRACE must stay entirely UNDEFINED (not merely defined as 0)
+# when the switch is off: latency_trace.h guards LT_STAMP/LT_ALLOC with
+# `#if defined(BRPC_LATENCY_TRACE)`, so appending "=0" unconditionally like
+# the flags above would flip that check to true and defeat the switch.
+if [ $WITH_LATENCY_TRACE != 0 ]; then
+    CPPFLAGS="${CPPFLAGS} -DBRPC_LATENCY_TRACE=1"
+fi
+
 # Avoid over-optimizations of TLS variables by GCC>=4.8
 # See: https://github.com/apache/brpc/issues/1693
 CPPFLAGS="${CPPFLAGS} -D__const__=__unused__"
@@ -677,4 +687,5 @@ if [ $WITH_RDMA -ne 0 ]; then print_info "With RDMA: yes"; fi
 if [ $WITH_MESALINK -ne 0 ]; then print_info "With MesaLink: yes"; fi
 if [ $WITH_BTHREAD_TRACER -ne 0 ]; then print_info "With bthread tracer: yes"; fi
 if [ $WITH_ASAN -ne 0 ]; then print_info "With ASAN: yes"; fi
+if [ $WITH_LATENCY_TRACE -ne 0 ]; then print_info "With latency trace: yes"; fi
 printf "\n${GREEN}brpc is now configured. You can build it with 'make'.${NC}\n"

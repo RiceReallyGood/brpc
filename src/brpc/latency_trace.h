@@ -166,4 +166,17 @@ private:
 
 }  // namespace brpc
 
+// Compile-time switch. When BRPC_LATENCY_TRACE is not defined, every hook
+// vanishes and the library is byte-for-byte equivalent to an untraced
+// build -- including sizeof(Socket::WriteRequest) == 64.
+#if defined(BRPC_LATENCY_TRACE)
+#define LT_STAMP(handle, point)                                    \
+    ::brpc::LatencyTraceBuffer::instance()->Stamp((handle), (point))
+#define LT_ALLOC(trace_id, role)                                   \
+    ::brpc::LatencyTraceBuffer::instance()->AllocSlot((trace_id), (role))
+#else
+#define LT_STAMP(handle, point) ((void)0)
+#define LT_ALLOC(trace_id, role) (::brpc::LT_INVALID_HANDLE)
+#endif
+
 #endif  // BRPC_LATENCY_TRACE_H

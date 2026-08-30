@@ -383,4 +383,27 @@ TEST_F(LatencyTraceBufferTest, StaleHandleIsRejectedUnderConcurrentRecycling) {
            "been recycled, never a foreign generation's data";
 }
 
+TEST(LatencyTraceMacroTest, StampCompilesAndIsNoOpWhenHandleInvalid) {
+    // Must be safe to call with an invalid handle from any thread.
+    LT_STAMP(brpc::LT_INVALID_HANDLE, brpc::LT_C_RPC_START);
+    SUCCEED();
+}
+
+TEST(LatencyTraceMacroTest, StampRecordsWhenEnabled) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(64);
+    const brpc::LatencyTraceHandle h = LT_ALLOC(42, brpc::LT_ROLE_CLIENT);
+#if defined(BRPC_LATENCY_TRACE)
+    ASSERT_NE(brpc::LT_INVALID_HANDLE, h);
+    const uint64_t start = butil::detail::clock_cycles();
+    while (butil::detail::clock_cycles() - start < 1000) {}
+    LT_STAMP(h, brpc::LT_C_RPC_END);
+    ASSERT_GT(brpc::LatencyTraceBuffer::instance()->GetForTest(h)
+                  ->ts[brpc::LT_C_RPC_END], 0u);
+#else
+    ASSERT_EQ(brpc::LT_INVALID_HANDLE, h);
+#endif
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
 }  // namespace
