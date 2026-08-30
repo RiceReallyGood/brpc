@@ -35,6 +35,9 @@
   仓库工作区里长期存放着用户的 34 个未跟踪个人文档（`brpc_*.md`、`*.html`、`*.pptx`、
   `问题记录.txt` 等），它们是**故意不跟踪**的。Task 2 曾因 `git add -A` 把这 34 个文件
   全部提交进分支（36 files, 33188 insertions），需要 controller 做历史手术回退。
+- **远端时钟比本地快约 25 秒**，而 `tar` 保留 mtime。`sync950.sh` 已在解包后对「最近 3 分钟内
+  编辑过」的文件补 `touch`，否则 `make` 会把陈旧的 `.o` 当成比刚同步的源文件更新，打印
+  "up to date" 并静默测试旧二进制 —— 一次看不出异样的假绿。**不要绕过该脚本手工同步。**
 - **所有 `make` 测试目标都要带 `NEED_GPERFTOOLS=0`**：该主机未装 gperftools，而 `test/Makefile:18`
   硬编码 `NEED_GPERFTOOLS=1`，`config_brpc.sh:592` 会因此在 `config.mk` 里生成
   `$(error "Fail to find gperftools")`。见 Task 0 的裁决。
