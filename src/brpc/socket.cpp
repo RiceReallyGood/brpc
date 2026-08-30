@@ -1672,6 +1672,11 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
     // wait until it points to a valid WriteRequest or nullptr.
     req->next = WriteRequest::UNCONNECTED;
     req->id_wait = opt.id_wait;
+#if defined(BRPC_LATENCY_TRACE)
+    req->lt_handle = opt.lt_handle;
+    LT_STAMP(req->lt_handle, (opt.lt_role == LT_ROLE_SERVER)
+                                 ? LT_S_WRITE_ENQUEUE : LT_C_WRITE_ENQUEUE);
+#endif
     req->clear_and_set_control_bits(opt.notify_on_success, opt.shutdown_write);
     req->set_pipelined_count_and_user_message(
         opt.pipelined_count, DUMMY_USER_MESSAGE, opt.auth_flags);
@@ -1905,9 +1910,20 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
     // Group butil::IOBuf in the list into a batch array.
     butil::IOBuf* data_list[DATA_LIST_MAX];
     size_t ndata = 0;
+#if defined(BRPC_LATENCY_TRACE)
+    // Parallel array of the WriteRequest each data_list[] entry came from,
+    // so the batch can be walked again by request (not just IOBuf) once
+    // CutFromIOBufList() returns. See the write_start/write_end stamping
+    // below and design doc sec.8.4.
+    WriteRequest* lt_req_list[DATA_LIST_MAX];
+#endif
     for (WriteRequest* p = req; p != nullptr && ndata < DATA_LIST_MAX;
          p = p->next) {
-        data_list[ndata++] = &p->data;
+        data_list[ndata] = &p->data;
+#if defined(BRPC_LATENCY_TRACE)
+        lt_req_list[ndata] = p;
+#endif
+        ++ndata;
         if (p->need_shutdown_write()) {
             // Write WriteRequest until shutdown write.
             _is_write_shutdown = true;
@@ -1920,7 +1936,40 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
         if (_conn) {
             return _conn->CutMessageIntoFileDescriptor(fd(), data_list, ndata);
         } else {
+#if defined(BRPC_LATENCY_TRACE)
+            for (size_t i = 0; i < ndata; ++i) {
+                WriteRequest* p = lt_req_list[i];
+                LatencyTraceRecord* r =
+                    LatencyTraceBuffer::instance()->Get(p->lt_handle);
+                if (r != nullptr) {
+                    LT_STAMP(p->lt_handle, (r->role == LT_ROLE_SERVER)
+                                 ? LT_S_WRITE_START : LT_C_WRITE_START);
+                }
+            }
+            const ssize_t lt_nw = _transport->CutFromIOBufList(data_list, ndata);
+            // write_end is stamped HERE, right after the batch is cut into
+            // the transport -- not in ReturnSuccessfulWriteRequest(), which
+            // runs after writev()/ibv_post_send() returns and, on the
+            // KeepWrite path, after IsWriteComplete() too. Stamping there
+            // would systematically produce negative round trips on a fast
+            // (loopback/RDMA) path, since the response's wake can arrive
+            // before that later point runs. See design doc sec.8.4.
+            for (size_t i = 0; i < ndata; ++i) {
+                WriteRequest* p = lt_req_list[i];
+                if (!p->data.empty()) {
+                    continue;
+                }
+                LatencyTraceRecord* r =
+                    LatencyTraceBuffer::instance()->Get(p->lt_handle);
+                if (r != nullptr) {
+                    LT_STAMP(p->lt_handle, (r->role == LT_ROLE_SERVER)
+                                 ? LT_S_WRITE_END : LT_C_WRITE_END);
+                }
+            }
+            return lt_nw;
+#else
             return _transport->CutFromIOBufList(data_list, ndata);
+#endif
         }
     }
 

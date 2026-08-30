@@ -1101,6 +1101,10 @@ void PackRpcRequest(butil::IOBuf* req_buf,
                     Controller* cntl,
                     const butil::IOBuf& request_body,
                     const Authenticator* auth) {
+#if defined(BRPC_LATENCY_TRACE)
+    LT_STAMP(ControllerPrivateAccessor(cntl).latency_trace_handle(),
+             LT_C_REQ_META_SER_START);
+#endif
     RpcMeta meta;
     if (auth && auth->GenerateCredential(
             meta.mutable_authentication_data()) != 0) {
@@ -1187,6 +1191,9 @@ void PackRpcRequest(butil::IOBuf* req_buf,
 #endif
 
     SerializeRpcHeaderAndMeta(req_buf, meta, req_size + attached_size);
+#if defined(BRPC_LATENCY_TRACE)
+    LT_STAMP(accessor.latency_trace_handle(), LT_C_REQ_META_SER_END);
+#endif
     req_buf->append(request_body);
     if (attached_size) {
         req_buf->append(cntl->request_attachment());

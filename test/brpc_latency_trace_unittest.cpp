@@ -22,9 +22,13 @@
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
+#include "brpc/channel.h"
+#include "brpc/closure_guard.h"
 #include "brpc/latency_trace.h"
 #include "brpc/policy/baidu_rpc_meta.pb.h"
+#include "brpc/server.h"
 #include "butil/time.h"
+#include "echo.pb.h"
 
 namespace {
 
@@ -497,5 +501,90 @@ TEST(LatencyTraceIdTest, MetaCarriesTraceIdOnTag9) {
     ASSERT_TRUE(parsed.has_latency_trace_id());
     ASSERT_EQ(0x1234567890ABCDEFULL, parsed.latency_trace_id());
 }
+
+// The points below only ever get stamped when the library is built with
+// BRPC_LATENCY_TRACE -- without it, ControllerPrivateAccessor::
+// set_latency_trace() is a no-op stub (see controller_private_accessor.h)
+// and nothing ever calls LatencyTraceBuffer::AllocSlot() for a real RPC,
+// so FindClientRecordForTest() below would always return nullptr. Keep
+// this end-to-end test (and the two helpers Task 9/10/11 reuse) scoped to
+// the traced build rather than asserting something that cannot be true in
+// the default build.
+#if defined(BRPC_LATENCY_TRACE)
+
+// Scans every shard for the single record of the given role. Tests run one
+// RPC at a time, so exactly one match is expected; returning nullptr on
+// zero or multiple matches keeps a silently-wrong test from passing.
+static const brpc::LatencyTraceRecord* FindRecordByRole(brpc::LatencyTraceRole role) {
+    const brpc::LatencyTraceRecord* found = nullptr;
+    int n = 0;
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            break;
+        }
+        if (r->role == (uint8_t)role) {
+            found = r;
+            ++n;
+        }
+    }
+    return (n == 1) ? found : nullptr;
+}
+static const brpc::LatencyTraceRecord* FindClientRecordForTest() {
+    return FindRecordByRole(brpc::LT_ROLE_CLIENT);
+}
+static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
+    return FindRecordByRole(brpc::LT_ROLE_SERVER);
+}
+
+class LatencyTraceEchoServiceImpl : public test::EchoService {
+public:
+    void Echo(google::protobuf::RpcController* cntl_base,
+              const test::EchoRequest* request,
+              test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        response->set_message(request->message());
+    }
+};
+
+TEST(LatencyTraceE2ETest, ClientSendPointsAreStampedAndMonotonic) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9527, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9527", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("hello");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    const brpc::LatencyTraceRecord* r = FindClientRecordForTest();
+    ASSERT_TRUE(r != nullptr);
+    for (int p = brpc::LT_C_RPC_START; p <= brpc::LT_C_WRITE_END; ++p) {
+        ASSERT_GT(r->ts[p], 0u) << "point " << p << " was never stamped";
+    }
+    for (int p = brpc::LT_C_RPC_START; p < brpc::LT_C_WRITE_END; ++p) {
+        ASSERT_LE(r->ts[p], r->ts[p + 1])
+            << "point " << p << " is later than " << (p + 1);
+    }
+    server.Stop(0);
+    server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+#endif  // defined(BRPC_LATENCY_TRACE)
 
 }  // namespace

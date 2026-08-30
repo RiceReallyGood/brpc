@@ -20,6 +20,7 @@
 #include <google/protobuf/descriptor.h>
 #include <gflags/gflags.h>
 #include <memory>
+#include "butil/atomicops.h"
 #include "butil/time.h"                              // milliseconds_from_now
 #include "butil/logging.h"
 #include "butil/third_party/murmurhash3/murmurhash3.h"
@@ -537,6 +538,18 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     }
     cntl->set_used_by_rpc();
 
+#if defined(BRPC_LATENCY_TRACE)
+    {
+        static butil::atomic<uint64_t> s_lt_seq(0);
+        const uint64_t seq = s_lt_seq.fetch_add(1, butil::memory_order_relaxed);
+        const uint64_t trace_id = MakeLatencyTraceId(seq);
+        ControllerPrivateAccessor accessor(cntl);
+        accessor.set_latency_trace(trace_id,
+                                   LT_ALLOC(trace_id, LT_ROLE_CLIENT));
+        LT_STAMP(accessor.latency_trace_handle(), LT_C_RPC_START);
+    }
+#endif
+
     if (cntl->_sender == nullptr && IsTraceable(Span::tls_parent().get())) {
         const int64_t start_send_us = butil::cpuwide_time_us();
         std::string method_name;
@@ -592,7 +605,15 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     // Ensure that serialize_request is done before pack_request in all
     // possible executions, including:
     //   HandleSendFailed => OnVersionedRPCReturned => IssueRPC(pack_request)
+#if defined(BRPC_LATENCY_TRACE)
+    LT_STAMP(ControllerPrivateAccessor(cntl).latency_trace_handle(),
+             LT_C_REQ_PAYLOAD_SER_START);
+#endif
     _serialize_request(&cntl->_request_buf, cntl, request);
+#if defined(BRPC_LATENCY_TRACE)
+    LT_STAMP(ControllerPrivateAccessor(cntl).latency_trace_handle(),
+             LT_C_REQ_PAYLOAD_SER_END);
+#endif
     if (cntl->FailedInline()) {
         // Handle failures caused by serialize_request, and these error_codes
         // should be excluded from the retry_policy.
