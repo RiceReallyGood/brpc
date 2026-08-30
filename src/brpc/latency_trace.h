@@ -92,6 +92,19 @@ uint64_t MakeLatencyTraceId(uint64_t seq);
 typedef uint64_t LatencyTraceHandle;
 const LatencyTraceHandle LT_INVALID_HANDLE = 0;
 
+// ts[] reserves three sentinel values out of its uint32 range (see
+// LatencyTraceRecord::ts and design doc sec.8.1's table):
+//   0          -- never stamped
+//   0xFFFFFFFF -- this point does not exist in this record's mode (e.g.
+//                 the RDMA polling-mode receive points; Task 12 writes
+//                 this one, this task only reserves the name)
+//   0xFFFFFFFE -- offset saturated (a real interval too long -- roughly
+//                 42.9s at 100MHz -- for uint32 to hold); see EncodeOffset
+//                 in the .cpp for why saturation must land here and not on
+//                 0xFFFFFFFF, which means something categorically
+//                 different ("not applicable" vs. "this took forever").
+const uint32_t LT_TS_NOT_APPLICABLE = 0xFFFFFFFFu;
+
 // Fixed-size POD, 200 bytes. Timestamps encode counter deltas (offset+1;
 // see `ts` below) relative to `base_counter`; conversion to nanoseconds
 // happens offline.

@@ -1016,6 +1016,13 @@ bool VerifyRpcRequest(const InputMessageBase* msg_base) {
 }
 
 void ProcessRpcResponse(InputMessageBase* msg_base) {
+#if defined(BRPC_LATENCY_TRACE)
+    // C13: ProcessRpcResponse's entry. Held in a local -- the handle lives
+    // on the Controller, which bthread_id_lock() below hasn't recovered
+    // yet. Same reasoning as S05/S06 in ProcessRpcRequest; see design doc
+    // sec.8.2.
+    const uint64_t lt_rsp_meta_deser_start = butil::detail::clock_cycles();
+#endif
     const int64_t start_parse_us = butil::cpuwide_time_us();
     DestroyingPtr<MostCommonMessage> msg(static_cast<MostCommonMessage*>(msg_base));
     RpcMeta meta;
@@ -1023,6 +1030,10 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         LOG(WARNING) << "Fail to parse from response meta";
         return;
     }
+#if defined(BRPC_LATENCY_TRACE)
+    // C14: ParsePbFromIOBuf(&meta, ...) returned. Same reasoning as C13.
+    const uint64_t lt_rsp_meta_deser_end = butil::detail::clock_cycles();
+#endif
 
     const bthread_id_t cid = { static_cast<uint64_t>(meta.correlation_id()) };
     Controller* cntl = nullptr;
@@ -1044,6 +1055,25 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
     }
     
     ControllerPrivateAccessor accessor(cntl);
+#if defined(BRPC_LATENCY_TRACE)
+    {
+        // C09-C12: historical values sampled before this handle existed
+        // (parked on Socket / InputMessageBase by Task 9). C13-C14: the two
+        // locals captured above, for the same reason -- the handle only
+        // became available once bthread_id_lock() above succeeded. Mirrors
+        // ProcessRpcRequest's S01-S06 handling.
+        LatencyTraceBuffer* lt_buffer = LatencyTraceBuffer::instance();
+        const LatencyTraceHandle lt_handle = accessor.latency_trace_handle();
+        lt_buffer->StampAt(lt_handle, LT_C_WAKE, msg->lt_wake());
+        lt_buffer->StampAt(lt_handle, LT_C_ONEDGE_START, msg->lt_onedge_start());
+        lt_buffer->StampAt(lt_handle, LT_C_READV_START, msg->lt_readv_start());
+        lt_buffer->StampAt(lt_handle, LT_C_MSG_RECV_DONE, msg->lt_msg_recv_done());
+        lt_buffer->StampAt(lt_handle, LT_C_RSP_META_DESER_START,
+                            lt_rsp_meta_deser_start);
+        lt_buffer->StampAt(lt_handle, LT_C_RSP_META_DESER_END,
+                            lt_rsp_meta_deser_end);
+    }
+#endif
     if (remote_stream_id != INVALID_STREAM_ID) {
         accessor.set_remote_stream_settings(
                 new StreamSettings(meta.stream_settings()));
@@ -1096,6 +1126,9 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         cntl->set_response_checksum_type(checksum_type);
         cntl->set_response_checksum_attachment(meta.checksum_with_attachment());
         accessor.set_checksum_value(meta.checksum_value());
+#if defined(BRPC_LATENCY_TRACE)
+        LT_STAMP(accessor.latency_trace_handle(), LT_C_RSP_PAYLOAD_DESER_START);
+#endif
         if (cntl->response()) {
             // response_attachment() has already been filled in above (swapped
             // out of msg->payload) before we get here, so it's safe to fold
@@ -1120,6 +1153,9 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
                     ChecksumTypeToCStr(checksum_type), res_size);
             }
         } // else silently ignore the response.
+#if defined(BRPC_LATENCY_TRACE)
+        LT_STAMP(accessor.latency_trace_handle(), LT_C_RSP_PAYLOAD_DESER_END);
+#endif
     } while (0);
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails

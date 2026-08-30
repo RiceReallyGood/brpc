@@ -1223,6 +1223,17 @@ void Controller::EndRPC(const CompletionInfo& info) {
 
     // No need to retry or can't retry, just call user's `done'.
     const CallId saved_cid = _correlation_id;
+#if defined(BRPC_LATENCY_TRACE)
+    // C17: about to hand off to whatever runs "the client callback" --
+    // `_done->Run()` for an async RPC, or (with no `done` at all) whatever
+    // wakes the synchronous caller blocked in Channel::CallMethod's Join().
+    // Captured as a plain handle value, not read again through `this`,
+    // because the async branch below may delete this Controller inside
+    // `_done->Run()` before C18 can be stamped.
+    const LatencyTraceHandle lt_process_handle =
+        ControllerPrivateAccessor(this).latency_trace_handle();
+    LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_START);
+#endif
     if (_done) {
         if (!FLAGS_usercode_in_pthread || _done == DoNothing()/*Note*/) {
             // Note: no need to run DoNothing in backup thread when pthread
@@ -1239,6 +1250,9 @@ void Controller::EndRPC(const CompletionInfo& info) {
             OnRPCEnd(butil::gettimeofday_us());
             const bool destroy_cid_in_done = has_flag(FLAGS_DESTROY_CID_IN_DONE);
             _done->Run();
+#if defined(BRPC_LATENCY_TRACE)
+            LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_END);
+#endif
             // NOTE: Don't touch this Controller anymore, because it's likely to be
             // deleted by done.
             if (!destroy_cid_in_done) {
@@ -1257,6 +1271,15 @@ void Controller::EndRPC(const CompletionInfo& info) {
 
         // Check comments in above branch on bthread_about_to_quit.
         bthread_about_to_quit();
+#if defined(BRPC_LATENCY_TRACE)
+        // C18 must be stamped strictly before the unlock below: that call is
+        // what wakes the Join()'d caller in Channel::CallMethod, which goes
+        // on to stamp C19 (LT_C_RPC_END) on its own bthread. Stamping after
+        // the unlock would race the two bthreads with no ordering guarantee
+        // between them, occasionally landing C18 after C19 and breaking the
+        // point sequence's monotonicity.
+        LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_END);
+#endif
         CHECK_EQ(0, bthread_id_unlock_and_destroy(saved_cid));
     }
 }

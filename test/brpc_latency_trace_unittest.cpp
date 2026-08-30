@@ -693,6 +693,32 @@ static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
     return FindRecordByRole(brpc::LT_ROLE_SERVER);
 }
 
+// Task 11's end-to-end tests issue more than one RPC on the same channel
+// (see RunSequentialEchoRPCs below for why), so more than one record of
+// each role exists and FindRecordByRole's "exactly one" rule would return
+// nullptr. This variant returns the LAST record of the given role instead
+// -- the steady-state request the test actually wants to assert on.
+static const brpc::LatencyTraceRecord* FindLastRecordByRole(brpc::LatencyTraceRole role) {
+    const brpc::LatencyTraceRecord* found = nullptr;
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            break;
+        }
+        if (r->role == (uint8_t)role) {
+            found = r;
+        }
+    }
+    return found;
+}
+static const brpc::LatencyTraceRecord* FindLastClientRecordForTest() {
+    return FindLastRecordByRole(brpc::LT_ROLE_CLIENT);
+}
+static const brpc::LatencyTraceRecord* FindLastServerRecordForTest() {
+    return FindLastRecordByRole(brpc::LT_ROLE_SERVER);
+}
+
 class LatencyTraceEchoServiceImpl : public test::EchoService {
 public:
     void Echo(google::protobuf::RpcController* cntl_base,
@@ -783,6 +809,240 @@ TEST(LatencyTraceE2ETest, ServerPointsAreCompleteAndMonotonic) {
     }
     server.Stop(0);
     server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// Task 10's defect, and why the tests below must not repeat it: Socket::
+// StartWrite() has a synchronous fast path (no contention, no reconnect)
+// that returns before ever calling DoWrite() -- so the write_start/
+// write_end stamps that used to live only in DoWrite never ran for it.
+// Task 8's end-to-end test asserted C01-C08 non-zero and passed anyway,
+// because a single RPC on a fresh channel always needs a connect and so
+// always goes through KeepWrite -> DoWrite; a *second* RPC on the same,
+// now-established connection takes the fast path instead and would have
+// left C07/C08 (and the server's S16/S17) at the unstamped sentinel (0)
+// forever. Task 10 fixed StartWrite's fast path to stamp directly (see
+// socket.cpp:1810/1828), but the only way to keep this class of defect
+// caught in the future is to never again measure just the first RPC on a
+// fresh connection. Every test below therefore issues several RPCs on one
+// channel and reads back the LAST record of each role.
+static void RunSequentialEchoRPCs(int port, int n_requests,
+                                   const brpc::LatencyTraceRecord** out_client,
+                                   const brpc::LatencyTraceRecord** out_server) {
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(port, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    char addr[64];
+    snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
+    ASSERT_EQ(0, channel.Init(addr, &opt));
+
+    test::EchoService_Stub stub(&channel);
+    // One request at a time (fully synchronous, blocking Echo() call) --
+    // never more than one outstanding request per connection. That is the
+    // precondition design doc sec.10 requires for the "every decomposition
+    // item non-negative" check below: with outstanding>1, a message can
+    // inherit an earlier batch's wake/write timestamps (sec.8.2/8.4) and
+    // manufacture a negative item that has nothing to do with a real
+    // instrumentation bug.
+    for (int i = 0; i < n_requests; ++i) {
+        test::EchoRequest req;
+        test::EchoResponse res;
+        brpc::Controller cntl;
+        req.set_message("hello");
+        stub.Echo(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    }
+
+    *out_client = FindLastClientRecordForTest();
+    *out_server = FindLastServerRecordForTest();
+
+    server.Stop(0);
+    server.Join();
+}
+
+TEST(LatencyTraceE2ETest, AllClientPointsStampedAndSumIsIdentity) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    const brpc::LatencyTraceRecord* c = nullptr;
+    const brpc::LatencyTraceRecord* s = nullptr;
+    RunSequentialEchoRPCs(9529, 5, &c, &s);
+    ASSERT_TRUE(c != nullptr && s != nullptr);
+
+    // Criterion 1 (design doc sec.10.1): every point non-zero is the ONLY
+    // check that catches a code path that was never instrumented (e.g. the
+    // fast-path defect this file's comment above describes). Check both
+    // ends, not just the client's 19.
+    for (int p = brpc::LT_C_RPC_START; p <= brpc::LT_C_RPC_END; ++p) {
+        ASSERT_GT(c->ts[p], 0u) << "client point " << p;
+    }
+    for (int p = brpc::LT_S_WAKE; p <= brpc::LT_S_WRITE_END; ++p) {
+        ASSERT_GT(s->ts[p], 0u) << "server point " << p;
+    }
+
+    // Criterion 2: monotonic within each side's own timeline.
+    for (int p = brpc::LT_C_RPC_START; p < brpc::LT_C_RPC_END; ++p) {
+        ASSERT_LE(c->ts[p], c->ts[p + 1]) << "client point " << p;
+    }
+    for (int p = brpc::LT_S_WAKE; p < brpc::LT_S_WRITE_END; ++p) {
+        ASSERT_LE(s->ts[p], s->ts[p + 1]) << "server point " << p;
+    }
+
+    // Sigma identity (design doc sec.5): the 17 client intervals excluding
+    // C08->C09, plus the 16 server intervals, plus the two link halves,
+    // must equal the end-to-end span exactly. This is a telescoping sum --
+    // per design doc sec.10.1 it holds for ANY timestamp values (all
+    // zeros included) and therefore verifies only the analysis tool's
+    // arithmetic, never whether a point landed in the right place. Kept
+    // because it IS a real, if narrow, invariant; the checks above and
+    // below are what actually verify instrumentation correctness.
+    const int64_t e2e = (int64_t)c->ts[brpc::LT_C_RPC_END] -
+                        (int64_t)c->ts[brpc::LT_C_RPC_START];
+    int64_t sum = 0;
+    for (int p = brpc::LT_C_RPC_START; p < brpc::LT_C_RPC_END; ++p) {
+        if (p == brpc::LT_C_WRITE_END) {
+            continue;   // replaced by link_up + server + link_down
+        }
+        sum += (int64_t)c->ts[p + 1] - (int64_t)c->ts[p];
+    }
+    for (int p = brpc::LT_S_WAKE; p < brpc::LT_S_WRITE_END; ++p) {
+        sum += (int64_t)s->ts[p + 1] - (int64_t)s->ts[p];
+    }
+    const int64_t rtt = (int64_t)c->ts[brpc::LT_C_WAKE] -
+                        (int64_t)c->ts[brpc::LT_C_WRITE_END];
+    const int64_t srv = (int64_t)s->ts[brpc::LT_S_WRITE_END] -
+                        (int64_t)s->ts[brpc::LT_S_WAKE];
+    sum += (rtt - srv);   // link_up + link_down
+    ASSERT_EQ(e2e, sum) << "Sigma(35 items) must equal end-to-end exactly";
+
+    // This TCP test must never see the RDMA polling-mode sentinel; if it
+    // does, the sums above are silently wrong. See Task 12 and spec sec.8.5.
+    for (int p = 0; p < brpc::LT_POINT_COUNT; ++p) {
+        ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, c->ts[p]) << "client point " << p;
+        ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[p]) << "server point " << p;
+    }
+
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceE2ETest, LinkTimeIsNonNegativeAtOutstandingOne) {
+    // Spec sec.10: with one in-flight request per connection there is no
+    // batch attribution error, so a negative link time means the
+    // instrumentation is misplaced -- most likely write_end (see sec.8.4).
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    const brpc::LatencyTraceRecord* c = nullptr;
+    const brpc::LatencyTraceRecord* s = nullptr;
+    RunSequentialEchoRPCs(9530, 5, &c, &s);
+    ASSERT_TRUE(c != nullptr && s != nullptr);
+
+    const int64_t rtt = (int64_t)c->ts[brpc::LT_C_WAKE] -
+                        (int64_t)c->ts[brpc::LT_C_WRITE_END];
+    const int64_t srv = (int64_t)s->ts[brpc::LT_S_WRITE_END] -
+                        (int64_t)s->ts[brpc::LT_S_WAKE];
+    ASSERT_GE(rtt - srv, 0)
+        << "negative total link time at outstanding=1; check write_end anchor";
+    // C09 >= C08 by itself (rtt >= 0) is the specific signature called out
+    // in design doc sec.8.4: write_end stamped too late (e.g. inside
+    // ReturnSuccessfulWriteRequest instead of DoWrite/StartWrite) shows up
+    // exactly as a negative round trip, independent of the server side.
+    ASSERT_GE(rtt, 0) << "negative client round trip C09-C08; "
+                          "write_end is likely anchored too late";
+
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
+    // Spec sec.10.1: this is the check that actually catches "a point
+    // landed in the wrong slot" -- neither the sigma identity (a
+    // telescoping sum, true for any values) nor plain monotonicity (which,
+    // within one record, is algebraically the same statement as "this
+    // item is non-negative") say anything about the two derived link
+    // items. Named per design doc sec.5 for anyone cross-referencing a
+    // failure here against the spec's decomposition table.
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    const brpc::LatencyTraceRecord* c = nullptr;
+    const brpc::LatencyTraceRecord* s = nullptr;
+    RunSequentialEchoRPCs(9531, 5, &c, &s);
+    ASSERT_TRUE(c != nullptr && s != nullptr);
+
+    // 7 client send-side items (C01-C08, sec.5.1).
+    static const struct { int lo, hi; const char* name; } kClientItems[] = {
+        { brpc::LT_C_RPC_START,           brpc::LT_C_REQ_PAYLOAD_SER_START, "cli_pre_serialize" },
+        { brpc::LT_C_REQ_PAYLOAD_SER_START, brpc::LT_C_REQ_PAYLOAD_SER_END,  "cli_req_payload_ser" },
+        { brpc::LT_C_REQ_PAYLOAD_SER_END,   brpc::LT_C_REQ_META_SER_START,   "cli_issue_rpc" },
+        { brpc::LT_C_REQ_META_SER_START,    brpc::LT_C_REQ_META_SER_END,     "cli_req_meta_ser" },
+        { brpc::LT_C_REQ_META_SER_END,      brpc::LT_C_WRITE_ENQUEUE,        "cli_pack_to_write" },
+        { brpc::LT_C_WRITE_ENQUEUE,         brpc::LT_C_WRITE_START,          "cli_write_queue" },
+        { brpc::LT_C_WRITE_START,           brpc::LT_C_WRITE_END,            "cli_write_syscall" },
+    };
+    for (const auto& it : kClientItems) {
+        ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
+    }
+
+    // 16 server items (S01-S17, sec.5.2).
+    static const struct { int lo, hi; const char* name; } kServerItems[] = {
+        { brpc::LT_S_WAKE,                  brpc::LT_S_ONEDGE_START,          "srv_wake_to_onedge" },
+        { brpc::LT_S_ONEDGE_START,          brpc::LT_S_READV_START,           "srv_onedge_to_readv" },
+        { brpc::LT_S_READV_START,           brpc::LT_S_MSG_RECV_DONE,         "srv_readv" },
+        { brpc::LT_S_MSG_RECV_DONE,         brpc::LT_S_REQ_META_DESER_START,  "srv_recv_to_deser" },
+        { brpc::LT_S_REQ_META_DESER_START,  brpc::LT_S_REQ_META_DESER_END,    "srv_req_meta_deser" },
+        { brpc::LT_S_REQ_META_DESER_END,    brpc::LT_S_REQ_PAYLOAD_DESER_START, "srv_dispatch" },
+        { brpc::LT_S_REQ_PAYLOAD_DESER_START, brpc::LT_S_REQ_PAYLOAD_DESER_END, "srv_req_payload_deser" },
+        { brpc::LT_S_REQ_PAYLOAD_DESER_END, brpc::LT_S_SERVICE_START,         "srv_to_service" },
+        { brpc::LT_S_SERVICE_START,         brpc::LT_S_SERVICE_END,           "srv_service" },
+        { brpc::LT_S_SERVICE_END,           brpc::LT_S_RSP_PAYLOAD_SER_START, "srv_service_to_ser" },
+        { brpc::LT_S_RSP_PAYLOAD_SER_START, brpc::LT_S_RSP_PAYLOAD_SER_END,   "srv_rsp_payload_ser" },
+        { brpc::LT_S_RSP_PAYLOAD_SER_END,   brpc::LT_S_RSP_META_SER_START,    "srv_compress_checksum" },
+        { brpc::LT_S_RSP_META_SER_START,    brpc::LT_S_RSP_META_SER_END,      "srv_rsp_meta_ser" },
+        { brpc::LT_S_RSP_META_SER_END,      brpc::LT_S_WRITE_ENQUEUE,         "srv_pack_to_write" },
+        { brpc::LT_S_WRITE_ENQUEUE,         brpc::LT_S_WRITE_START,           "srv_write_queue" },
+        { brpc::LT_S_WRITE_START,           brpc::LT_S_WRITE_END,             "srv_write_syscall" },
+    };
+    for (const auto& it : kServerItems) {
+        ASSERT_GE((int64_t)s->ts[it.hi] - (int64_t)s->ts[it.lo], 0) << it.name;
+    }
+
+    // 10 client receive-side items (C09-C19, sec.5.3).
+    static const struct { int lo, hi; const char* name; } kClientRecvItems[] = {
+        { brpc::LT_C_WAKE,                  brpc::LT_C_ONEDGE_START,          "cli_wake_to_onedge" },
+        { brpc::LT_C_ONEDGE_START,          brpc::LT_C_READV_START,           "cli_onedge_to_readv" },
+        { brpc::LT_C_READV_START,           brpc::LT_C_MSG_RECV_DONE,         "cli_readv" },
+        { brpc::LT_C_MSG_RECV_DONE,         brpc::LT_C_RSP_META_DESER_START,  "cli_recv_to_deser" },
+        { brpc::LT_C_RSP_META_DESER_START,  brpc::LT_C_RSP_META_DESER_END,    "cli_rsp_meta_deser" },
+        { brpc::LT_C_RSP_META_DESER_END,    brpc::LT_C_RSP_PAYLOAD_DESER_START, "cli_lookup_cntl" },
+        { brpc::LT_C_RSP_PAYLOAD_DESER_START, brpc::LT_C_RSP_PAYLOAD_DESER_END, "cli_rsp_payload_deser" },
+        { brpc::LT_C_RSP_PAYLOAD_DESER_END, brpc::LT_C_RSP_PROCESS_START,     "cli_post_deser" },
+        { brpc::LT_C_RSP_PROCESS_START,     brpc::LT_C_RSP_PROCESS_END,       "cli_callback" },
+        { brpc::LT_C_RSP_PROCESS_END,       brpc::LT_C_RPC_END,               "cli_rpc_finish" },
+    };
+    for (const auto& it : kClientRecvItems) {
+        ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
+    }
+
+    // 2 derived link items (sec.6.1, model A): total link time L = RTT - S
+    // (both terms purely intra-record, so the +1 encoding cancels exactly
+    // the same way it does in the sigma identity above), halved. Verified
+    // via the exact same formula as LinkTimeIsNonNegativeAtOutstandingOne;
+    // duplicated here (rather than only relying on that test) because this
+    // test's job is specifically "all 35 named items are individually
+    // accounted for and non-negative," not "the link time happens to be
+    // non-negative for some other reason."
+    const int64_t rtt = (int64_t)c->ts[brpc::LT_C_WAKE] -
+                        (int64_t)c->ts[brpc::LT_C_WRITE_END];
+    const int64_t srv = (int64_t)s->ts[brpc::LT_S_WRITE_END] -
+                        (int64_t)s->ts[brpc::LT_S_WAKE];
+    const int64_t total_link = rtt - srv;
+    ASSERT_GE(total_link, 0) << "link_up + link_down (model A)";
+
     brpc::FLAGS_latency_trace_enabled = false;
 }
 

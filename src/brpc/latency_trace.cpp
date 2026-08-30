@@ -95,8 +95,14 @@ uint64_t MakeLatencyTraceId(uint64_t seq) {
 // StampAt() both compute it via unsigned subtraction) can pass a value
 // that already overflows 32 bits without this function seeing a
 // pre-truncated, wrapped-around number.
+//
+// Saturates to 0xFFFFFFFE, NOT 0xFFFFFFFF: the latter is LT_TS_NOT_APPLICABLE,
+// a categorically different meaning ("this point does not exist in this
+// record's mode", e.g. RDMA polling mode -- see design doc sec.8.1/8.5).
+// Colliding the two would make the HTML render a genuine ~43-second stall
+// as "N/A" instead of "very slow".
 static uint32_t EncodeOffset(uint64_t offset) {
-    return (offset >= 0xFFFFFFFFULL) ? 0xFFFFFFFFu : ((uint32_t)offset + 1);
+    return (offset >= 0xFFFFFFFEULL) ? 0xFFFFFFFEu : ((uint32_t)offset + 1);
 }
 
 static uint64_t NextPowerOfTwo(uint64_t v) {
