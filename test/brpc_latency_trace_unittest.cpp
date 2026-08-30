@@ -60,6 +60,10 @@ TEST(LatencyTraceTest, RecordIsExactly200Bytes) {
 namespace brpc {
 DECLARE_bool(latency_trace_enabled);
 DECLARE_int32(latency_trace_capacity);
+// Defined in event_dispatcher.cpp, also inside `namespace brpc`. The fix
+// round's usercode_in_pthread test flips this at runtime; see item 2's
+// test below.
+DECLARE_bool(usercode_in_pthread);
 }  // namespace brpc
 
 namespace {
@@ -697,8 +701,41 @@ static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
 // Task 11's end-to-end tests issue more than one RPC on the same channel
 // (see RunSequentialEchoRPCs below for why), so more than one record of
 // each role exists and FindRecordByRole's "exactly one" rule would return
-// nullptr. This variant returns the LAST record of the given role instead
-// -- the steady-state request the test actually wants to assert on.
+// nullptr. This variant returns the record of the given role with the
+// LARGEST trace_id -- the most recently issued RPC -- rather than simply
+// the last one encountered while walking GetBySeqForTest()'s order.
+//
+// That distinction is not academic. GetBySeqForTest() walks shard 0's
+// written prefix, then shard 1's, and so on (see its own comment in
+// latency_trace.cpp) -- shard-concatenation order, not wall-clock order
+// across shards. Shard selection is per-OS-thread (a `__thread` variable
+// fixed the first time that thread ever allocates a slot; see
+// LatencyTraceBuffer::AllocSlot's tls_shard), so "last while walking
+// shards in order" only equals "chronologically last" when every record
+// that matters lands in the SAME shard:
+//   - Client side: every RPC here is issued from this one blocking test
+//     thread, and Channel::CallMethod's AllocSlot() runs synchronously on
+//     the calling thread (no bthread hop before it), so all client
+//     records in this file share one shard and shard order coincides
+//     with issuance order. That is specific to this test's single-thread
+//     shape, not a general property of the client path.
+//   - Server side: whether every request on one persistent connection is
+//     dispatched to the same worker thread (hence the same shard) across
+//     separate requests was never confirmed by this project -- plausible
+//     (brpc may pin a connection's read processing to one dispatcher),
+//     but unverified. Depending on shard-concatenation order for "last"
+//     would silently pick the wrong record the day that assumption stops
+//     holding, with no test failure to flag it.
+//
+// Selecting on trace_id sidesteps the question rather than resting on
+// either assumption above. Its low 32 bits are channel.cpp's `s_lt_seq`,
+// one process-wide atomic counter incremented per RPC issued by
+// Channel::CallMethod (see MakeLatencyTraceId); the server's record
+// carries that exact same trace_id via propagation -- baidu_rpc_protocol.
+// cpp reads request_meta.latency_trace_id() off the wire rather than
+// minting its own (see ProcessRpcRequest). So "max trace_id for this
+// role" means "most recently issued RPC" regardless of which shard either
+// side's record ended up in.
 static const brpc::LatencyTraceRecord* FindLastRecordByRole(brpc::LatencyTraceRole role) {
     const brpc::LatencyTraceRecord* found = nullptr;
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
@@ -707,7 +744,8 @@ static const brpc::LatencyTraceRecord* FindLastRecordByRole(brpc::LatencyTraceRo
         if (r == nullptr) {
             break;
         }
-        if (r->role == (uint8_t)role) {
+        if (r->role == (uint8_t)role &&
+            (found == nullptr || r->trace_id > found->trace_id)) {
             found = r;
         }
     }
@@ -1043,6 +1081,235 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
                         (int64_t)s->ts[brpc::LT_S_WAKE];
     const int64_t total_link = rtt - srv;
     ASSERT_GE(total_link, 0) << "link_up + link_down (model A)";
+
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// ---------------------------------------------------------------------
+// Fix round (Task 11 review, items 1-3): every test above issues fully
+// synchronous RPCs (`stub.Echo(&cntl, &req, &res, nullptr)`), so neither
+// the pre-existing async instrumentation nor this round's two fixes --
+// C19 on the regular async path (Controller::EndRPC) and C17-C19 on the
+// -usercode_in_pthread path (Controller::DoneInBackupThread) -- were ever
+// exercised. The two tests below close that gap, asserting the same
+// section 10.1 properties the synchronous tests above assert: every
+// point non-zero, monotonic, C09 >= C08, and every decomposition item
+// non-negative at outstanding=1.
+// ---------------------------------------------------------------------
+
+// A no-op, self-deleting Closure. Deliberately NOT brpc::DoNothing():
+// Controller::EndRPC special-cases `_done == DoNothing()` to always take
+// the immediate (non-backup-thread) branch regardless of
+// -usercode_in_pthread (see the "Note" comment in controller.cpp), so
+// using DoNothing() here would make it impossible to exercise
+// DoneInBackupThread() -- exactly the path item 2 fixes.
+class AsyncEchoDone : public google::protobuf::Closure {
+public:
+    void Run() override { delete this; }
+};
+
+// Generic poll-with-timeout, mirroring the pattern used elsewhere in this
+// codebase (see brpc_streaming_rpc_unittest.cpp's WaitForTrue) for
+// observing state a Closure running on a different thread produces.
+template <typename Pred>
+static bool WaitForTrue(Pred pred, int timeout_ms) {
+    const int kStepUs = 1000;
+    for (int waited_us = 0; !pred(); waited_us += kStepUs) {
+        if (waited_us >= timeout_ms * 1000) {
+            return pred();
+        }
+        usleep(kStepUs);
+    }
+    return true;
+}
+
+// Async analog of RunSequentialEchoRPCs above, still one RPC at a time
+// (outstanding == 1, for the same reason the sync helper cites: design
+// doc sec.10.1's non-negative-decomposition-item check assumes it) but
+// issued with a `done` closure instead of a blocking Echo() call.
+//
+// A subtlety unique to the async path: our closure only marks that
+// `_done->Run()` happened (by self-deleting; it carries no other state).
+// EndRPC's C18/C19 stamps -- and, on the -usercode_in_pthread path,
+// DoneInBackupThread's -- land on the RPC-processing thread strictly
+// AFTER `_done->Run()` returns, which is after control has already
+// returned to that thread, not to this one. There is no synchronization
+// primitive between "the closure ran" and "C18/C19 are stamped", so
+// rather than reading the record the instant Echo() posts the request,
+// this helper polls the record itself for C19 (LT_C_RPC_END) to go
+// non-zero, bounded by a generous timeout. If C19 is never stamped (e.g.
+// item 1's or item 2's fix is missing) this poll times out and the test
+// fails on that specific assertion instead of silently reading a
+// half-written record.
+static void RunSequentialAsyncEchoRPCs(int port, int n_requests,
+                                        const brpc::LatencyTraceRecord** out_client,
+                                        const brpc::LatencyTraceRecord** out_server) {
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(port, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    char addr[64];
+    snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
+    ASSERT_EQ(0, channel.Init(addr, &opt));
+
+    test::EchoService_Stub stub(&channel);
+    for (int i = 0; i < n_requests; ++i) {
+        test::EchoRequest req;
+        test::EchoResponse res;
+        brpc::Controller cntl;
+        req.set_message("hello");
+        // Echo() with a non-null `done` returns as soon as the request is
+        // posted -- it does not block for the response.
+        stub.Echo(&cntl, &req, &res, new AsyncEchoDone);
+
+        const bool stamped = WaitForTrue([]() {
+            const brpc::LatencyTraceRecord* r = FindLastClientRecordForTest();
+            return r != nullptr && r->ts[brpc::LT_C_RPC_END] != 0;
+        }, 2000);
+        ASSERT_TRUE(stamped)
+            << "timed out waiting for C19 (LT_C_RPC_END) to be stamped "
+               "on async request " << i;
+        // Safe to read now: cntl's error state was finalized by OnRPCEnd()
+        // before _done->Run() was ever invoked, well before the C19 stamp
+        // this wait just confirmed.
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    }
+
+    *out_client = FindLastClientRecordForTest();
+    *out_server = FindLastServerRecordForTest();
+
+    server.Stop(0);
+    server.Join();
+}
+
+// Shared body for the two tests below: section 10.1's weight-bearing
+// checks, factored out so they aren't duplicated verbatim a third time
+// (the sync tests above already state them twice, split by concern --
+// this collapses all of them into one call site per async test).
+static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
+                                              const brpc::LatencyTraceRecord* s) {
+    ASSERT_TRUE(c != nullptr && s != nullptr);
+
+    // Every point non-zero (design doc sec.10.1's only check that catches
+    // an un-instrumented code path).
+    for (int p = brpc::LT_C_RPC_START; p <= brpc::LT_C_RPC_END; ++p) {
+        ASSERT_GT(c->ts[p], 0u) << "client point " << p;
+    }
+    for (int p = brpc::LT_S_WAKE; p <= brpc::LT_S_WRITE_END; ++p) {
+        ASSERT_GT(s->ts[p], 0u) << "server point " << p;
+    }
+
+    // Monotonic within each side's own timeline.
+    for (int p = brpc::LT_C_RPC_START; p < brpc::LT_C_RPC_END; ++p) {
+        ASSERT_LE(c->ts[p], c->ts[p + 1]) << "client point " << p;
+    }
+    for (int p = brpc::LT_S_WAKE; p < brpc::LT_S_WRITE_END; ++p) {
+        ASSERT_LE(s->ts[p], s->ts[p + 1]) << "server point " << p;
+    }
+
+    // C09 >= C08.
+    const int64_t rtt = (int64_t)c->ts[brpc::LT_C_WAKE] -
+                        (int64_t)c->ts[brpc::LT_C_WRITE_END];
+    ASSERT_GE(rtt, 0) << "negative client round trip C09-C08";
+
+    // Every decomposition item non-negative at outstanding=1 (design doc
+    // sec.5's 7 client-send + 16 server + 10 client-receive items, plus
+    // the 2 derived link halves).
+    static const struct { int lo, hi; const char* name; } kClientItems[] = {
+        { brpc::LT_C_RPC_START,             brpc::LT_C_REQ_PAYLOAD_SER_START, "cli_pre_serialize" },
+        { brpc::LT_C_REQ_PAYLOAD_SER_START, brpc::LT_C_REQ_PAYLOAD_SER_END,   "cli_req_payload_ser" },
+        { brpc::LT_C_REQ_PAYLOAD_SER_END,   brpc::LT_C_REQ_META_SER_START,    "cli_issue_rpc" },
+        { brpc::LT_C_REQ_META_SER_START,    brpc::LT_C_REQ_META_SER_END,      "cli_req_meta_ser" },
+        { brpc::LT_C_REQ_META_SER_END,      brpc::LT_C_WRITE_ENQUEUE,         "cli_pack_to_write" },
+        { brpc::LT_C_WRITE_ENQUEUE,         brpc::LT_C_WRITE_START,           "cli_write_queue" },
+        { brpc::LT_C_WRITE_START,           brpc::LT_C_WRITE_END,             "cli_write_syscall" },
+    };
+    for (const auto& it : kClientItems) {
+        ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
+    }
+
+    static const struct { int lo, hi; const char* name; } kServerItems[] = {
+        { brpc::LT_S_WAKE,                   brpc::LT_S_ONEDGE_START,           "srv_wake_to_onedge" },
+        { brpc::LT_S_ONEDGE_START,           brpc::LT_S_READV_START,            "srv_onedge_to_readv" },
+        { brpc::LT_S_READV_START,            brpc::LT_S_MSG_RECV_DONE,          "srv_readv" },
+        { brpc::LT_S_MSG_RECV_DONE,          brpc::LT_S_REQ_META_DESER_START,   "srv_recv_to_deser" },
+        { brpc::LT_S_REQ_META_DESER_START,   brpc::LT_S_REQ_META_DESER_END,     "srv_req_meta_deser" },
+        { brpc::LT_S_REQ_META_DESER_END,     brpc::LT_S_REQ_PAYLOAD_DESER_START, "srv_dispatch" },
+        { brpc::LT_S_REQ_PAYLOAD_DESER_START, brpc::LT_S_REQ_PAYLOAD_DESER_END, "srv_req_payload_deser" },
+        { brpc::LT_S_REQ_PAYLOAD_DESER_END,  brpc::LT_S_SERVICE_START,          "srv_to_service" },
+        { brpc::LT_S_SERVICE_START,          brpc::LT_S_SERVICE_END,            "srv_service" },
+        { brpc::LT_S_SERVICE_END,            brpc::LT_S_RSP_PAYLOAD_SER_START,  "srv_service_to_ser" },
+        { brpc::LT_S_RSP_PAYLOAD_SER_START,  brpc::LT_S_RSP_PAYLOAD_SER_END,    "srv_rsp_payload_ser" },
+        { brpc::LT_S_RSP_PAYLOAD_SER_END,    brpc::LT_S_RSP_META_SER_START,     "srv_compress_checksum" },
+        { brpc::LT_S_RSP_META_SER_START,     brpc::LT_S_RSP_META_SER_END,       "srv_rsp_meta_ser" },
+        { brpc::LT_S_RSP_META_SER_END,       brpc::LT_S_WRITE_ENQUEUE,          "srv_pack_to_write" },
+        { brpc::LT_S_WRITE_ENQUEUE,          brpc::LT_S_WRITE_START,            "srv_write_queue" },
+        { brpc::LT_S_WRITE_START,            brpc::LT_S_WRITE_END,              "srv_write_syscall" },
+    };
+    for (const auto& it : kServerItems) {
+        ASSERT_GE((int64_t)s->ts[it.hi] - (int64_t)s->ts[it.lo], 0) << it.name;
+    }
+
+    static const struct { int lo, hi; const char* name; } kClientRecvItems[] = {
+        { brpc::LT_C_WAKE,                    brpc::LT_C_ONEDGE_START,           "cli_wake_to_onedge" },
+        { brpc::LT_C_ONEDGE_START,            brpc::LT_C_READV_START,            "cli_onedge_to_readv" },
+        { brpc::LT_C_READV_START,             brpc::LT_C_MSG_RECV_DONE,          "cli_readv" },
+        { brpc::LT_C_MSG_RECV_DONE,           brpc::LT_C_RSP_META_DESER_START,   "cli_recv_to_deser" },
+        { brpc::LT_C_RSP_META_DESER_START,    brpc::LT_C_RSP_META_DESER_END,     "cli_rsp_meta_deser" },
+        { brpc::LT_C_RSP_META_DESER_END,      brpc::LT_C_RSP_PAYLOAD_DESER_START, "cli_lookup_cntl" },
+        { brpc::LT_C_RSP_PAYLOAD_DESER_START, brpc::LT_C_RSP_PAYLOAD_DESER_END,  "cli_rsp_payload_deser" },
+        { brpc::LT_C_RSP_PAYLOAD_DESER_END,   brpc::LT_C_RSP_PROCESS_START,      "cli_post_deser" },
+        { brpc::LT_C_RSP_PROCESS_START,       brpc::LT_C_RSP_PROCESS_END,        "cli_callback" },
+        { brpc::LT_C_RSP_PROCESS_END,         brpc::LT_C_RPC_END,                "cli_rpc_finish" },
+    };
+    for (const auto& it : kClientRecvItems) {
+        ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
+    }
+
+    const int64_t srv = (int64_t)s->ts[brpc::LT_S_WRITE_END] -
+                        (int64_t)s->ts[brpc::LT_S_WAKE];
+    ASSERT_GE(rtt - srv, 0) << "link_up + link_down (model A)";
+}
+
+TEST(LatencyTraceE2ETest, AsyncEchoAllWeightBearingInvariants) {
+    // Item 1's target: the regular async branch of Controller::EndRPC
+    // (-usercode_in_pthread stays at its default, false).
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    const brpc::LatencyTraceRecord* c = nullptr;
+    const brpc::LatencyTraceRecord* s = nullptr;
+    RunSequentialAsyncEchoRPCs(9533, 5, &c, &s);
+    AssertAllWeightBearingInvariants(c, s);
+
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceE2ETest, AsyncEchoWithUsercodeInPthreadAllWeightBearingInvariants) {
+    // Item 2's target: Controller::DoneInBackupThread(), reached only via
+    // RunUserCode(RunDoneInBackupThread, this), which Controller::EndRPC
+    // takes when -usercode_in_pthread is on and `done` isn't DoNothing().
+    // Restore the flag unconditionally (even on an early ASSERT_ return
+    // above) since it's process-wide and would otherwise silently change
+    // every later test's async execution path.
+    const bool saved_usercode_in_pthread = brpc::FLAGS_usercode_in_pthread;
+    struct Restore {
+        const bool* saved;
+        ~Restore() { brpc::FLAGS_usercode_in_pthread = *saved; }
+    } restore{&saved_usercode_in_pthread};
+
+    brpc::FLAGS_usercode_in_pthread = true;
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    const brpc::LatencyTraceRecord* c = nullptr;
+    const brpc::LatencyTraceRecord* s = nullptr;
+    RunSequentialAsyncEchoRPCs(9534, 5, &c, &s);
+    AssertAllWeightBearingInvariants(c, s);
 
     brpc::FLAGS_latency_trace_enabled = false;
 }

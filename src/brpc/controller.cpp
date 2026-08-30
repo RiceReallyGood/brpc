@@ -1252,6 +1252,13 @@ void Controller::EndRPC(const CompletionInfo& info) {
             _done->Run();
 #if defined(BRPC_LATENCY_TRACE)
             LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_END);
+            // C19: same thread, same program order as the C18 stamp just
+            // above -- both read `lt_process_handle`, a plain local
+            // captured before `_done->Run()`, never `this` (which may
+            // already be deleted here). No reordering of OnRPCEnd() against
+            // `_done->Run()` is needed: stamping C19 right after C18 is
+            // trivially monotonic without it.
+            LT_STAMP(lt_process_handle, LT_C_RPC_END);
 #endif
             // NOTE: Don't touch this Controller anymore, because it's likely to be
             // deleted by done.
@@ -1314,7 +1321,26 @@ void Controller::DoneInBackupThread() {
     OnRPCEnd(butil::gettimeofday_us());
     const CallId saved_cid = _correlation_id;
     const bool destroy_cid_in_done = has_flag(FLAGS_DESTROY_CID_IN_DONE);
+#if defined(BRPC_LATENCY_TRACE)
+    // C17 was already stamped by EndRPC() before it dispatched here via
+    // RunUserCode(RunDoneInBackupThread, this) -- that stamp sits before
+    // the `if (_done)` fork and so covers every `_done` branch, this one
+    // included. What EndRPC's stamp can't reach is C18/C19, which must
+    // happen after `_done->Run()` on THIS thread. Same lifetime hazard as
+    // EndRPC's lt_process_handle: `this` may be deleted inside
+    // `_done->Run()` below, so the handle is read into a local now, before
+    // that call, and never re-read through `this` afterward.
+    const LatencyTraceHandle lt_process_handle =
+        ControllerPrivateAccessor(this).latency_trace_handle();
+#endif
     _done->Run();
+#if defined(BRPC_LATENCY_TRACE)
+    // C18 then C19: same thread, same program order, both off the local
+    // handle above -- trivially monotonic, matching how EndRPC's other
+    // async branch stamps them back-to-back after `_done->Run()`.
+    LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_END);
+    LT_STAMP(lt_process_handle, LT_C_RPC_END);
+#endif
     // NOTE: Don't touch fields of controller anymore, it may be deleted.
     if (!destroy_cid_in_done) {
         CHECK_EQ(0, bthread_id_unlock_and_destroy(saved_cid));
