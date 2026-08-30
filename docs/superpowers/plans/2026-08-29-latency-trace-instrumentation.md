@@ -35,6 +35,15 @@
   仓库工作区里长期存放着用户的 34 个未跟踪个人文档（`brpc_*.md`、`*.html`、`*.pptx`、
   `问题记录.txt` 等），它们是**故意不跟踪**的。Task 2 曾因 `git add -A` 把这 34 个文件
   全部提交进分支（36 files, 33188 insertions），需要 controller 做历史手术回退。
+- **两种构建配置各用一棵独立的远端树，不要在同一棵树上切换配置**：
+  - 默认构建：`./tools/latency_trace/sync950.sh` → `suzhou950:~/brpc-lt`
+  - 追踪构建：`LT_BUILD_DIR=brpc-lt-traced ./tools/latency_trace/sync950.sh` → `suzhou950:~/brpc-lt-traced`
+
+  两棵树各自 `config_brpc.sh` 配置一次即可长期复用，各自保持增量构建。
+  **原因**：`config.mk` 不是目标文件的依赖（`Makefile:19` 只是 `include`，`%.o:%.cpp` 规则里
+  没有它），所以在同一棵树上重跑 `config_brpc.sh` 切换 `--with-latency-trace` 后，
+  `make` **完全不知道编译选项变了**，直接复用上一种配置编出来的 `.o`。这是确定性的假绿，
+  比时钟偏差那条更容易中招。若非要在一棵树上切，必须先手工删掉受影响的目标文件。
 - **远端时钟比本地快约 25 秒**，而 `tar` 保留 mtime。`sync950.sh` 已在解包后对「最近 3 分钟内
   编辑过」的文件补 `touch`，否则 `make` 会把陈旧的 `.o` 当成比刚同步的源文件更新，打印
   "up to date" 并静默测试旧二进制 —— 一次看不出异样的假绿。**不要绕过该脚本手工同步。**
