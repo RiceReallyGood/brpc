@@ -1753,6 +1753,13 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     SocketUniquePtr ptr_for_keep_write;
     ssize_t nw = 0;
     int ret = 0;
+#if defined(BRPC_LATENCY_TRACE)
+    // Declared up here (unassigned) rather than at first use below: the
+    // `goto FAIL_TO_WRITE`/`goto KEEPWRITE_IN_BACKGROUND` jumps above the
+    // single-write fast path would otherwise cross an initialized
+    // declaration, which gcc/clang both reject.
+    LatencyTraceRecord* lt_r = nullptr;
+#endif
 
     // We've got the right to write.
     req->next = nullptr;
@@ -1788,12 +1795,40 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     
     // Write once in the calling thread. If the write is not complete,
     // continue it in KeepWrite thread.
+#if defined(BRPC_LATENCY_TRACE)
+    // This is the common case for a small, already-connected write (e.g.
+    // a server's response, or any client write onto a socket that didn't
+    // need to (re)connect) -- it never reaches DoWrite() at all, so
+    // DoWrite()'s write_start/write_end lambdas (see below) never run for
+    // it. Without this block C08/S17 (and C07/S16) are silently zero on
+    // exactly this path -- the "some code path never gets a stamp" defect
+    // design doc sec.10.1 warns is invisible to both the sum identity and
+    // the monotonicity check. Mirrors DoWrite()'s lambdas for this single
+    // WriteRequest instead of a batch.
+    lt_r = LatencyTraceBuffer::instance()->Get(req->lt_handle);
+    if (lt_r != nullptr) {
+        LT_STAMP(req->lt_handle, (lt_r->role == LT_ROLE_SERVER)
+                     ? LT_S_WRITE_START : LT_C_WRITE_START);
+    }
+#endif
     if (_conn) {
         butil::IOBuf* data_arr[1] = { &req->data };
         nw = _conn->CutMessageIntoFileDescriptor(fd(), data_arr, 1);
     } else {
         nw = _transport->CutFromIOBuf(&req->data);
     }
+#if defined(BRPC_LATENCY_TRACE)
+    // Only when this single request's data is now fully drained -- same
+    // "data.empty()" gate DoWrite()'s lambda uses, and for the same
+    // reason (see design doc sec.8.4): a partial write here falls through
+    // to KEEPWRITE_IN_BACKGROUND/DoWrite() below, which will stamp
+    // write_end once the remainder actually finishes; first-write-wins
+    // in Stamp()/StampAt() makes double-stamping harmless either way.
+    if (lt_r != nullptr && req->data.empty()) {
+        LT_STAMP(req->lt_handle, (lt_r->role == LT_ROLE_SERVER)
+                     ? LT_S_WRITE_END : LT_C_WRITE_END);
+    }
+#endif
     if (nw < 0) {
         // RTMP may return EOVERCROWDED
         if (errno != EAGAIN && errno != EOVERCROWDED) {

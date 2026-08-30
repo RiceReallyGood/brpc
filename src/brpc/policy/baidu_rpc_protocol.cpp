@@ -27,6 +27,7 @@
 #include "butil/memory/scope_guard.h"
 #include "butil/raw_pack.h"                      // RawPacker RawUnpacker
 #include "butil/strings/string_util.h"
+#include "butil/time.h"                          // butil::detail::clock_cycles
 
 #include "json2pb/json_to_pb.h"
 #include "json2pb/pb_to_json.h"
@@ -284,6 +285,12 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
                      MethodStatus* method_status, int64_t received_us,
                      std::shared_ptr<Span> span) {
     ControllerPrivateAccessor accessor(cntl);
+#if defined(BRPC_LATENCY_TRACE)
+    // S10: SendRpcResponse's entry. Correct for both sync and async
+    // service implementations -- see design doc sec.4.3 for why no point
+    // is placed at svc->CallMethod()'s return instead.
+    LT_STAMP(accessor.latency_trace_handle(), LT_S_SERVICE_END);
+#endif
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
@@ -328,7 +335,13 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
     // If user calls `SetFailed' on Controller, we don't serialize
     // response either
     if (res != nullptr && !cntl->Failed()) {
+#if defined(BRPC_LATENCY_TRACE)
+        LT_STAMP(accessor.latency_trace_handle(), LT_S_RSP_PAYLOAD_SER_START);
+#endif
         append_body = SerializeResponse(*res, *cntl, res_body);
+#if defined(BRPC_LATENCY_TRACE)
+        LT_STAMP(accessor.latency_trace_handle(), LT_S_RSP_PAYLOAD_SER_END);
+#endif
     }
 
     // Don't use res->ByteSize() since it may be compressed
@@ -345,6 +358,9 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
         // distinction between server error and client error
         error_code = EINTERNAL;
     }
+#if defined(BRPC_LATENCY_TRACE)
+    LT_STAMP(accessor.latency_trace_handle(), LT_S_RSP_META_SER_START);
+#endif
     RpcMeta meta;
     RpcResponseMeta* response_meta = meta.mutable_response();
     response_meta->set_error_code(error_code);
@@ -400,6 +416,9 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
 
     butil::IOBuf res_buf;
     SerializeRpcHeaderAndMeta(&res_buf, meta, res_size + attached_size);
+#if defined(BRPC_LATENCY_TRACE)
+    LT_STAMP(accessor.latency_trace_handle(), LT_S_RSP_META_SER_END);
+#endif
     if (append_body) {
         res_buf.append(res_body.movable());
         if (attached_size > 0) {
@@ -466,6 +485,14 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
             wopt.id_wait = response_id;
             wopt.notify_on_success = true;
         }
+#if defined(BRPC_LATENCY_TRACE)
+        // S15-S17 (write_enqueue/write_start/write_end) are stamped
+        // generically inside Socket::Write()/DoWrite() keyed off
+        // wopt.lt_handle/lt_role -- see socket.cpp. Just wire the handle
+        // through here.
+        wopt.lt_handle = accessor.latency_trace_handle();
+        wopt.lt_role = LT_ROLE_SERVER;
+#endif
         if (sock->Write(&res_buf, &wopt) != 0) {
             const int errcode = errno;
             PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -591,6 +618,14 @@ bool DeserializeRpcMessage(const butil::IOBuf& data, Controller& cntl,
 }
 
 void ProcessRpcRequest(InputMessageBase* msg_base) {
+#if defined(BRPC_LATENCY_TRACE)
+    // S05: ProcessRpcRequest's entry. Held in a local rather than stamped
+    // directly -- the LatencyTraceHandle for this record doesn't exist yet
+    // (it's only known once the trace id is parsed out of `meta` below and
+    // AllocSlot runs), so it's written into the slot with StampAt() once
+    // that handle exists. See design doc sec.8.2.
+    const uint64_t lt_req_meta_deser_start = butil::detail::clock_cycles();
+#endif
     const int64_t start_parse_us = butil::cpuwide_time_us();
     DestroyingPtr<MostCommonMessage> msg(static_cast<MostCommonMessage*>(msg_base));
     SocketUniquePtr socket_guard(msg->ReleaseSocket());
@@ -605,6 +640,11 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
                           socket->description().c_str());
         return;
     }
+#if defined(BRPC_LATENCY_TRACE)
+    // S06: ParsePbFromIOBuf(&meta, ...) returned. Same reasoning as S05
+    // above -- no handle yet, held for a later StampAt().
+    const uint64_t lt_req_meta_deser_end = butil::detail::clock_cycles();
+#endif
     const RpcRequestMeta &request_meta = meta.request();
 
     SampledRequest* sample = AskToBeSampled();
@@ -683,9 +723,28 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
 
 #if defined(BRPC_LATENCY_TRACE)
     if (request_meta.has_latency_trace_id()) {
-        const LatencyTraceHandle lt_handle =
-            LT_ALLOC(request_meta.latency_trace_id(), LT_ROLE_SERVER);
+        // base_counter must be this record's timeline origin, not "the
+        // moment the slot was allocated" -- S01-S04 (epoll wake-up through
+        // the message being cut out of the read buffer) all happened
+        // before AllocSlot can run here, so pass the wake timestamp Task 9
+        // already parked on the message instead of sampling "now". See
+        // design doc sec.8.1's base_counter paragraph and
+        // LatencyTraceBuffer::AllocSlot()'s 3-arg overload.
+        LatencyTraceBuffer* lt_buffer = LatencyTraceBuffer::instance();
+        const LatencyTraceHandle lt_handle = lt_buffer->AllocSlot(
+            request_meta.latency_trace_id(), LT_ROLE_SERVER, msg->lt_wake());
         accessor.set_latency_trace(request_meta.latency_trace_id(), lt_handle);
+        // S01-S04: historical values sampled before this handle existed
+        // (parked on Socket / InputMessageBase by Task 9). S05-S06: the
+        // two locals captured above, for the same reason.
+        lt_buffer->StampAt(lt_handle, LT_S_WAKE, msg->lt_wake());
+        lt_buffer->StampAt(lt_handle, LT_S_ONEDGE_START, msg->lt_onedge_start());
+        lt_buffer->StampAt(lt_handle, LT_S_READV_START, msg->lt_readv_start());
+        lt_buffer->StampAt(lt_handle, LT_S_MSG_RECV_DONE, msg->lt_msg_recv_done());
+        lt_buffer->StampAt(lt_handle, LT_S_REQ_META_DESER_START,
+                            lt_req_meta_deser_start);
+        lt_buffer->StampAt(lt_handle, LT_S_REQ_META_DESER_END,
+                            lt_req_meta_deser_end);
     }
 #endif
 
@@ -840,6 +899,9 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
             const butil::IOBuf* checksum_attachment =
                 cntl->request_checksum_attachment() ?
                 &cntl->request_attachment() : nullptr;
+#if defined(BRPC_LATENCY_TRACE)
+            LT_STAMP(accessor.latency_trace_handle(), LT_S_REQ_PAYLOAD_DESER_START);
+#endif
             if (!DeserializeRpcMessage(req_buf, *cntl, content_type,
                                        compress_type, checksum_type,
                                        messages->Request(),
@@ -854,6 +916,9 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
                     ChecksumTypeToCStr(checksum_type), req_size);
                 break;
             }
+#if defined(BRPC_LATENCY_TRACE)
+            LT_STAMP(accessor.latency_trace_handle(), LT_S_REQ_PAYLOAD_DESER_END);
+#endif
             req_buf.clear();
         }
 
@@ -871,6 +936,15 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
             span->set_start_callback_us(butil::cpuwide_time_us());
             span->AsParent();
         }
+#if defined(BRPC_LATENCY_TRACE)
+        // S09: svc->CallMethod() call. One stamp covers all three branches
+        // below -- the direct call, the in-place usercode_in_pthread call,
+        // and the pool-scheduled call -- since it sits immediately before
+        // all of them and accessor.latency_trace_handle() stays valid
+        // across cntl.release() (release() only transfers ownership out of
+        // the unique_ptr, it doesn't destroy the Controller).
+        LT_STAMP(accessor.latency_trace_handle(), LT_S_SERVICE_START);
+#endif
         if (!FLAGS_usercode_in_pthread) {
             return svc->CallMethod(method, cntl.release(), 
                                    messages->Request(),

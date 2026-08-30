@@ -51,6 +51,20 @@ public:
     int64_t received_us() const { return _received_us; }
     int64_t base_real_us() const { return _base_real_us; }
 
+#if defined(BRPC_LATENCY_TRACE)
+    // Read-only accessors for the four event-level timestamps Task 9
+    // parked on this object (see the private fields below). Protocol
+    // handlers such as ProcessRpcRequest/ProcessRpcResponse are not
+    // friends of InputMessageBase -- they live in a different
+    // translation unit and only learn the LatencyTraceHandle needed to
+    // write these into a record after parsing the message -- so they
+    // need public read access rather than friendship.
+    uint64_t lt_wake() const { return _lt_wake; }
+    uint64_t lt_onedge_start() const { return _lt_onedge_start; }
+    uint64_t lt_readv_start() const { return _lt_readv_start; }
+    uint64_t lt_msg_recv_done() const { return _lt_msg_recv_done; }
+#endif
+
 protected:
     virtual ~InputMessageBase();
 

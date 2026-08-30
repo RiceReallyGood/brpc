@@ -689,10 +689,7 @@ static const brpc::LatencyTraceRecord* FindRecordByRole(brpc::LatencyTraceRole r
 static const brpc::LatencyTraceRecord* FindClientRecordForTest() {
     return FindRecordByRole(brpc::LT_ROLE_CLIENT);
 }
-// Unused by this file until Task 10/11 land (see the comment above
-// LatencyTraceE2ETest.ClientSendPointsAreStampedAndMonotonic's sibling
-// section below) -- kept, and marked accordingly, for them to reuse.
-ALLOW_UNUSED static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
+static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
     return FindRecordByRole(brpc::LT_ROLE_SERVER);
 }
 
@@ -743,27 +740,51 @@ TEST(LatencyTraceE2ETest, ClientSendPointsAreStampedAndMonotonic) {
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
-// Task 9 threads four receive-side timestamps (_lt_wake, _lt_onedge_start,
-// _lt_readv_start on Socket; _lt_msg_recv_done sampled when a message is
-// cut) down to InputMessageBase, but nothing in Task 9's file list calls
-// LatencyTraceBuffer::StampAt() to actually write them into a record --
-// that backfill happens in Task 10 (server, S01-S04, in
-// baidu_rpc_protocol.cpp's ProcessRpcRequest right after LT_ALLOC) and
-// Task 11 (client, C09-C12, in ProcessRpcResponse right after
-// bthread_id_lock succeeds). Until those land, the only live coverage of
-// StampAt() itself is the unit-level tests above
-// (StampAtWritesHistoricalDeltaIntoRecord / StampAtIsFirstWriteWins /
-// StampAtRejectsStaleHandle / StampAtClampsPreBaseCounterValueToZero).
-//
-// The end-to-end assertion that belongs here once Tasks 10/11 land: run a
-// real RPC (as ClientSendPointsAreStampedAndMonotonic above does) and
-// assert LT_C_WAKE..LT_C_MSG_RECV_DONE are non-zero and monotonic on the
-// client record, and LT_S_WAKE..LT_S_MSG_RECV_DONE are non-zero and
-// monotonic on the server record (previously attempted, and correctly
-// red, as LatencyTraceE2ETest.ReceivePointsAreStampedOnBothSides -- see
-// fix-round-q1q6 item 6). Flagging this explicitly so the gap stays
-// visible instead of silently reappearing once StampAt() exists and
-// someone assumes the wiring is done too.
+// Task 10 wires the server side: S01-S04 are the four Task-9 receive-side
+// timestamps backfilled via StampAt() right after AllocSlot() in
+// ProcessRpcRequest (passing the wake timestamp as base_counter -- see
+// AllocSlot's 3-arg overload and design doc sec.8.1); S05-S17 are stamped
+// directly (S05/S06 held in locals until the handle exists, same reasoning
+// as S01-S04; S15-S17 via Socket::Write()'s generic wopt.lt_handle path).
+// This single assertion range (LT_S_WAKE..LT_S_WRITE_END) therefore also
+// covers the server half of what Task 9's report flagged as pending
+// (formerly LatencyTraceE2ETest.ReceivePointsAreStampedOnBothSides's
+// server-side assertions). The client half (C09-C12) remains Task 11's.
+TEST(LatencyTraceE2ETest, ServerPointsAreCompleteAndMonotonic) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9528, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9528", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("hello");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
+    ASSERT_TRUE(s != nullptr);
+    for (int p = brpc::LT_S_WAKE; p <= brpc::LT_S_WRITE_END; ++p) {
+        ASSERT_GT(s->ts[p], 0u) << "server point " << p << " was never stamped";
+    }
+    for (int p = brpc::LT_S_WAKE; p < brpc::LT_S_WRITE_END; ++p) {
+        ASSERT_LE(s->ts[p], s->ts[p + 1])
+            << "server point " << p << " is later than " << (p + 1);
+    }
+    server.Stop(0);
+    server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
 
 #endif  // defined(BRPC_LATENCY_TRACE)
 
