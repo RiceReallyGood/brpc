@@ -19,6 +19,7 @@
 #define BRPC_LATENCY_TRACE_H
 
 #include <stdint.h>
+#include <string>
 #include "butil/atomicops.h"
 #include "butil/compiler_specific.h"
 
@@ -104,6 +105,29 @@ struct LatencyTraceRecord {
     uint8_t  attempt;        // retry / backup-request index
 };
 
+const uint64_t LT_FILE_MAGIC = 0x4252504C54524331ULL;  // "BRPCLTRC1"
+
+// 128 bytes, fixed. merge.py parses this verbatim.
+struct LatencyTraceFileHeader {
+    uint64_t magic;
+    uint32_t record_size;
+    uint32_t point_count;
+    // Empirical calibration: freq = (tail_counter - head_counter)
+    //                             * 1e9 / (tail_realtime_ns - head_realtime_ns)
+    uint64_t head_counter;
+    int64_t  head_realtime_ns;
+    uint64_t tail_counter;
+    int64_t  tail_realtime_ns;
+    double   counter_freq_hz;     // authoritative, empirically measured
+    uint64_t cntfrq_el0_hz;       // cross-check only; 0 on non-aarch64
+    uint64_t record_count;
+    uint64_t dropped_count;
+    uint64_t process_tag;         // random per process, high bits of trace_id
+    uint64_t method_table_offset; // byte offset of the method-name table,
+                                  // written by Task 13; 0 until then
+    char     padding[128 - 96];
+};
+
 // Sharded ring buffer of records. One shard per group of workers keeps
 // the allocation cursor off a single contended cacheline.
 class LatencyTraceBuffer {
@@ -143,9 +167,27 @@ public:
     // Test-only: re-create the buffer with `capacity` slots in total.
     void ResetForTest(int capacity);
 
+    // Writes a LatencyTraceFileHeader followed by every written record
+    // (across all shards) to `path`. Returns the number of records
+    // written, or -1 on I/O failure.
+    int Dump(const char* path);
+
+    // Saves `path` and registers an atexit hook that calls Dump(path) when
+    // the process exits. Idempotent: only the first call registers the
+    // hook. Called automatically from the constructor when
+    // -latency_trace_dump_path is non-empty.
+    void EnableDumpOnExit(const char* path);
+
+    bool atexit_registered() const { return _atexit_registered; }
+
 private:
     LatencyTraceBuffer();
     ~LatencyTraceBuffer();
+
+    // The lone atexit callback: reaches back into the singleton to find
+    // the path EnableDumpOnExit stashed, since atexit callbacks take no
+    // arguments.
+    static void DumpAtExitCallback();
 
     struct Shard {
         butil::atomic<uint64_t> cursor;
@@ -162,6 +204,17 @@ private:
     butil::atomic<uint64_t> _dropped;
     bool _stop_when_full;
     int _per_shard_capacity;
+
+    // Calibration anchor, sampled once at construction. Dump() pairs this
+    // with a freshly-sampled tail (counter, realtime) to compute an
+    // empirical counter frequency -- see Dump()'s comment for why the
+    // window has a 100ms minimum.
+    uint64_t _head_counter;
+    int64_t _head_realtime_ns;
+    uint64_t _process_tag;
+
+    bool _atexit_registered;
+    std::string _dump_path;
 };
 
 }  // namespace brpc

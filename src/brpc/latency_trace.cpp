@@ -19,8 +19,12 @@
 
 #include <gflags/gflags.h>
 #include <new>
+#include <cstdio>
+#include <cstdlib>
+#include <time.h>
 #include "butil/time.h"
 #include "butil/logging.h"
+#include "butil/fast_rand.h"
 
 namespace brpc {
 
@@ -29,6 +33,9 @@ DEFINE_bool(latency_trace_enabled, false,
             "to be built with BRPC_LATENCY_TRACE.");
 DEFINE_int32(latency_trace_capacity, 100000,
              "Total number of latency trace records held in memory");
+DEFINE_string(latency_trace_dump_path, "",
+              "Dump latency trace records to this file at exit; empty "
+              "disables dumping");
 
 static uint64_t NextPowerOfTwo(uint64_t v) {
     uint64_t r = 1;
@@ -39,8 +46,15 @@ static uint64_t NextPowerOfTwo(uint64_t v) {
 }
 
 LatencyTraceBuffer::LatencyTraceBuffer()
-    : _dropped(0), _stop_when_full(true), _per_shard_capacity(0) {
+    : _dropped(0), _stop_when_full(true), _per_shard_capacity(0),
+      _head_counter(butil::detail::clock_cycles()),
+      _head_realtime_ns(butil::monotonic_time_ns()),
+      _process_tag(butil::fast_rand()),
+      _atexit_registered(false) {
     ResetForTest(FLAGS_latency_trace_capacity);
+    if (!FLAGS_latency_trace_dump_path.empty()) {
+        EnableDumpOnExit(FLAGS_latency_trace_dump_path.c_str());
+    }
 }
 
 LatencyTraceBuffer::~LatencyTraceBuffer() {
@@ -209,6 +223,101 @@ size_t LatencyTraceBuffer::recorded_count() const {
 
 size_t LatencyTraceBuffer::dropped_count() const {
     return _dropped.load(butil::memory_order_relaxed);
+}
+
+static uint64_t ReadCntfrqHz() {
+#if defined(__aarch64__)
+    uint64_t v;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(v));
+    return v;
+#else
+    return 0;
+#endif
+}
+
+int LatencyTraceBuffer::Dump(const char* path) {
+    // Calibration window minimum: freq = Δcounter / Δrealtime, and a
+    // window of only a few microseconds (e.g. ResetForTest() immediately
+    // followed by Dump() in a unit test) makes that quotient pure noise.
+    // Top the window up to at least 100ms before sampling the tail pair.
+    // On a real dump-at-exit path this never triggers -- a process that
+    // has run RPCs has been alive far longer than 100ms already.
+    const int64_t kMinWindowNs = 100 * 1000000LL;
+    int64_t elapsed_ns = butil::monotonic_time_ns() - _head_realtime_ns;
+    if (elapsed_ns < kMinWindowNs) {
+        const int64_t remain_ns = kMinWindowNs - elapsed_ns;
+        struct timespec ts;
+        ts.tv_sec = remain_ns / 1000000000LL;
+        ts.tv_nsec = remain_ns % 1000000000LL;
+        nanosleep(&ts, nullptr);
+    }
+    const uint64_t tail_counter = butil::detail::clock_cycles();
+    const int64_t tail_realtime_ns = butil::monotonic_time_ns();
+
+    LatencyTraceFileHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = LT_FILE_MAGIC;
+    hdr.record_size = (uint32_t)sizeof(LatencyTraceRecord);
+    hdr.point_count = (uint32_t)LT_POINT_COUNT;
+    hdr.head_counter = _head_counter;
+    hdr.head_realtime_ns = _head_realtime_ns;
+    hdr.tail_counter = tail_counter;
+    hdr.tail_realtime_ns = tail_realtime_ns;
+    const double dt_counter = (double)(tail_counter - _head_counter);
+    const double dt_realtime_ns = (double)(tail_realtime_ns - _head_realtime_ns);
+    hdr.counter_freq_hz = dt_counter * 1e9 / dt_realtime_ns;
+    hdr.cntfrq_el0_hz = ReadCntfrqHz();
+    hdr.record_count = recorded_count();
+    hdr.dropped_count = dropped_count();
+    hdr.process_tag = _process_tag;
+    hdr.method_table_offset = 0;  // written by Task 13
+
+    FILE* fp = fopen(path, "wb");
+    if (fp == nullptr) {
+        return -1;
+    }
+    if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
+        fclose(fp);
+        return -1;
+    }
+
+    int written = 0;
+    for (int i = 0; i < SHARD_COUNT; ++i) {
+        Shard& sh = _shards[i];
+        for (int j = 0; j < _per_shard_capacity; ++j) {
+            LatencyTraceRecord& r = sh.records[j];
+            // Acquire-load, paired with AllocSlot's release-store: this is
+            // the actual publication point (cursor.fetch_add happens
+            // BEFORE the payload is written, so it cannot serve as one).
+            // Seeing anything other than UINT64_MAX here guarantees every
+            // payload write AllocSlot made before its release-store is
+            // visible to this thread too.
+            const uint64_t seq = r.slot_seq.load(butil::memory_order_acquire);
+            if (seq == UINT64_MAX) {
+                continue;   // never written
+            }
+            if (fwrite(&r, sizeof(r), 1, fp) != 1) {
+                fclose(fp);
+                return -1;
+            }
+            ++written;
+        }
+    }
+    fclose(fp);
+    return written;
+}
+
+void LatencyTraceBuffer::DumpAtExitCallback() {
+    LatencyTraceBuffer* b = instance();
+    b->Dump(b->_dump_path.c_str());
+}
+
+void LatencyTraceBuffer::EnableDumpOnExit(const char* path) {
+    _dump_path = path;
+    if (!_atexit_registered) {
+        atexit(&LatencyTraceBuffer::DumpAtExitCallback);
+        _atexit_registered = true;
+    }
 }
 
 }  // namespace brpc

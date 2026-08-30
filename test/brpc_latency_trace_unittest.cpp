@@ -17,8 +17,10 @@
 
 #include <gtest/gtest.h>
 #include <atomic>
+#include <cstdio>
 #include <thread>
 #include <type_traits>
+#include <unistd.h>
 #include <vector>
 #include "brpc/latency_trace.h"
 #include "butil/time.h"
@@ -381,6 +383,50 @@ TEST_F(LatencyTraceBufferTest, StaleHandleIsRejectedUnderConcurrentRecycling) {
            "yet handed back a record belonging to a different "
            "generation -- it must return null instead once a slot has "
            "been recycled, never a foreign generation's data";
+}
+
+TEST_F(LatencyTraceBufferTest, DumpRoundTripsHeaderAndRecords) {
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    b->ResetForTest(64);
+    const brpc::LatencyTraceHandle h = b->AllocSlot(0xABCDEF, brpc::LT_ROLE_CLIENT);
+    b->Stamp(h, brpc::LT_C_RPC_START);
+
+    const char* path = "/tmp/brpc_lt_test.bin";
+    ASSERT_GE(b->Dump(path), 1);
+
+    FILE* fp = fopen(path, "rb");
+    ASSERT_TRUE(fp != nullptr);
+    brpc::LatencyTraceFileHeader hdr;
+    ASSERT_EQ(1u, fread(&hdr, sizeof(hdr), 1, fp));
+    ASSERT_EQ(brpc::LT_FILE_MAGIC, hdr.magic);
+    ASSERT_EQ(sizeof(brpc::LatencyTraceRecord), hdr.record_size);
+    ASSERT_EQ((uint32_t)brpc::LT_POINT_COUNT, hdr.point_count);
+    // Empirical frequency must be a plausible clock rate, not zero.
+    ASSERT_GT(hdr.counter_freq_hz, 1000000.0);
+    // Head/tail calibration pairs must bracket a positive interval.
+    ASSERT_GT(hdr.tail_realtime_ns, hdr.head_realtime_ns);
+    ASSERT_GT(hdr.tail_counter, hdr.head_counter);
+
+    brpc::LatencyTraceRecord rec;
+    bool found = false;
+    while (fread(&rec, sizeof(rec), 1, fp) == 1) {
+        if (rec.trace_id == 0xABCDEF) {
+            found = true;
+            break;
+        }
+    }
+    fclose(fp);
+    ASSERT_TRUE(found);
+    unlink(path);
+}
+
+TEST_F(LatencyTraceBufferTest, DumpPathFlagRegistersAtexitHook) {
+    // Dumping on exit is how a benchmark run gets its data without the
+    // program having to call anything. Verify the hook is installed, not
+    // that atexit fires (gtest cannot observe process exit).
+    ASSERT_FALSE(brpc::LatencyTraceBuffer::instance()->atexit_registered());
+    brpc::LatencyTraceBuffer::instance()->EnableDumpOnExit("/tmp/brpc_lt_exit.bin");
+    ASSERT_TRUE(brpc::LatencyTraceBuffer::instance()->atexit_registered());
 }
 
 TEST(LatencyTraceMacroTest, StampCompilesAndIsNoOpWhenHandleInvalid) {
