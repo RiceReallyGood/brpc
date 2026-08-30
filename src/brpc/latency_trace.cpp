@@ -291,22 +291,25 @@ int LatencyTraceBuffer::Dump(const char* path) {
         return -1;
     }
     // hdr.record_count above is the count this dump PROMISES to contain.
-    // If any fwrite below fails partway through, that promise is already
-    // wrong for whatever landed on disk before the failure -- a header
-    // claiming N records over a file holding fewer is worse than no file
-    // at all, because an offline reader has no way to tell the two apart
-    // from the header alone. So on any failure past this point we unlink
-    // the path rather than leave a truncated file with a lying header;
-    // the caller (Dump()'s own return value, or DumpAtExitCallback's log
-    // line below) is the failure signal instead.
-    if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
-        fclose(fp);
-        remove(path);
-        return -1;
-    }
+    // If any fwrite below fails partway through -- or, less obviously,
+    // if the fclose() at the bottom fails to flush stdio's buffer to
+    // disk even though every fwrite reported success -- that promise is
+    // already wrong for whatever actually landed on disk. A header
+    // claiming N records over a file holding fewer (or a file that never
+    // fully hit disk at all) is worse than no file, because an offline
+    // reader has no way to tell the two apart from the header alone. So
+    // every failure below funnels into one `ok = false`, and the single
+    // cleanup path at the end unlinks the path rather than leaving a
+    // file that lies about what it contains; the caller (Dump()'s own
+    // return value, or DumpAtExitCallback's log line below) is the
+    // failure signal instead. One `fclose` call, one `remove` call, both
+    // unconditional past this point but only the latter gated on `ok` --
+    // no path here can double-close `fp` or remove a file this call
+    // didn't itself create.
+    bool ok = (fwrite(&hdr, sizeof(hdr), 1, fp) == 1);
 
     int written = 0;
-    for (int i = 0; i < SHARD_COUNT; ++i) {
+    for (int i = 0; ok && i < SHARD_COUNT; ++i) {
         Shard& sh = _shards[i];
         for (int j = 0; j < _per_shard_capacity; ++j) {
             LatencyTraceRecord& r = sh.records[j];
@@ -337,14 +340,28 @@ int LatencyTraceBuffer::Dump(const char* path) {
                 continue;   // never written
             }
             if (fwrite(&r, sizeof(r), 1, fp) != 1) {
-                fclose(fp);
-                remove(path);
-                return -1;
+                ok = false;
+                break;
             }
             ++written;
         }
     }
-    fclose(fp);
+
+    // fclose() is where stdio actually flushes its buffer to the OS/disk
+    // -- a full buffer's worth of records can still be sitting in
+    // userspace when the last fwrite() above returned success, and only
+    // meet failure (ENOSPC, EIO, ...) here. Every fwrite succeeding is
+    // therefore "the write loop succeeded", not "the file is written";
+    // this check is what actually confirms the latter, and it is not
+    // redundant with the per-fwrite checks above.
+    if (fclose(fp) != 0) {
+        ok = false;
+    }
+
+    if (!ok) {
+        remove(path);
+        return -1;
+    }
     return written;
 }
 
