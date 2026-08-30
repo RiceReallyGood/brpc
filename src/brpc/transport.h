@@ -20,6 +20,9 @@
 #include "brpc/input_messenger.h"
 #include "brpc/socket.h"
 #include "server.h"
+#if defined(BRPC_LATENCY_TRACE)
+#include "butil/time.h"           // butil::detail::clock_cycles
+#endif
 
 namespace brpc {
 using OnEdgeTrigger = std::function<void (Socket*)>;
@@ -30,6 +33,9 @@ public:
         // the enclosed Socket is valid and free to access inside this function.
         SocketUniquePtr s(static_cast<Socket*>(arg));
         const OnEdgeTrigger on_edge_trigger = s->_transport->GetOnEdgeTrigger();
+#if defined(BRPC_LATENCY_TRACE)
+        s->_lt_onedge_start = butil::detail::clock_cycles();
+#endif
         on_edge_trigger(s.get());
         return nullptr;
     }

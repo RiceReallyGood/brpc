@@ -19,8 +19,20 @@
 #ifdef BRPC_SOCKET_HAS_EOF
 #include "brpc/details/has_epollrdhup.h"
 #endif
+#if defined(BRPC_LATENCY_TRACE)
+#include "butil/time.h"           // butil::detail::clock_cycles
+#endif
 
 namespace brpc {
+
+#if defined(BRPC_LATENCY_TRACE)
+// Timestamp of the most recent epoll_wait() return on this thread, in raw
+// clock_cycles(). All N events reaped by one epoll_wait() call share this
+// value -- that's correct semantics (they woke up together), not
+// measurement error. Read by Socket::OnInputEvent() (socket.cpp) into
+// Socket::_lt_wake. See design doc sec.8.2. External linkage on purpose.
+__thread uint64_t tls_lt_epoll_wake = 0;
+#endif
 
 EventDispatcher::EventDispatcher()
     : _event_dispatcher_fd(-1)
@@ -226,6 +238,11 @@ void EventDispatcher::Run() {
             PLOG(FATAL) << "Fail to epoll_wait epfd=" << _event_dispatcher_fd;
             break;
         }
+#if defined(BRPC_LATENCY_TRACE)
+        // All N events from one epoll_wait return share this timestamp.
+        // That is the correct semantics: they were one wake-up.
+        tls_lt_epoll_wake = butil::detail::clock_cycles();
+#endif
         for (int i = 0; i < n; ++i) {
             if (e[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)
 #ifdef BRPC_SOCKET_HAS_EOF

@@ -585,6 +585,48 @@ TEST(LatencyTraceE2ETest, ClientSendPointsAreStampedAndMonotonic) {
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
+TEST(LatencyTraceE2ETest, ReceivePointsAreStampedOnBothSides) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9527, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9527", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("hello");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    const brpc::LatencyTraceRecord* c = FindClientRecordForTest();
+    const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
+    ASSERT_TRUE(c != nullptr && s != nullptr);
+    for (int p = brpc::LT_C_WAKE; p <= brpc::LT_C_MSG_RECV_DONE; ++p) {
+        ASSERT_GT(c->ts[p], 0u) << "client point " << p;
+    }
+    for (int p = brpc::LT_S_WAKE; p <= brpc::LT_S_MSG_RECV_DONE; ++p) {
+        ASSERT_GT(s->ts[p], 0u) << "server point " << p;
+    }
+    // Messages cut from the same epoll_wait batch share the same wake
+    // value, so this is <=, not <.
+    ASSERT_LE(s->ts[brpc::LT_S_WAKE], s->ts[brpc::LT_S_ONEDGE_START]);
+    ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READV_START]);
+    ASSERT_LE(s->ts[brpc::LT_S_READV_START], s->ts[brpc::LT_S_MSG_RECV_DONE]);
+
+    server.Stop(0);
+    server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
 #endif  // defined(BRPC_LATENCY_TRACE)
 
 }  // namespace

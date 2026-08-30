@@ -254,7 +254,17 @@ int InputMessenger::ProcessNewMessage(
         }
         pr.message()->_received_us = received_us;
         pr.message()->_base_real_us = base_realtime;
-                    
+#if defined(BRPC_LATENCY_TRACE)
+        // No trace handle is known yet -- this message hasn't been parsed
+        // as an RPC. Carry the Socket's event-level timestamps along with
+        // this message so a protocol handler can stamp them once it does
+        // know the handle. See design doc sec.8.2.
+        pr.message()->_lt_wake = m->_lt_wake;
+        pr.message()->_lt_onedge_start = m->_lt_onedge_start;
+        pr.message()->_lt_readv_start = m->_lt_readv_start;
+        pr.message()->_lt_msg_recv_done = butil::detail::clock_cycles();
+#endif
+
         // This unique_ptr prevents msg to be lost before transfering
         // ownership to last_msg
         DestroyingPtr<InputMessageBase> msg(pr.message());
@@ -342,6 +352,9 @@ void InputMessenger::OnNewMessages(Socket* m) {
         }
 
         // Read.
+#if defined(BRPC_LATENCY_TRACE)
+        m->_lt_readv_start = butil::detail::clock_cycles();
+#endif
         const ssize_t nr = m->DoRead(once_read);
         if (nr <= 0) {
             if (0 == nr) {

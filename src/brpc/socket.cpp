@@ -65,6 +65,13 @@ size_t BAIDU_WEAK get_sizes(const bthread_id_list_t* list, size_t* cnt, size_t n
 
 namespace brpc {
 
+#if defined(BRPC_LATENCY_TRACE)
+// Defined in event_dispatcher_epoll.cpp: raw clock_cycles() at the most
+// recent epoll_wait() return on this thread. OnInputEvent() below copies
+// it into the addressed Socket's _lt_wake. See design doc sec.8.2.
+extern __thread uint64_t tls_lt_epoll_wake;
+#endif
+
 // NOTE: This flag was true by default before r31206. Connected to somewhere
 // is not an important event now, we can check the connection in /connections
 // if we're in doubt.
@@ -489,6 +496,11 @@ Socket::Socket(Forbidden f)
     , _last_msg_size(0)
     , _avg_msg_size(0)
     , _last_readtime_us(0)
+#if defined(BRPC_LATENCY_TRACE)
+    , _lt_wake(0)
+    , _lt_onedge_start(0)
+    , _lt_readv_start(0)
+#endif
     , _parsing_context(nullptr)
     , _correlation_id(0)
     , _health_check_interval_s(-1)
@@ -2300,6 +2312,9 @@ int Socket::OnInputEvent(void* user_data, uint32_t events,
     if (Address(id, &s) < 0) {
         return -1;
     }
+#if defined(BRPC_LATENCY_TRACE)
+    s->_lt_wake = tls_lt_epoll_wake;
+#endif
     if (!s->_transport->HasOnEdgeTrigger()) {
         // Callback can be nullptr when receiving error epoll events
         // (Added into epoll by `WaitConnected')

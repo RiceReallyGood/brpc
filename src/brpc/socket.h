@@ -924,6 +924,20 @@ private:
     // Set with cpuwide_time_us() at last read operation
     butil::atomic<int64_t> _last_readtime_us;
 
+#if defined(BRPC_LATENCY_TRACE)
+    // Event-level receive timestamps (raw clock_cycles()). No trace handle
+    // exists yet when these are observed -- epoll_wait/OnEdge/DoRead all
+    // happen before any message has been parsed off the wire -- so they
+    // are parked here and copied into each InputMessageBase as messages
+    // are cut out of _read_buf (see InputMessenger::ProcessNewMessage).
+    // Not atomic: at most one bthread runs this socket's edge-triggered
+    // callback at a time (see _nevent), so writes here are serialized.
+    // See design doc sec.8.2.
+    uint64_t _lt_wake;
+    uint64_t _lt_onedge_start;
+    uint64_t _lt_readv_start;
+#endif
+
     // Saved context for parsing, reset before trying other protocols.
     butil::atomic<Destroyable*> _parsing_context;
 

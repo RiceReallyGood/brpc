@@ -21,6 +21,9 @@
 
 #include "brpc/socket_id.h"           // SocketId
 #include "brpc/destroyable.h"         // DestroyingPtr
+#if defined(BRPC_LATENCY_TRACE)
+#include <stdint.h>                   // uint64_t
+#endif
 
 
 namespace brpc {
@@ -61,6 +64,20 @@ friend class Transport;
     SocketUniquePtr _socket;
     void (*_process)(InputMessageBase* msg);
     const void* _arg;
+#if defined(BRPC_LATENCY_TRACE)
+    // Copied from the owning Socket's _lt_wake/_lt_onedge_start/
+    // _lt_readv_start at the moment this message was cut out of the read
+    // buffer in InputMessenger::ProcessNewMessage, plus the cut-out time
+    // itself. The handle needed to write these into a trace record is
+    // still unknown at that point (the message hasn't been parsed as an
+    // RPC yet), so they ride along here until a protocol handler
+    // (e.g. ProcessRpcRequest/ProcessRpcResponse) learns the handle and
+    // stamps them. See design doc sec.8.2.
+    uint64_t _lt_wake;
+    uint64_t _lt_onedge_start;
+    uint64_t _lt_readv_start;
+    uint64_t _lt_msg_recv_done;
+#endif
 };
 
 } // namespace brpc
