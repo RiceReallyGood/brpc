@@ -87,6 +87,18 @@ enum LatencyTraceRole {
 // within this process; see the .cpp for why its wraparound is safe.
 uint64_t MakeLatencyTraceId(uint64_t seq);
 
+// Interns `full_name` into a process-wide, thread-safe string->id table and
+// returns the id -- stable for the life of the process, and the same string
+// always maps back to the same id. Ids are assigned in first-seen order
+// starting at 1; 0 is never assigned (LatencyTraceRecord::method_id defaults
+// to 0, meaning "no method identified", so this table's id space cannot
+// collide with that default). `method_id` alone is meaningless offline
+// (it's just a small integer in a fixed-size record) -- LatencyTraceBuffer::
+// Dump() appends this table's full contents after the records, and stores
+// its byte offset in LatencyTraceFileHeader::method_table_offset, so an
+// offline reader can resolve an id back to the name that produced it.
+uint32_t LatencyTraceMethodId(const std::string& full_name);
+
 // Opaque reference to one slot in the ring buffer.
 // Layout: (shard << 56) | seq. Zero means "not tracing".
 typedef uint64_t LatencyTraceHandle;
@@ -167,8 +179,12 @@ struct LatencyTraceFileHeader {
     uint64_t record_count;
     uint64_t dropped_count;
     uint64_t process_tag;         // random per process, high bits of trace_id
-    uint64_t method_table_offset; // byte offset of the method-name table,
-                                  // written by Task 13; 0 until then
+    // Byte offset (from the start of the file) of the method-name table:
+    // a uint32 `count`, followed by `count` entries of uint32 `len` + `len`
+    // raw bytes (no trailing NUL). Entry i (0-based) names the method whose
+    // LatencyTraceRecord::method_id == i + 1 -- id 0 is never assigned (see
+    // LatencyTraceMethodId), so it is intentionally absent from this table.
+    uint64_t method_table_offset;
     char     padding[128 - 96];
 };
 

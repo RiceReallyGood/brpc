@@ -1286,6 +1286,19 @@ void Controller::EndRPC(const CompletionInfo& info) {
 
 void Controller::OnRPCEnd(int64_t end_time_us) {
     _end_time_us = end_time_us;
+#if defined(BRPC_LATENCY_TRACE)
+    // Final outcome of whichever attempt is current when the whole,
+    // possibly-retried RPC actually finishes -- 0 on success, or the
+    // terminal error once retries are exhausted. Earlier, abandoned
+    // attempts get their own error_code written at the point IssueRPC
+    // decides to retry (see IssueRPC), before their slot is replaced.
+    {
+        LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(_lt_handle);
+        if (lt_rec != nullptr) {
+            lt_rec->error_code = ErrorCode();
+        }
+    }
+#endif
     if (nullptr != _backup_request_policy) {
         _backup_request_policy->OnRPCEnd(this);
     }
@@ -1341,7 +1354,43 @@ void Controller::HandleSendFailed() {
 
 void Controller::IssueRPC(int64_t start_realtime_us) {
     _current_call.begin_time_us = start_realtime_us;
-    
+
+#if defined(BRPC_LATENCY_TRACE)
+    // Spec D9: every attempt gets its own record, numbered from 0. The
+    // first attempt's slot was already allocated by Channel::CallMethod
+    // before its first call into IssueRPC; _current_call.nretry is
+    // incremented (by OnVersionedRPCReturned, for both the retry and the
+    // backup-request path) strictly before IssueRPC runs again, so seeing
+    // it non-zero here -- together with a still-valid handle, i.e. tracing
+    // is actually on -- means this is a second-or-later send for the same
+    // logical RPC, not the first. `_error_code` at this point still holds
+    // the error that caused the retry (this function resets it to 0
+    // itself, just below) -- record it into the OLD attempt's slot before
+    // moving on. The old slot is left otherwise untouched, as its own
+    // permanent row; a brand-new slot/trace id is allocated for THIS
+    // attempt rather than reusing it, precisely so a retried request that
+    // took 40ms is visible as its own record and not silently overwritten.
+    if (_current_call.nretry > 0 && _lt_handle != LT_INVALID_HANDLE) {
+        LatencyTraceRecord* prev_rec = LatencyTraceBuffer::instance()->Get(_lt_handle);
+        if (prev_rec != nullptr) {
+            prev_rec->error_code = _error_code;
+        }
+        static butil::atomic<uint64_t> s_lt_retry_seq(0);
+        const uint64_t seq =
+            s_lt_retry_seq.fetch_add(1, butil::memory_order_relaxed);
+        const uint64_t trace_id = MakeLatencyTraceId(seq);
+        const LatencyTraceHandle h =
+            LatencyTraceBuffer::instance()->AllocSlot(trace_id, LT_ROLE_CLIENT);
+        _lt_trace_id = trace_id;
+        _lt_handle = h;
+        LatencyTraceRecord* rec = LatencyTraceBuffer::instance()->Get(h);
+        if (rec != nullptr) {
+            rec->attempt = (uint8_t)_current_call.nretry;
+        }
+        LT_STAMP(h, LT_C_RPC_START);
+    }
+#endif
+
     // If has retry/backup request，we will recalculate the timeout,
     if (_real_timeout_ms > 0) {
         _real_timeout_ms -= (start_realtime_us - _begin_time_us) / 1000;
@@ -1544,6 +1593,16 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
 #if defined(BRPC_LATENCY_TRACE)
     wopt.lt_handle = _lt_handle;
     wopt.lt_role = LT_ROLE_CLIENT;
+    {
+        LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(_lt_handle);
+        if (lt_rec != nullptr) {
+            lt_rec->socket_id = (uint32_t)_current_call.sending_sock->id();
+            lt_rec->remote_ip =
+                butil::ip2int(_current_call.sending_sock->remote_side().ip);
+            lt_rec->remote_port =
+                (uint16_t)_current_call.sending_sock->remote_side().port;
+        }
+    }
 #endif
     int rc;
     size_t packet_size = 0;

@@ -22,9 +22,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <time.h>
+#include <mutex>
+#include <vector>
 #include "butil/time.h"
 #include "butil/logging.h"
 #include "butil/fast_rand.h"
+#include "butil/synchronization/lock.h"
+#include "butil/containers/flat_map.h"
 
 namespace brpc {
 
@@ -369,6 +373,41 @@ size_t LatencyTraceBuffer::dropped_count() const {
     return _dropped.load(butil::memory_order_relaxed);
 }
 
+// Process-wide method-name -> id table backing LatencyTraceMethodId(). One
+// instance for the whole process (like LatencyTraceBuffer::instance()),
+// deliberately leaked for the same reason documented on that instance()
+// function: no destructor-ordering hazard against a later atexit dump.
+namespace {
+struct MethodTable {
+    MethodTable() { ids.init(1024); }
+    butil::Mutex mutex;
+    butil::FlatMap<std::string, uint32_t> ids;
+    // names[i] is the method whose id is i+1 -- kept in first-seen (i.e.
+    // id) order so Dump() can serialize it without re-deriving the order
+    // from `ids`, which is a hash table.
+    std::vector<std::string> names;
+};
+
+MethodTable* GetMethodTable() {
+    static MethodTable* table = new MethodTable;
+    return table;
+}
+}  // namespace
+
+uint32_t LatencyTraceMethodId(const std::string& full_name) {
+    MethodTable* t = GetMethodTable();
+    std::unique_lock<butil::Mutex> lck(t->mutex);
+    uint32_t* existing = t->ids.seek(full_name);
+    if (existing != nullptr) {
+        return *existing;
+    }
+    // Ids start at 1 -- see the declaration's comment for why 0 is reserved.
+    const uint32_t id = (uint32_t)t->names.size() + 1;
+    t->names.push_back(full_name);
+    t->ids.insert(full_name, id);
+    return id;
+}
+
 static uint64_t ReadCntfrqHz() {
 #if defined(__aarch64__)
     uint64_t v;
@@ -414,7 +453,19 @@ int LatencyTraceBuffer::Dump(const char* path) {
     hdr.record_count = recorded_count();
     hdr.dropped_count = dropped_count();
     hdr.process_tag = _process_tag;
-    hdr.method_table_offset = 0;  // written by Task 13
+    // Snapshot the method table once, under lock, so the offset computed
+    // here (which assumes exactly hdr.record_count records precede the
+    // table) and the bytes actually written after the record loop below
+    // both describe the same table -- a LatencyTraceMethodId() call
+    // racing this Dump() must not see half the snapshot.
+    std::vector<std::string> method_names;
+    {
+        MethodTable* mt = GetMethodTable();
+        std::unique_lock<butil::Mutex> lck(mt->mutex);
+        method_names = mt->names;
+    }
+    hdr.method_table_offset =
+        sizeof(hdr) + hdr.record_count * (uint64_t)sizeof(LatencyTraceRecord);
 
     FILE* fp = fopen(path, "wb");
     if (fp == nullptr) {
@@ -474,6 +525,25 @@ int LatencyTraceBuffer::Dump(const char* path) {
                 break;
             }
             ++written;
+        }
+    }
+
+    // Method-name table: appended immediately after the records, at the
+    // byte offset already computed into hdr.method_table_offset above
+    // (sizeof(hdr) + hdr.record_count * sizeof(record)) -- which is where
+    // this write lands as long as `written` matches hdr.record_count.
+    // Format: uint32 count, then `count` entries of uint32 len + raw
+    // bytes; entry i names the method whose method_id is i+1 (see
+    // LatencyTraceMethodId and LatencyTraceFileHeader::method_table_offset).
+    if (ok) {
+        const uint32_t count = (uint32_t)method_names.size();
+        ok = (fwrite(&count, sizeof(count), 1, fp) == 1);
+        for (size_t i = 0; ok && i < method_names.size(); ++i) {
+            const uint32_t len = (uint32_t)method_names[i].size();
+            ok = (fwrite(&len, sizeof(len), 1, fp) == 1);
+            if (ok && len > 0) {
+                ok = (fwrite(method_names[i].data(), len, 1, fp) == 1);
+            }
         }
     }
 

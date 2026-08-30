@@ -425,6 +425,16 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
             res_buf.append(cntl->response_attachment().movable());
         }
     }
+#if defined(BRPC_LATENCY_TRACE)
+    {
+        LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(
+            accessor.latency_trace_handle());
+        if (lt_rec != nullptr) {
+            lt_rec->rsp_size = (uint32_t)res_buf.size();
+            lt_rec->error_code = error_code;
+        }
+    }
+#endif
 
     ResponseWriteInfo args;
     bthread_id_t response_id = INVALID_BTHREAD_ID;
@@ -745,6 +755,16 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
                             lt_req_meta_deser_start);
         lt_buffer->StampAt(lt_handle, LT_S_REQ_META_DESER_END,
                             lt_req_meta_deser_end);
+        LatencyTraceRecord* lt_rec = lt_buffer->Get(lt_handle);
+        if (lt_rec != nullptr) {
+            lt_rec->socket_id = (uint32_t)socket->id();
+            lt_rec->remote_ip = butil::ip2int(socket->remote_side().ip);
+            lt_rec->remote_port = (uint16_t)socket->remote_side().port;
+            // Total request body size (business payload + attachment, if
+            // any), before it gets cut apart below -- same value the
+            // do{}-loop's own `req_size` local recomputes further down.
+            lt_rec->req_size = (uint32_t)msg->payload.size();
+        }
     }
 #endif
 
@@ -870,6 +890,16 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
             svc = mp->service;
             method = const_cast<google::protobuf::MethodDescriptor*>(mp->method);
             accessor.set_method(method);
+#if defined(BRPC_LATENCY_TRACE)
+            {
+                LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(
+                    accessor.latency_trace_handle());
+                if (lt_rec != nullptr) {
+                    lt_rec->method_id = LatencyTraceMethodId(
+                        butil::EnsureString(method->full_name()));
+                }
+            }
+#endif
 
             if (span) {
                 span->ResetServerSpanName(butil::EnsureString(method->full_name()));
@@ -1104,6 +1134,15 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         // Parse response message iff error code from meta is 0
         butil::IOBuf res_buf;
         const int res_size = msg->payload.length();
+#if defined(BRPC_LATENCY_TRACE)
+        {
+            LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(
+                accessor.latency_trace_handle());
+            if (lt_rec != nullptr) {
+                lt_rec->rsp_size = (uint32_t)res_size;
+            }
+        }
+#endif
         butil::IOBuf* res_buf_ptr = &msg->payload;
         if (meta.has_attachment_size()) {
             if (meta.attachment_size() > res_size) {
@@ -1234,6 +1273,16 @@ void PackRpcRequest(butil::IOBuf* req_buf,
         if (cntl->request_checksum_attachment()) {
             meta.set_checksum_with_attachment(true);
         }
+#if defined(BRPC_LATENCY_TRACE)
+        {
+            LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(
+                accessor.latency_trace_handle());
+            if (lt_rec != nullptr) {
+                lt_rec->method_id = LatencyTraceMethodId(
+                    butil::EnsureString(method->full_name()));
+            }
+        }
+#endif
     } else if (nullptr != cntl->sampled_request()) {
         // Replaying. Keep service-name as the one seen by server.
         request_meta->set_service_name(cntl->sampled_request()->meta.service_name());
@@ -1275,7 +1324,16 @@ void PackRpcRequest(butil::IOBuf* req_buf,
     }
 
     // Don't use res->ByteSize() since it may be compressed
-    const size_t req_size = request_body.length(); 
+    const size_t req_size = request_body.length();
+#if defined(BRPC_LATENCY_TRACE)
+    {
+        LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(
+            accessor.latency_trace_handle());
+        if (lt_rec != nullptr) {
+            lt_rec->req_size = (uint32_t)req_size;
+        }
+    }
+#endif
     const size_t attached_size = cntl->request_attachment().length();
     if (attached_size) {
         meta.set_attachment_size(attached_size);

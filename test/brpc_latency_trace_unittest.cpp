@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <cstdio>
+#include <set>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
@@ -1043,6 +1044,160 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
     const int64_t total_link = rtt - srv;
     ASSERT_GE(total_link, 0) << "link_up + link_down (model A)";
 
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceMetaTest, RecordCarriesSizesEndpointAndErrorCode) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9527, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9527", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("hello");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    // Run one successful RPC first (reuse the Task 8 fixture).
+    const brpc::LatencyTraceRecord* c = FindClientRecordForTest();
+    const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
+    ASSERT_TRUE(c != nullptr && s != nullptr);
+
+    ASSERT_GT(c->req_size, 0u) << "client never recorded the request size";
+    ASSERT_GT(c->rsp_size, 0u) << "client never recorded the response size";
+    ASSERT_EQ(0, c->error_code);
+    ASSERT_NE(0u, c->socket_id);
+    ASSERT_NE(0u, c->remote_ip);
+    ASSERT_EQ(9527, c->remote_port);
+
+    ASSERT_GT(s->req_size, 0u);
+    ASSERT_NE(0u, s->socket_id);
+    // Both ends must agree on the payload sizes they saw.
+    ASSERT_EQ(c->req_size, s->req_size);
+
+    server.Stop(0);
+    server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceMetaTest, EachRetryAttemptGetsItsOwnRecord) {
+    // Spec D9: one record per attempt, numbered from 0. Point a channel at
+    // a dead backend with max_retry=2 so three attempts are issued.
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    opt.max_retry = 2;
+    opt.timeout_ms = 200;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9599", &opt));  // nothing listening
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("x");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_TRUE(cntl.Failed());
+
+    std::set<int> attempts;
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            break;
+        }
+        if (r->role == brpc::LT_ROLE_CLIENT) {
+            attempts.insert(r->attempt);
+            ASSERT_NE(0, r->error_code) << "a failed attempt must carry its errno";
+        }
+    }
+    ASSERT_EQ(3u, attempts.size()) << "expected one record per attempt";
+    ASSERT_EQ(0, *attempts.begin());
+    ASSERT_EQ(2, *attempts.rbegin());
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceMetaTest, DumpMethodTableResolvesRecordedMethodId) {
+    // The method table is only useful if an offline reader can actually
+    // resolve a method_id back to a name from the dumped file -- not
+    // merely if some bytes happen to land at method_table_offset. Issue a
+    // real RPC, dump, then parse the file exactly as an external tool
+    // would: read the header, seek to method_table_offset, walk the
+    // count+len-prefixed entries, and check entry[method_id - 1] matches
+    // the method that was actually called.
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9532, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9532", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("hello");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
+    ASSERT_TRUE(s != nullptr);
+    ASSERT_NE(0u, s->method_id) << "server record never recorded a method_id";
+
+    const char* path = "/tmp/brpc_lt_method_table_test.bin";
+    ASSERT_GE(brpc::LatencyTraceBuffer::instance()->Dump(path), 1);
+
+    FILE* fp = fopen(path, "rb");
+    ASSERT_TRUE(fp != nullptr);
+    brpc::LatencyTraceFileHeader hdr;
+    ASSERT_EQ(1u, fread(&hdr, sizeof(hdr), 1, fp));
+    ASSERT_GT(hdr.method_table_offset, 0u)
+        << "method_table_offset must no longer be the pre-Task-13 zero";
+
+    ASSERT_EQ(0, fseek(fp, (long)hdr.method_table_offset, SEEK_SET));
+    uint32_t count = 0;
+    ASSERT_EQ(1u, fread(&count, sizeof(count), 1, fp));
+    ASSERT_GE(count, s->method_id) << "table too short to contain method_id="
+                                    << s->method_id;
+
+    std::vector<std::string> names;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t len = 0;
+        ASSERT_EQ(1u, fread(&len, sizeof(len), 1, fp));
+        std::string name(len, '\0');
+        if (len > 0) {
+            ASSERT_EQ(1u, fread(&name[0], len, 1, fp));
+        }
+        names.push_back(name);
+    }
+    fclose(fp);
+    unlink(path);
+
+    // Entry i (0-based) names the method whose method_id == i + 1.
+    ASSERT_EQ("test.EchoService.Echo", names[s->method_id - 1])
+        << "could not resolve the recorded method_id back to its name";
+
+    server.Stop(0);
+    server.Join();
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
