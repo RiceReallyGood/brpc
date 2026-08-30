@@ -85,6 +85,20 @@ void LatencyTraceBuffer::ResetForTest(int capacity) {
     _dropped.store(0, butil::memory_order_relaxed);
 }
 
+// Deliberately leaked, not a function-local static object: EnableDumpOnExit
+// (called from the constructor when -latency_trace_dump_path is set) does
+// its own atexit(&DumpAtExitCallback) registration from inside that
+// constructor call, which runs BEFORE the compiler's own destructor
+// registration for a magic-static object would happen (that registration
+// happens right after construction completes, i.e. strictly later in
+// program order). atexit/__cxa_atexit callbacks run in reverse order of
+// registration, so a magic-static's destructor -- registered after ours
+// -- would run BEFORE DumpAtExitCallback fires at real process exit,
+// making the dump-at-exit path read a destroyed object. A raw `new` that
+// is never deleted has no destructor registration to race against: the
+// object is simply still alive, unconditionally, whenever any atexit
+// callback (ours included) runs. Do not "fix" this leak with a
+// function-local static.
 LatencyTraceBuffer* LatencyTraceBuffer::instance() {
     static LatencyTraceBuffer* s = new LatencyTraceBuffer;
     return s;
@@ -276,8 +290,18 @@ int LatencyTraceBuffer::Dump(const char* path) {
     if (fp == nullptr) {
         return -1;
     }
+    // hdr.record_count above is the count this dump PROMISES to contain.
+    // If any fwrite below fails partway through, that promise is already
+    // wrong for whatever landed on disk before the failure -- a header
+    // claiming N records over a file holding fewer is worse than no file
+    // at all, because an offline reader has no way to tell the two apart
+    // from the header alone. So on any failure past this point we unlink
+    // the path rather than leave a truncated file with a lying header;
+    // the caller (Dump()'s own return value, or DumpAtExitCallback's log
+    // line below) is the failure signal instead.
     if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
         fclose(fp);
+        remove(path);
         return -1;
     }
 
@@ -292,12 +316,29 @@ int LatencyTraceBuffer::Dump(const char* path) {
             // Seeing anything other than UINT64_MAX here guarantees every
             // payload write AllocSlot made before its release-store is
             // visible to this thread too.
+            //
+            // What this acquire load does NOT cover: ts[] entries the
+            // owning thread writes via Stamp() concurrently with this
+            // fwrite copying the record's bytes -- that is a genuine data
+            // race by the formal model, with no synchronization between
+            // this read and those writes. It is practically benign here:
+            // each ts[] entry is a single aligned uint32_t, which does not
+            // tear on this hardware, so this thread observes either the
+            // pre- or post-Stamp() value for each entry, never a mix of
+            // the two within one entry; and ts[point] == 0 already means
+            // "not yet stamped" everywhere else this array is read, so a
+            // dump that catches a record between AllocSlot and a later
+            // Stamp() just looks like an earlier, still-legitimate
+            // snapshot rather than corrupt data. Not fixed here -- doing
+            // so would mean synchronizing every Stamp() against a
+            // concurrent Dump(), which this design does not pay for.
             const uint64_t seq = r.slot_seq.load(butil::memory_order_acquire);
             if (seq == UINT64_MAX) {
                 continue;   // never written
             }
             if (fwrite(&r, sizeof(r), 1, fp) != 1) {
                 fclose(fp);
+                remove(path);
                 return -1;
             }
             ++written;
@@ -308,8 +349,15 @@ int LatencyTraceBuffer::Dump(const char* path) {
 }
 
 void LatencyTraceBuffer::DumpAtExitCallback() {
+    // Dump-at-exit is the primary production path (see the flag's doc
+    // comment) -- an I/O failure here has no caller left to report it to,
+    // so it must be logged here or it is simply lost.
     LatencyTraceBuffer* b = instance();
-    b->Dump(b->_dump_path.c_str());
+    const int n = b->Dump(b->_dump_path.c_str());
+    if (n < 0) {
+        LOG(ERROR) << "Failed to dump latency trace records to \""
+                   << b->_dump_path << "\"";
+    }
 }
 
 void LatencyTraceBuffer::EnableDumpOnExit(const char* path) {

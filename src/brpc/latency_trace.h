@@ -128,6 +128,15 @@ struct LatencyTraceFileHeader {
     char     padding[128 - 96];
 };
 
+// merge.py parses this struct byte-for-byte off disk; a silent size or
+// layout change (a field's type changed, a member got reordered, etc.)
+// would corrupt every dump file written after that point without
+// tripping any test that only round-trips the header through its own
+// sizeof(). Pin the contract at compile time as well.
+static_assert(sizeof(LatencyTraceFileHeader) == 128,
+              "LatencyTraceFileHeader is an on-disk format merge.py "
+              "parses verbatim -- it must stay exactly 128 bytes");
+
 // Sharded ring buffer of records. One shard per group of workers keeps
 // the allocation cursor off a single contended cacheline.
 class LatencyTraceBuffer {

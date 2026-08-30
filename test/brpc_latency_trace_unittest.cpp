@@ -386,6 +386,16 @@ TEST_F(LatencyTraceBufferTest, StaleHandleIsRejectedUnderConcurrentRecycling) {
 }
 
 TEST_F(LatencyTraceBufferTest, DumpRoundTripsHeaderAndRecords) {
+    // Hard-coded 128, not sizeof(hdr) on both sides of the fread below --
+    // this is the on-disk contract merge.py parses verbatim (mirrors
+    // Task 2's ASSERT_EQ(200u, sizeof(LatencyTraceRecord))). A self-
+    // consistent sizeof()-vs-sizeof() round trip would keep passing even
+    // if a field's type changed or members got reordered; this catches
+    // that. LatencyTraceFileHeader also carries a static_assert to the
+    // same effect, so a bad size fails at compile time already -- this
+    // is the runtime belt to that compile-time suspender.
+    ASSERT_EQ(128u, sizeof(brpc::LatencyTraceFileHeader));
+
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
     b->ResetForTest(64);
     const brpc::LatencyTraceHandle h = b->AllocSlot(0xABCDEF, brpc::LT_ROLE_CLIENT);
