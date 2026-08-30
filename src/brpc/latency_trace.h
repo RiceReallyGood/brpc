@@ -81,8 +81,10 @@ enum LatencyTraceRole {
 // LatencyTraceBuffer's per-process tag (never zero, so two untagged
 // processes can't collide; also what LatencyTraceFileHeader::process_tag
 // records -- there is exactly one tag, reused for both purposes), the
-// low 32 bits are `seq`. `seq` only needs to be unique within this
-// process; see the .cpp for why its wraparound is safe.
+// low 32 bits are `seq`, a counter owned entirely by the caller (e.g.
+// channel.cpp's `s_lt_seq`) -- this function does not read or advance
+// any LatencyTraceBuffer::Shard::cursor. `seq` only needs to be unique
+// within this process; see the .cpp for why its wraparound is safe.
 uint64_t MakeLatencyTraceId(uint64_t seq);
 
 // Opaque reference to one slot in the ring buffer.
@@ -157,8 +159,20 @@ public:
     // Returns LT_INVALID_HANDLE when tracing is off or the buffer is full.
     LatencyTraceHandle AllocSlot(uint64_t trace_id, LatencyTraceRole role);
 
-    // Silently ignores an invalid or stale handle.
+    // Silently ignores an invalid or stale handle. First-write-wins: if
+    // ts[point] already holds a non-zero value, this call is a no-op.
     void Stamp(LatencyTraceHandle h, int point);
+
+    // Like Stamp(), but for a timestamp that was already sampled earlier
+    // (e.g. a Socket-level wake-up copied into an InputMessageBase before
+    // any LatencyTraceHandle for it existed) rather than "now". Writes
+    // `raw_counter - record->base_counter` into ts[point], through the
+    // same generation-guarded Get() and the same first-write-wins rule
+    // as Stamp(). If `raw_counter` predates `base_counter` -- possible,
+    // since the historical event can precede the slot's allocation --
+    // the result is clamped to 0 rather than left to wrap around; see
+    // the .cpp for why.
+    void StampAt(LatencyTraceHandle h, int point, uint64_t raw_counter);
 
     // Returns nullptr when the handle is stale.
     LatencyTraceRecord* Get(LatencyTraceHandle h);

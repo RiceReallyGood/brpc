@@ -104,6 +104,91 @@ TEST_F(LatencyTraceBufferTest, StampWritesNonZeroDelta) {
     ASSERT_GT(b->GetForTest(h)->ts[brpc::LT_C_RPC_END], 0u);
 }
 
+TEST_F(LatencyTraceBufferTest, StampIsFirstWriteWins) {
+    // The property design doc sec.10.1 requires: a point already holding
+    // a non-zero value is left alone, and a later write is discarded.
+    // This is the fix for a real bug (see fix-round-q1q6 item 2): DoWrite
+    // calls LT_STAMP(write_start) unconditionally on every KeepWrite
+    // iteration, so without this rule a request needing more than one
+    // writev would silently record the *last* attempt's write_start
+    // instead of the first, moving real queueing time into the syscall
+    // bucket.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const brpc::LatencyTraceHandle h = b->AllocSlot(8, brpc::LT_ROLE_CLIENT);
+    b->Stamp(h, brpc::LT_C_WRITE_START);
+    const uint32_t first = b->GetForTest(h)->ts[brpc::LT_C_WRITE_START];
+
+    // Busy-wait so a second Stamp() call would, if it were not discarded,
+    // observe a strictly later (and thus different) counter delta.
+    const uint64_t start = butil::detail::clock_cycles();
+    while (butil::detail::clock_cycles() - start < 1000) {}
+    b->Stamp(h, brpc::LT_C_WRITE_START);
+    ASSERT_EQ(first, b->GetForTest(h)->ts[brpc::LT_C_WRITE_START])
+        << "second Stamp() call must be discarded, not overwrite the first";
+}
+
+TEST_F(LatencyTraceBufferTest, StampAtWritesHistoricalDeltaIntoRecord) {
+    // What Task 9 actually delivers: a primitive that can backfill a
+    // timestamp sampled earlier (e.g. a Socket-level wake-up copied into
+    // an InputMessageBase before any LatencyTraceHandle for it existed)
+    // rather than "now", by taking the raw counter value directly.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const brpc::LatencyTraceHandle h = b->AllocSlot(1, brpc::LT_ROLE_SERVER);
+    ASSERT_NE(brpc::LT_INVALID_HANDLE, h);
+    ASSERT_EQ(0u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+
+    const uint64_t base = b->GetForTest(h)->base_counter;
+    b->StampAt(h, brpc::LT_S_WAKE, base + 12345);
+    ASSERT_EQ(12345u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+}
+
+TEST_F(LatencyTraceBufferTest, StampAtIsFirstWriteWins) {
+    // Same rule as Stamp() (see design doc sec.10.1), and it has to hold
+    // regardless of which of the two APIs makes the first write.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const brpc::LatencyTraceHandle h = b->AllocSlot(2, brpc::LT_ROLE_SERVER);
+    const uint64_t base = b->GetForTest(h)->base_counter;
+
+    b->StampAt(h, brpc::LT_S_WAKE, base + 100);
+    ASSERT_EQ(100u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+    b->StampAt(h, brpc::LT_S_WAKE, base + 999);   // later StampAt: discarded
+    ASSERT_EQ(100u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+    b->Stamp(h, brpc::LT_S_WAKE);                 // later Stamp: also discarded
+    ASSERT_EQ(100u, b->GetForTest(h)->ts[brpc::LT_S_WAKE]);
+}
+
+TEST_F(LatencyTraceBufferTest, StampAtRejectsStaleHandle) {
+    // Mirrors StaleHandleIsRejectedAfterWrapAround below, for StampAt: a
+    // handle whose slot has been recycled into a different generation
+    // must be silently ignored, not written through into the new
+    // occupant's record.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    b->set_stop_when_full_for_test(false);
+    const brpc::LatencyTraceHandle stale = b->AllocSlot(3, brpc::LT_ROLE_SERVER);
+    ASSERT_NE(brpc::LT_INVALID_HANDLE, stale);
+    for (int i = 0; i < 64; ++i) {
+        b->AllocSlot(1000 + i, brpc::LT_ROLE_SERVER);
+    }
+    ASSERT_EQ(nullptr, b->GetForTest(stale));     // handle no longer valid
+    b->StampAt(stale, brpc::LT_S_WAKE, 42);       // must be a silent no-op
+}
+
+TEST_F(LatencyTraceBufferTest, StampAtClampsPreBaseCounterValueToZero) {
+    // A historical sample can legitimately predate base_counter -- e.g. a
+    // wake-up recorded on the Socket before AllocSlot ever ran for this
+    // request. raw_counter - base_counter would underflow as unsigned
+    // arithmetic and produce a huge, bogus-looking positive delta; verify
+    // StampAt clamps to 0 (== "not stamped", same sentinel used
+    // everywhere else) instead of letting that happen.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const brpc::LatencyTraceHandle h = b->AllocSlot(4, brpc::LT_ROLE_SERVER);
+    const uint64_t base = b->GetForTest(h)->base_counter;
+    ASSERT_GT(base, 0u);  // otherwise "predates" can't be constructed below
+    b->StampAt(h, brpc::LT_S_WAKE, base - 1);
+    ASSERT_EQ(0u, b->GetForTest(h)->ts[brpc::LT_S_WAKE])
+        << "must clamp, not wrap around to a huge uint32_t";
+}
+
 TEST_F(LatencyTraceBufferTest, StaleHandleIsRejectedAfterWrapAround) {
     // Capacity 64. Allocating 64 more slots must recycle the first one and
     // invalidate its handle, so a late backfill cannot corrupt a live slot.
@@ -534,7 +619,10 @@ static const brpc::LatencyTraceRecord* FindRecordByRole(brpc::LatencyTraceRole r
 static const brpc::LatencyTraceRecord* FindClientRecordForTest() {
     return FindRecordByRole(brpc::LT_ROLE_CLIENT);
 }
-static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
+// Unused by this file until Task 10/11 land (see the comment above
+// LatencyTraceE2ETest.ClientSendPointsAreStampedAndMonotonic's sibling
+// section below) -- kept, and marked accordingly, for them to reuse.
+ALLOW_UNUSED static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
     return FindRecordByRole(brpc::LT_ROLE_SERVER);
 }
 
@@ -585,47 +673,27 @@ TEST(LatencyTraceE2ETest, ClientSendPointsAreStampedAndMonotonic) {
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
-TEST(LatencyTraceE2ETest, ReceivePointsAreStampedOnBothSides) {
-    brpc::FLAGS_latency_trace_enabled = true;
-    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
-
-    brpc::Server server;
-    LatencyTraceEchoServiceImpl svc;
-    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    ASSERT_EQ(0, server.Start(9527, nullptr));
-
-    brpc::Channel channel;
-    brpc::ChannelOptions opt;
-    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
-    ASSERT_EQ(0, channel.Init("127.0.0.1:9527", &opt));
-
-    test::EchoService_Stub stub(&channel);
-    test::EchoRequest req;
-    test::EchoResponse res;
-    brpc::Controller cntl;
-    req.set_message("hello");
-    stub.Echo(&cntl, &req, &res, nullptr);
-    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
-
-    const brpc::LatencyTraceRecord* c = FindClientRecordForTest();
-    const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
-    ASSERT_TRUE(c != nullptr && s != nullptr);
-    for (int p = brpc::LT_C_WAKE; p <= brpc::LT_C_MSG_RECV_DONE; ++p) {
-        ASSERT_GT(c->ts[p], 0u) << "client point " << p;
-    }
-    for (int p = brpc::LT_S_WAKE; p <= brpc::LT_S_MSG_RECV_DONE; ++p) {
-        ASSERT_GT(s->ts[p], 0u) << "server point " << p;
-    }
-    // Messages cut from the same epoll_wait batch share the same wake
-    // value, so this is <=, not <.
-    ASSERT_LE(s->ts[brpc::LT_S_WAKE], s->ts[brpc::LT_S_ONEDGE_START]);
-    ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READV_START]);
-    ASSERT_LE(s->ts[brpc::LT_S_READV_START], s->ts[brpc::LT_S_MSG_RECV_DONE]);
-
-    server.Stop(0);
-    server.Join();
-    brpc::FLAGS_latency_trace_enabled = false;
-}
+// Task 9 threads four receive-side timestamps (_lt_wake, _lt_onedge_start,
+// _lt_readv_start on Socket; _lt_msg_recv_done sampled when a message is
+// cut) down to InputMessageBase, but nothing in Task 9's file list calls
+// LatencyTraceBuffer::StampAt() to actually write them into a record --
+// that backfill happens in Task 10 (server, S01-S04, in
+// baidu_rpc_protocol.cpp's ProcessRpcRequest right after LT_ALLOC) and
+// Task 11 (client, C09-C12, in ProcessRpcResponse right after
+// bthread_id_lock succeeds). Until those land, the only live coverage of
+// StampAt() itself is the unit-level tests above
+// (StampAtWritesHistoricalDeltaIntoRecord / StampAtIsFirstWriteWins /
+// StampAtRejectsStaleHandle / StampAtClampsPreBaseCounterValueToZero).
+//
+// The end-to-end assertion that belongs here once Tasks 10/11 land: run a
+// real RPC (as ClientSendPointsAreStampedAndMonotonic above does) and
+// assert LT_C_WAKE..LT_C_MSG_RECV_DONE are non-zero and monotonic on the
+// client record, and LT_S_WAKE..LT_S_MSG_RECV_DONE are non-zero and
+// monotonic on the server record (previously attempted, and correctly
+// red, as LatencyTraceE2ETest.ReceivePointsAreStampedOnBothSides -- see
+// fix-round-q1q6 item 6). Flagging this explicitly so the gap stays
+// visible instead of silently reappearing once StampAt() exists and
+// someone assumes the wiring is done too.
 
 #endif  // defined(BRPC_LATENCY_TRACE)
 

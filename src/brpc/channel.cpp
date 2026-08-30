@@ -20,7 +20,9 @@
 #include <google/protobuf/descriptor.h>
 #include <gflags/gflags.h>
 #include <memory>
-#include "butil/atomicops.h"
+#if defined(BRPC_LATENCY_TRACE)
+#include "butil/atomicops.h"                         // s_lt_seq below
+#endif
 #include "butil/time.h"                              // milliseconds_from_now
 #include "butil/logging.h"
 #include "butil/third_party/murmurhash3/murmurhash3.h"

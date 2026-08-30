@@ -64,12 +64,26 @@ static uint32_t MakeProcessTag() {
 uint64_t MakeLatencyTraceId(uint64_t seq) {
     const uint64_t tag = LatencyTraceBuffer::instance()->process_tag();
     // The low 32 bits (`seq`) wrap after ~4B calls from this process.
-    // That is safe only because the ring buffer -- bounded by
-    // -latency_trace_capacity, 100000 records by default -- gets dumped
-    // (and its cursors reset for the next dump) long before any one
-    // shard's cursor reaches anywhere near 2^32 allocations, so no two
-    // records that end up in the same dump can ever share a trace id.
-    // Raising -latency_trace_capacity toward 2^32 would break that.
+    // `seq` here is the caller's own process-wide counter (e.g.
+    // channel.cpp's `s_lt_seq`, a plain atomic<uint64_t> counting client
+    // RPCs) -- it is NOT a LatencyTraceBuffer::Shard::cursor, a separate
+    // per-shard index this function never touches. Dump() never resets
+    // any cursor, and it is not called repeatedly in production either:
+    // -latency_trace_dump_path registers exactly one atexit dump, so
+    // there is no "next dump" for a cursor reset to matter to even if
+    // one happened.
+    //
+    // The wrap is safe for a different reason: with `_stop_when_full`
+    // true (the only supported production setting -- see its own
+    // comment), each shard stops recording once it has captured its
+    // earliest `_per_shard_capacity` arrivals and every later AllocSlot
+    // call for that shard is dropped rather than assigned a `seq`-derived
+    // trace id. So the only `seq` values that ever actually reach a
+    // recorded LatencyTraceRecord are bounded by
+    // -latency_trace_capacity (100000 by default across all shards) --
+    // nowhere near 2^32 -- regardless of how high the caller's own
+    // counter climbs over the life of the process. Raising
+    // -latency_trace_capacity toward 2^32 would break that.
     return (tag << 32) | (uint32_t)seq;
 }
 
@@ -239,7 +253,53 @@ void LatencyTraceBuffer::Stamp(LatencyTraceHandle h, int point) {
     if (r == nullptr || point < 0 || point >= LT_POINT_COUNT) {
         return;
     }
+    // First-write-wins: a point that already holds a non-zero value keeps
+    // it, and this (necessarily later) write is discarded. This is not
+    // just defensive -- KeepWrite calls DoWrite repeatedly for a request
+    // that needs more than one writev (EAGAIN, backpressure, a batch
+    // capped by DATA_LIST_MAX), and the head WriteRequest on the next
+    // iteration can be the same still-undrained request. Without this
+    // rule, write_start would silently record the *last* attempt instead
+    // of the first, moving real queueing/backpressure time out of
+    // cli_write_queue and into cli_write_syscall. Every point being
+    // written at most once is a property this data structure guarantees,
+    // not something every call site has to remember -- see design doc
+    // sec.10.1. `0` already means "not stamped" everywhere ts[] is read,
+    // so it is the natural sentinel for "not yet written".
+    if (r->ts[point] != 0) {
+        return;
+    }
     r->ts[point] = (uint32_t)(butil::detail::clock_cycles() - r->base_counter);
+}
+
+void LatencyTraceBuffer::StampAt(LatencyTraceHandle h, int point,
+                                  uint64_t raw_counter) {
+    LatencyTraceRecord* r = Get(h);
+    if (r == nullptr || point < 0 || point >= LT_POINT_COUNT) {
+        return;
+    }
+    // Same first-write-wins rule as Stamp(); see its comment.
+    if (r->ts[point] != 0) {
+        return;
+    }
+    // `raw_counter` is a *historical* sample taken before this record's
+    // handle existed (e.g. a Socket wake-up recorded ahead of the slot
+    // that will end up describing it), so it can legitimately predate
+    // `base_counter` -- a wake-up can precede the slot's allocation.
+    // Subtracting unsigned integers in that case would wrap around to a
+    // huge value that would masquerade as a real (and wildly wrong)
+    // timestamp downstream. Clamp to 0 instead: 0 already means "not
+    // stamped" everywhere this array is read, so a point whose true
+    // value is "at or before this record's start" collapses to the same
+    // sentinel as "not observed" rather than fabricating a bogus delta.
+    // The tradeoff: such a clamped write is then indistinguishable from
+    // an unstamped point, so a later legitimate write to the same point
+    // is free to (over)write it -- acceptable because this only happens
+    // when the true value was already unrepresentable in this record's
+    // timeline.
+    r->ts[point] = (raw_counter >= r->base_counter)
+                       ? (uint32_t)(raw_counter - r->base_counter)
+                       : 0;
 }
 
 const LatencyTraceRecord* LatencyTraceBuffer::GetBySeqForTest(

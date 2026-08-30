@@ -1925,8 +1925,9 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
 #if defined(BRPC_LATENCY_TRACE)
     // Parallel array of the WriteRequest each data_list[] entry came from,
     // so the batch can be walked again by request (not just IOBuf) once
-    // CutFromIOBufList() returns. See the write_start/write_end stamping
-    // below and design doc sec.8.4.
+    // the batch has been cut into whichever of the transport/fd/SSL/
+    // SocketConnection paths below actually performs the write. See the
+    // write_start/write_end stamping lambdas and design doc sec.8.4.
     WriteRequest* lt_req_list[DATA_LIST_MAX];
 #endif
     for (WriteRequest* p = req; p != nullptr && ndata < DATA_LIST_MAX;
@@ -1943,41 +1944,66 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
         }
     }
 
+#if defined(BRPC_LATENCY_TRACE)
+    // Stamps write_start on every request in the batch. Shared by every
+    // branch below (plain TCP, SocketConnection, and both SSL paths) --
+    // all four cut the same data_list/lt_req_list batch (just through a
+    // different underlying call), so the stamping shape is identical
+    // regardless of which one actually performs the write. Leaving any
+    // one branch uninstrumented would silently leave C07/C08 (or
+    // S16/S17) at zero for that configuration -- see design doc sec.10.1.
+    auto lt_stamp_write_start = [&]() {
+        for (size_t i = 0; i < ndata; ++i) {
+            WriteRequest* p = lt_req_list[i];
+            LatencyTraceRecord* r =
+                LatencyTraceBuffer::instance()->Get(p->lt_handle);
+            if (r != nullptr) {
+                LT_STAMP(p->lt_handle, (r->role == LT_ROLE_SERVER)
+                             ? LT_S_WRITE_START : LT_C_WRITE_START);
+            }
+        }
+    };
+    // Stamps write_end on every request whose data is now fully drained.
+    // Stamped HERE, right after the batch is cut -- not in
+    // ReturnSuccessfulWriteRequest(), which runs after
+    // writev()/ibv_post_send() returns and, on the KeepWrite path, after
+    // IsWriteComplete() too. Stamping there would systematically produce
+    // negative round trips on a fast (loopback/RDMA) path, since the
+    // response's wake can arrive before that later point runs. See
+    // design doc sec.8.4.
+    auto lt_stamp_write_end = [&]() {
+        for (size_t i = 0; i < ndata; ++i) {
+            WriteRequest* p = lt_req_list[i];
+            if (!p->data.empty()) {
+                continue;
+            }
+            LatencyTraceRecord* r =
+                LatencyTraceBuffer::instance()->Get(p->lt_handle);
+            if (r != nullptr) {
+                LT_STAMP(p->lt_handle, (r->role == LT_ROLE_SERVER)
+                             ? LT_S_WRITE_END : LT_C_WRITE_END);
+            }
+        }
+    };
+#endif
+
     if (ssl_state() == SSL_OFF) {
         // Write IOBuf in the batch array into the fd.
         if (_conn) {
+#if defined(BRPC_LATENCY_TRACE)
+            lt_stamp_write_start();
+            const ssize_t lt_nw =
+                _conn->CutMessageIntoFileDescriptor(fd(), data_list, ndata);
+            lt_stamp_write_end();
+            return lt_nw;
+#else
             return _conn->CutMessageIntoFileDescriptor(fd(), data_list, ndata);
+#endif
         } else {
 #if defined(BRPC_LATENCY_TRACE)
-            for (size_t i = 0; i < ndata; ++i) {
-                WriteRequest* p = lt_req_list[i];
-                LatencyTraceRecord* r =
-                    LatencyTraceBuffer::instance()->Get(p->lt_handle);
-                if (r != nullptr) {
-                    LT_STAMP(p->lt_handle, (r->role == LT_ROLE_SERVER)
-                                 ? LT_S_WRITE_START : LT_C_WRITE_START);
-                }
-            }
+            lt_stamp_write_start();
             const ssize_t lt_nw = _transport->CutFromIOBufList(data_list, ndata);
-            // write_end is stamped HERE, right after the batch is cut into
-            // the transport -- not in ReturnSuccessfulWriteRequest(), which
-            // runs after writev()/ibv_post_send() returns and, on the
-            // KeepWrite path, after IsWriteComplete() too. Stamping there
-            // would systematically produce negative round trips on a fast
-            // (loopback/RDMA) path, since the response's wake can arrive
-            // before that later point runs. See design doc sec.8.4.
-            for (size_t i = 0; i < ndata; ++i) {
-                WriteRequest* p = lt_req_list[i];
-                if (!p->data.empty()) {
-                    continue;
-                }
-                LatencyTraceRecord* r =
-                    LatencyTraceBuffer::instance()->Get(p->lt_handle);
-                if (r != nullptr) {
-                    LT_STAMP(p->lt_handle, (r->role == LT_ROLE_SERVER)
-                                 ? LT_S_WRITE_END : LT_C_WRITE_END);
-                }
-            }
+            lt_stamp_write_end();
             return lt_nw;
 #else
             return _transport->CutFromIOBufList(data_list, ndata);
@@ -1989,13 +2015,27 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
     if (_conn) {
         // TODO: Separate SSL stuff from SocketConnection
         BAIDU_SCOPED_LOCK(_ssl_session_mutex);
+#if defined(BRPC_LATENCY_TRACE)
+        lt_stamp_write_start();
+        const ssize_t lt_nw =
+            _conn->CutMessageIntoSSLChannel(_ssl_session, data_list, ndata);
+        lt_stamp_write_end();
+        return lt_nw;
+#else
         return _conn->CutMessageIntoSSLChannel(_ssl_session, data_list, ndata);
+#endif
     }
     int ssl_error = 0;
     ssize_t nw = 0;
     {
         BAIDU_SCOPED_LOCK(_ssl_session_mutex);
+#if defined(BRPC_LATENCY_TRACE)
+        lt_stamp_write_start();
+#endif
         nw = butil::IOBuf::cut_multiple_into_SSL_channel(_ssl_session, data_list, ndata, &ssl_error);
+#if defined(BRPC_LATENCY_TRACE)
+        lt_stamp_write_end();
+#endif
     }
     switch (ssl_error) {
     case SSL_ERROR_NONE:
