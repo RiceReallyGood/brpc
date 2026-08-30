@@ -37,7 +37,9 @@
 #include "butil/class_name.h"                     // butil::class_name
 #include "butil/memory/scope_guard.h"
 #include "brpc/log.h"
+#if defined(BRPC_LATENCY_TRACE)
 #include "brpc/latency_trace.h"
+#endif
 #include "brpc/reloadable_flags.h"          // BRPC_VALIDATE_GFLAG
 #include "brpc/errno.pb.h"
 #include "brpc/event_dispatcher.h"          // RemoveConsumer
@@ -309,17 +311,17 @@ SocketMessage* const DUMMY_USER_MESSAGE = (SocketMessage*)0x1;
 const uint32_t MAX_PIPELINED_COUNT = 16384;
 
 struct BAIDU_CACHELINE_ALIGNMENT Socket::WriteRequest {
+    // Grants Socket::GetStat() access to the private PackedPtr members
+    // below, purely so it can BAIDU_CASSERT their offsetof() -- pinning the
+    // cacheline layout the lt_handle placement depends on. See the offset
+    // asserts next to the sizeof(WriteRequest) assert in GetStat().
+    friend class Socket;
+
     static WriteRequest* const UNCONNECTED;
 
     butil::IOBuf data;
     WriteRequest* next;
     bthread_id_t id_wait;
-#if defined(BRPC_LATENCY_TRACE)
-    // Which trace record this write belongs to. Written at Socket::Write()
-    // entry, read back when the batch drains. Lives in the second cacheline
-    // so the hot fields (data/next/id_wait/control bits) stay in the first.
-    LatencyTraceHandle lt_handle;
-#endif
 
     void clear_and_set_control_bits(bool notify_on_success,
                                     bool shutdown_write) {
@@ -391,6 +393,18 @@ private:
     PackedPtr<Socket> _socket_and_control_bits;
     // User message pointer, pipelined count auth flag.
     PackedPtr<SocketMessage> _pc_and_udmsg;
+#if defined(BRPC_LATENCY_TRACE)
+public:
+    // Which trace record this write belongs to. Written at Socket::Write()
+    // entry, read back when the batch drains. _socket_and_control_bits and
+    // _pc_and_udmsg are hot on every KeepWrite traversal step and every
+    // write completion (pipelined_count()/user_message()/Setup()/etc.), so
+    // this field is placed AFTER both -- at offset 64 -- so it alone falls
+    // into the second cacheline instead of splitting either of them across
+    // the boundary. Pinned by the BAIDU_CASSERT block below Setup().
+    LatencyTraceHandle lt_handle;
+private:
+#endif
 };
 
 void Socket::WriteRequest::Setup(Socket* s) {
@@ -2958,8 +2972,23 @@ int Socket::PeekAgentSocket(SocketUniquePtr* out) const {
 
 void Socket::GetStat(SocketStat* s) const {
     BAIDU_CASSERT(offsetof(Socket, _preferred_index) >= 64, different_cacheline);
+    // Pin the two PackedPtr members inside the first cacheline (bytes
+    // 0-63): they back pipelined_count()/user_message()/Setup(), which are
+    // hot on every KeepWrite traversal step and every write completion.
+    // A future field inserted before them (or growing `data`/`next`/
+    // `id_wait`) would silently push one across the boundary; this catches
+    // that instead of relying on the sizeof(WriteRequest) assert alone,
+    // which cannot tell WHERE inside the struct the overflow happened.
+    BAIDU_CASSERT(offsetof(WriteRequest, _socket_and_control_bits) == 48,
+                  socket_and_control_bits_at_48);
+    BAIDU_CASSERT(offsetof(WriteRequest, _pc_and_udmsg) == 56,
+                  pc_and_udmsg_at_56);
 #if defined(BRPC_LATENCY_TRACE)
     BAIDU_CASSERT(sizeof(WriteRequest) == 128, sizeof_write_request_is_128);
+    // lt_handle must land alone in the second cacheline, after both
+    // PackedPtr members above, not between id_wait and them.
+    BAIDU_CASSERT(offsetof(WriteRequest, lt_handle) == 64,
+                  lt_handle_at_64);
 #else
     BAIDU_CASSERT(sizeof(WriteRequest) == 64, sizeof_write_request_is_64);
 #endif

@@ -43,7 +43,9 @@
 #include "brpc/versioned_ref_with_id.h"
 #include "brpc/health_check_option.h"
 #include "brpc/socket_mode.h"
+#if defined(BRPC_LATENCY_TRACE)
 #include "brpc/latency_trace.h"
+#endif
 
 namespace brpc {
 namespace policy {
