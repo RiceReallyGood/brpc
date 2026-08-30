@@ -35,6 +35,18 @@ esac
 
 cd "$(dirname "$0")/../.."
 
+# The remote clock runs ~25s AHEAD of this machine, and `tar czf` preserves
+# mtimes -- so a file edited locally at T arrives stamped T, while an object
+# file built remotely 20s ago is stamped T+5 by the remote clock. `make` then
+# sees the object as NEWER than its source, prints "up to date", and silently
+# tests a stale binary. That is a false green, and it bites hardest in the
+# revert/restore cycle used to prove a test really fails.
+#
+# The extract step therefore touches every synced file whose mtime is within
+# the last three minutes -- i.e. exactly the ones just edited. Untouched files
+# keep their old mtimes, so incremental builds stay incremental instead of
+# forcing a full rebuild of ~500 sources on every sync.
+
 # GNU tar exits 1 for "some files differ" (e.g. a file changed while being
 # read) -- a benign, common race under concurrent editing, not a real
 # failure. Exit codes >= 2 are genuine fatal tar errors. Under `pipefail`,
@@ -51,7 +63,9 @@ tar czf - \
     --exclude='*.pb.cc' \
     --exclude='*.pb.h' \
     src test tools Makefile config_brpc.sh CMakeLists.txt \
-  | ssh "$HOST" "mkdir -p \"$DEST\" && tar xzf - -C \"$DEST\""
+  | ssh "$HOST" "mkdir -p \"$DEST\" && tar xzf - -C \"$DEST\" && \
+       cd \"$DEST\" && find src test tools -type f -newermt '-180 seconds' \
+         -exec touch {} + 2>/dev/null; true"
 # Capture both stages in one shot: even a bare `x=${PIPESTATUS[0]}`
 # assignment is itself a "command" that resets PIPESTATUS, so splitting
 # this into two separate assignment lines would silently lose index 1.
