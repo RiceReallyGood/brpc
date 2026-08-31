@@ -1293,22 +1293,36 @@ static void RunSequentialAsyncEchoRPCs(int port, int n_requests,
         // enough. Acquire only orders THIS thread's later operations
         // (program order) to not move before the load; it says nothing
         // about ordering the writes that happen-before it on the
-        // PRODUCER's side into visibility here. What is actually needed
-        // is a fence between "observed the sentinel" and "read the
-        // earlier fields" -- i.e. exactly the asymmetry already hit once
-        // on the write side of this same buffer (see
-        // LatencyTraceBuffer::AllocSlot's release-store-is-not-enough
-        // comment in latency_trace.cpp, and the seqlock-reader
-        // discussion in design doc sec.8.1): a plain release *store*
-        // there wasn't enough because release doesn't hold back writes
-        // that follow it; here, symmetrically, a plain (or even acquire-
-        // loaded) read of the sentinel isn't enough to hold back reads
-        // that follow IT. Only an explicit fence closes that gap.
+        // PRODUCER's side into visibility here. So a fence belongs
+        // between "observed the sentinel" and "read the earlier fields".
+        //
+        // What that fence does and does not buy us, honestly: it forbids
+        // the compiler from hoisting the reads that follow it (the
+        // earlier ts[] entries pulled by the caller) above it, and on
+        // aarch64 it lowers to a real hardware barrier (DMB ISH) that
+        // narrows the practical window for those reads to observe a
+        // stale value. It does NOT establish a synchronizes-with edge in
+        // the C++ memory model: atomic_thread_fence only participates in
+        // synchronizes-with when paired with an atomic operation on the
+        // SAME object on both the read and write side. Stamp() writes
+        // ts[] with plain, non-atomic stores (see design doc sec.8.1's
+        // check-then-write discussion), so there is no atomic release on
+        // the write side for this acquire fence to pair with -- this is
+        // a barrier on the reader alone. On hardware that is not
+        // multi-copy-atomic, that alone does not formally close the
+        // hazard; a writer-side release would also be required for a
+        // formal guarantee. We do not add one (see below), so what we
+        // have here is a real, useful mitigation, not a proof: the
+        // empirical evidence -- this suite passing repeatedly on the
+        // actual aarch64 host -- is the only kind obtainable given that.
         //
         // Stamp() itself deliberately uses plain, unfenced stores (see
         // design doc sec.8.1) -- that is an accepted trade-off on the
-        // write side, not an oversight, so the fix belongs here, on the
-        // read side.
+        // write side, not an oversight. Do not "close the gap" by adding
+        // a release fence to Stamp(): that would put an ordering
+        // constraint on the hot path this project measured carefully to
+        // avoid. The fence below is still worth keeping as the best
+        // available reader-side mitigation.
         butil::atomic_thread_fence(butil::memory_order_acquire);
     }
 
