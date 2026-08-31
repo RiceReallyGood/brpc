@@ -729,6 +729,17 @@ function drawChart() {
   function drawOneBar(idx, x0, x1) {
     const { segs } = computeBarSegments(idx);
     let anyNeg = false;
+    // Two passes, not one straight walk in pipeline order: a negative
+    // segment steps back far enough to overlap more than just its
+    // immediate predecessor whenever its magnitude exceeds that one
+    // neighbor (rare with real data -- merge.py's own tests call these
+    // "small link_total noise" -- but not impossible). Painting all
+    // positive/N/A segments first and every negative segment in a
+    // second, always-on-top pass guarantees the hatch stays visible
+    // over its full overlap regardless of how far back it steps,
+    // instead of later positive segments silently re-covering part of
+    // it as the running cumulative climbs back through the same range
+    // (sec.9.3's "both segments visible at once" requirement).
     for (const seg of segs) {
       if (seg.isNA) {
         const y = toY(seg.cumAt);
@@ -738,20 +749,23 @@ function drawChart() {
         ctx.restore();
         continue;
       }
-      if (seg.negative) anyNeg = true;
+      if (seg.negative) { anyNeg = true; continue; }
       const pxTop = toY(seg.yHi), pxBottom = toY(seg.yLo);
       const h = Math.max(0.6, pxBottom - pxTop - 1);
+      ctx.save();
+      ctx.fillStyle = colorFor(seg.i33);
+      ctx.fillRect(x0, pxTop, Math.max(1, x1 - x0), h);
+      ctx.restore();
+    }
+    for (const seg of segs) {
+      if (seg.isNA || !seg.negative) continue;
+      const pxTop = toY(seg.yHi), pxBottom = toY(seg.yLo);
       const color = colorFor(seg.i33);
       ctx.save();
-      if (seg.negative) {
-        ctx.fillStyle = hatchPattern(ctx, color);
-        ctx.fillRect(x0, pxTop, Math.max(1, x1 - x0), pxBottom - pxTop);
-        ctx.strokeStyle = color; ctx.lineWidth = 1.4;
-        ctx.strokeRect(x0 + 0.7, pxTop + 0.7, Math.max(0, (x1 - x0) - 1.4), Math.max(0, (pxBottom - pxTop) - 1.4));
-      } else {
-        ctx.fillStyle = color;
-        ctx.fillRect(x0, pxTop, Math.max(1, x1 - x0), h);
-      }
+      ctx.fillStyle = hatchPattern(ctx, color);
+      ctx.fillRect(x0, pxTop, Math.max(1, x1 - x0), pxBottom - pxTop);
+      ctx.strokeStyle = color; ctx.lineWidth = 1.4;
+      ctx.strokeRect(x0 + 0.7, pxTop + 0.7, Math.max(0, (x1 - x0) - 1.4), Math.max(0, (pxBottom - pxTop) - 1.4));
       ctx.restore();
     }
     if (anyNeg) {
@@ -914,11 +928,18 @@ function hoverAt(xCss, yCss, clientX, clientY) {
   const fromY = (y) => maxE2e - (y - marginT) / yScale;
   const nsAtCursor = fromY(yCss);
 
-  let hit = null;
+  // Mirrors drawOneBar()'s two-pass paint order exactly: positives (and
+  // the N/A tick) paint first in pipeline order, negatives always paint
+  // last on top -- so a negative match always wins over a positive one,
+  // and within each pass "last in pipeline order" wins (topmost of that
+  // pass).
+  let hit = null, negHit = null;
   for (const seg of segs) {
     if (seg.isNA) { if (Math.abs(nsAtCursor - seg.cumAt) < (yRange * 0.01)) hit = seg; continue; }
-    if (nsAtCursor <= seg.yHi && nsAtCursor >= seg.yLo) hit = seg; // last match wins = topmost drawn
+    if (nsAtCursor > seg.yHi || nsAtCursor < seg.yLo) continue;
+    if (seg.negative) negHit = seg; else hit = seg;
   }
+  if (negHit) hit = negHit;
 
   tooltip.textContent = '';
   const title = document.createElement('div'); title.className = 'tt-title';
