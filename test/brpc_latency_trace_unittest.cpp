@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include "brpc/channel.h"
 #include "brpc/closure_guard.h"
+#include "brpc/details/controller_private_accessor.h"
 #include "brpc/latency_trace.h"
 #include "brpc/policy/baidu_rpc_meta.pb.h"
 #include "brpc/server.h"
@@ -39,18 +40,20 @@
 
 namespace {
 
-TEST(LatencyTraceTest, PointEnumHasExactly36Members) {
-    ASSERT_EQ(36, brpc::LT_POINT_COUNT);
-    // 客户端 19 个，服务端 17 个，且两段不重叠。
+TEST(LatencyTraceTest, PointEnumHasExactly34Members) {
+    // D14: client lost rsp_process_start/end (the two points bracketing
+    // the user callback), so client is 17 points, not 19; total 34, not 36.
+    ASSERT_EQ(34, brpc::LT_POINT_COUNT);
+    // 客户端 17 个，服务端 17 个，且两段不重叠。
     ASSERT_EQ(0,  brpc::LT_C_RPC_START);
-    ASSERT_EQ(18, brpc::LT_C_RPC_END);
-    ASSERT_EQ(19, brpc::LT_S_WAKE);
-    ASSERT_EQ(35, brpc::LT_S_WRITE_END);
+    ASSERT_EQ(16, brpc::LT_C_RPC_END);
+    ASSERT_EQ(17, brpc::LT_S_WAKE);
+    ASSERT_EQ(33, brpc::LT_S_WRITE_END);
 }
 
-TEST(LatencyTraceTest, RecordIsExactly200Bytes) {
+TEST(LatencyTraceTest, RecordIsExactly192Bytes) {
     // 定长 POD。大小变化会直接改变 dump 文件格式，必须显式感知。
-    ASSERT_EQ(200u, sizeof(brpc::LatencyTraceRecord));
+    ASSERT_EQ(192u, sizeof(brpc::LatencyTraceRecord));
     ASSERT_TRUE(std::is_trivially_copyable<brpc::LatencyTraceRecord>::value);
 }
 
@@ -727,7 +730,7 @@ TEST_F(LatencyTraceBufferTest, StaleHandleIsRejectedUnderConcurrentRecycling) {
 TEST_F(LatencyTraceBufferTest, DumpRoundTripsHeaderAndRecords) {
     // Hard-coded 128, not sizeof(hdr) on both sides of the fread below --
     // this is the on-disk contract merge.py parses verbatim (mirrors
-    // Task 2's ASSERT_EQ(200u, sizeof(LatencyTraceRecord))). A self-
+    // Task 2's ASSERT_EQ(192u, sizeof(LatencyTraceRecord))). A self-
     // consistent sizeof()-vs-sizeof() round trip would keep passing even
     // if a field's type changed or members got reordered; this catches
     // that. LatencyTraceFileHeader also carries a static_assert to the
@@ -1209,7 +1212,7 @@ TEST(LatencyTraceE2ETest, AllClientPointsStampedAndSumIsIdentity) {
     // Criterion 1 (design doc sec.10.1): every point non-zero is the ONLY
     // check that catches a code path that was never instrumented (e.g. the
     // fast-path defect this file's comment above describes). Check both
-    // ends, not just the client's 19.
+    // ends, not just the client's 17 (D14 dropped rsp_process_start/end).
     for (int p = brpc::LT_C_RPC_START; p <= brpc::LT_C_RPC_END; ++p) {
         ASSERT_GT(c->ts[p], 0u) << "client point " << p;
     }
@@ -1225,7 +1228,7 @@ TEST(LatencyTraceE2ETest, AllClientPointsStampedAndSumIsIdentity) {
         ASSERT_LE(s->ts[p], s->ts[p + 1]) << "server point " << p;
     }
 
-    // Sigma identity (design doc sec.5): the 17 client intervals excluding
+    // Sigma identity (design doc sec.5): the 15 client intervals excluding
     // C08->C09, plus the 16 server intervals, plus the two link halves,
     // must equal the end-to-end span exactly. This is a telescoping sum --
     // per design doc sec.10.1 it holds for ANY timestamp values (all
@@ -1250,7 +1253,7 @@ TEST(LatencyTraceE2ETest, AllClientPointsStampedAndSumIsIdentity) {
     const int64_t srv = (int64_t)s->ts[brpc::LT_S_WRITE_END] -
                         (int64_t)s->ts[brpc::LT_S_WAKE];
     sum += (rtt - srv);   // link_up + link_down
-    ASSERT_EQ(e2e, sum) << "Sigma(35 items) must equal end-to-end exactly";
+    ASSERT_EQ(e2e, sum) << "Sigma(33 items) must equal end-to-end exactly";
 
     // This TCP test must never see the RDMA polling-mode sentinel; if it
     // does, the sums above are silently wrong. See Task 12 and spec sec.8.5.
@@ -1343,7 +1346,8 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
         ASSERT_GE((int64_t)s->ts[it.hi] - (int64_t)s->ts[it.lo], 0) << it.name;
     }
 
-    // 10 client receive-side items (C09-C19, sec.5.3).
+    // 8 client receive-side items (C09-C17, sec.5.3; D14 collapsed
+    // cli_post_deser/cli_callback/cli_rpc_finish into one item).
     static const struct { int lo, hi; const char* name; } kClientRecvItems[] = {
         { brpc::LT_C_WAKE,                  brpc::LT_C_ONEDGE_START,          "cli_wake_to_onedge" },
         { brpc::LT_C_ONEDGE_START,          brpc::LT_C_READV_START,           "cli_onedge_to_readv" },
@@ -1352,9 +1356,7 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
         { brpc::LT_C_RSP_META_DESER_START,  brpc::LT_C_RSP_META_DESER_END,    "cli_rsp_meta_deser" },
         { brpc::LT_C_RSP_META_DESER_END,    brpc::LT_C_RSP_PAYLOAD_DESER_START, "cli_lookup_cntl" },
         { brpc::LT_C_RSP_PAYLOAD_DESER_START, brpc::LT_C_RSP_PAYLOAD_DESER_END, "cli_rsp_payload_deser" },
-        { brpc::LT_C_RSP_PAYLOAD_DESER_END, brpc::LT_C_RSP_PROCESS_START,     "cli_post_deser" },
-        { brpc::LT_C_RSP_PROCESS_START,     brpc::LT_C_RSP_PROCESS_END,       "cli_callback" },
-        { brpc::LT_C_RSP_PROCESS_END,       brpc::LT_C_RPC_END,               "cli_rpc_finish" },
+        { brpc::LT_C_RSP_PAYLOAD_DESER_END, brpc::LT_C_RPC_END,               "cli_post_deser" },  // D14: collapsed cli_post_deser+cli_callback+cli_rpc_finish
     };
     for (const auto& it : kClientRecvItems) {
         ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
@@ -1365,7 +1367,7 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
     // the same way it does in the sigma identity above), halved. Verified
     // via the exact same formula as LinkTimeIsNonNegativeAtOutstandingOne;
     // duplicated here (rather than only relying on that test) because this
-    // test's job is specifically "all 35 named items are individually
+    // test's job is specifically "all 33 named items are individually
     // accounted for and non-negative," not "the link time happens to be
     // non-negative for some other reason."
     const int64_t rtt = (int64_t)c->ts[brpc::LT_C_WAKE] -
@@ -1382,7 +1384,7 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
 // Fix round (Task 11 review, items 1-3): every test above issues fully
 // synchronous RPCs (`stub.Echo(&cntl, &req, &res, nullptr)`), so neither
 // the pre-existing async instrumentation nor this round's two fixes --
-// C19 on the regular async path (Controller::EndRPC) and C17-C19 on the
+// C17 (rpc_end) on the regular async path (Controller::EndRPC) and on the
 // -usercode_in_pthread path (Controller::DoneInBackupThread) -- were ever
 // exercised. The two tests below close that gap, asserting the same
 // section 10.1 properties the synchronous tests above assert: every
@@ -1423,16 +1425,18 @@ static bool WaitForTrue(Pred pred, int timeout_ms) {
 //
 // A subtlety unique to the async path: our closure only marks that
 // `_done->Run()` happened (by self-deleting; it carries no other state).
-// EndRPC's C18/C19 stamps -- and, on the -usercode_in_pthread path,
-// DoneInBackupThread's -- land on the RPC-processing thread strictly
-// AFTER `_done->Run()` returns, which is after control has already
-// returned to that thread, not to this one. There is no synchronization
-// primitive between "the closure ran" and "C18/C19 are stamped", so
-// rather than reading the record the instant Echo() posts the request,
-// this helper polls the record itself for C19 (LT_C_RPC_END) to go
-// non-zero, bounded by a generous timeout. If C19 is never stamped (e.g.
-// item 1's or item 2's fix is missing) this poll times out and the test
-// fails on that specific assertion instead of silently reading a
+// EndRPC's C17 (rpc_end) stamp -- and, on the -usercode_in_pthread path,
+// DoneInBackupThread's -- lands on the RPC-processing thread (D14: right
+// after that thread's own OnRPCEnd() call, strictly BEFORE `_done->Run()`
+// -- see controller.cpp), which is not this test thread. Posting the
+// request (`stub.Echo(..., new AsyncEchoDone)`) returns as soon as the
+// request is written, long before any response-side stamp exists. There
+// is no synchronization primitive between "Echo() returned" and "C17 is
+// stamped", so rather than reading the record the instant Echo() posts
+// the request, this helper polls the record itself for C17 (LT_C_RPC_END)
+// to go non-zero, bounded by a generous timeout. If C17 is never stamped
+// (e.g. item 1's or item 2's fix is missing) this poll times out and the
+// test fails on that specific assertion instead of silently reading a
 // half-written record.
 static void RunSequentialAsyncEchoRPCs(int port, int n_requests,
                                         const brpc::LatencyTraceRecord** out_client,
@@ -1468,15 +1472,15 @@ static void RunSequentialAsyncEchoRPCs(int port, int n_requests,
         // the wait's result, not after. ASSERT_TRUE is fatal (it returns
         // from this function immediately on failure), so with the old
         // order an RPC that failed outright and one that succeeded but
-        // never got C19 stamped were indistinguishable -- both stopped at
-        // "timed out waiting for C19" and cntl.Failed() was never reached.
+        // never got C17 stamped were indistinguishable -- both stopped at
+        // "timed out waiting for C17" and cntl.Failed() was never reached.
         // Safe to read cntl here regardless of whether the wait timed out:
         // cntl's error state was finalized by OnRPCEnd(), which runs
         // before _done->Run() is ever invoked -- strictly before either
         // outcome below.
         ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
         ASSERT_TRUE(stamped)
-            << "timed out waiting for C19 (LT_C_RPC_END) to be stamped "
+            << "timed out waiting for C17 (LT_C_RPC_END) to be stamped "
                "on async request " << i;
 
         // Fix-round item 1: the poll above only proves the plain,
@@ -1484,7 +1488,7 @@ static void RunSequentialAsyncEchoRPCs(int port, int n_requests,
         // this thread -- that word is aligned and cannot tear, and the
         // wait is bounded so it cannot hang, but neither property says
         // anything about this record's EARLIER ts[] entries, written
-        // (possibly from a different thread/bthread) before C19. aarch64
+        // (possibly from a different thread/bthread) before C17. aarch64
         // is not other-multi-copy-atomic for plain stores: this thread
         // observing the producer's last store does not imply it observes
         // every earlier store that same producer made, in the same
@@ -1596,8 +1600,9 @@ static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
                         (int64_t)c->ts[brpc::LT_C_WRITE_END];
 
     // Every decomposition item non-negative at outstanding=1 (design doc
-    // sec.5's 7 client-send + 16 server + 10 client-receive items, plus
-    // the 2 derived link halves).
+    // sec.5's 7 client-send + 16 server + 8 client-receive items, plus
+    // the 2 derived link halves; D14 collapsed 3 client-receive items into
+    // 1, so 10 -> 8).
     static const struct { int lo, hi; const char* name; } kClientItems[] = {
         { brpc::LT_C_RPC_START,             brpc::LT_C_REQ_PAYLOAD_SER_START, "cli_pre_serialize" },
         { brpc::LT_C_REQ_PAYLOAD_SER_START, brpc::LT_C_REQ_PAYLOAD_SER_END,   "cli_req_payload_ser" },
@@ -1641,9 +1646,7 @@ static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
         { brpc::LT_C_RSP_META_DESER_START,    brpc::LT_C_RSP_META_DESER_END,     "cli_rsp_meta_deser" },
         { brpc::LT_C_RSP_META_DESER_END,      brpc::LT_C_RSP_PAYLOAD_DESER_START, "cli_lookup_cntl" },
         { brpc::LT_C_RSP_PAYLOAD_DESER_START, brpc::LT_C_RSP_PAYLOAD_DESER_END,  "cli_rsp_payload_deser" },
-        { brpc::LT_C_RSP_PAYLOAD_DESER_END,   brpc::LT_C_RSP_PROCESS_START,      "cli_post_deser" },
-        { brpc::LT_C_RSP_PROCESS_START,       brpc::LT_C_RSP_PROCESS_END,        "cli_callback" },
-        { brpc::LT_C_RSP_PROCESS_END,         brpc::LT_C_RPC_END,                "cli_rpc_finish" },
+        { brpc::LT_C_RSP_PAYLOAD_DESER_END,   brpc::LT_C_RPC_END,                "cli_post_deser" },  // D14: collapsed cli_post_deser+cli_callback+cli_rpc_finish
     };
     for (const auto& it : kClientRecvItems) {
         ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
@@ -1689,6 +1692,124 @@ TEST(LatencyTraceE2ETest, AsyncEchoWithUsercodeInPthreadAllWeightBearingInvarian
     const brpc::LatencyTraceRecord* s = nullptr;
     RunSequentialAsyncEchoRPCs(9534, 5, &c, &s);
     AssertAllWeightBearingInvariants(c, s);
+
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// ---------------------------------------------------------------------
+// D14 (item 1's core semantic claim): C17 (rpc_end) must be stamped at the
+// same instant brpc calls OnRPCEnd() -- strictly BEFORE `_done->Run()`
+// executes, never after. None of the invariant checks above (here or in
+// AssertAllWeightBearingInvariants) can observe this ordering: they only
+// check that C17 eventually becomes non-zero, monotonic, and non-negative
+// relative to earlier points -- properties an implementation that stamps
+// C17 AFTER `_done->Run()` returns would satisfy identically, because the
+// closures used everywhere else in this file (AsyncEchoDone) do nothing
+// but self-delete and never touch the record. Prove the ordering directly
+// by comparing raw counter reads instead of relying on any pass/fail
+// derived from ts[] alone: capture the counter value at the moment the
+// callback body starts running, then decode C17's own stamp back into a
+// raw counter value -- base_counter + (ts[C17] - 1), the exact inverse of
+// EncodeOffset (see LatencyTraceRecord::ts's comment) -- and assert the
+// latter is NOT LATER than the former. A callback that also sleeps for a
+// while widens the window: if C17 were (bug) stamped only after `Run()`
+// completes, its decoded raw counter would land somewhere during or after
+// that sleep, strictly AFTER entry_cycles, not at-or-before it.
+// ---------------------------------------------------------------------
+
+class TimingProbeAsyncDone : public google::protobuf::Closure {
+public:
+    TimingProbeAsyncDone(std::atomic<uint64_t>* entry_cycles,
+                          std::atomic<bool>* done_flag)
+        : _entry_cycles(entry_cycles), _done_flag(done_flag) {}
+    void Run() override {
+        _entry_cycles->store(butil::detail::clock_cycles(),
+                              std::memory_order_release);
+        // Widen the window a buggy "stamp after Run()" implementation
+        // would land in -- see this section's block comment above.
+        bthread_usleep(20 * 1000);
+        _done_flag->store(true, std::memory_order_release);
+        delete this;
+    }
+private:
+    std::atomic<uint64_t>* _entry_cycles;
+    std::atomic<bool>* _done_flag;
+};
+
+// Shared body: issue one async Echo with a TimingProbeAsyncDone, wait for
+// the callback to finish, then assert C17's decoded raw counter is
+// at-or-before the counter value sampled at the callback's own entry.
+static void AssertRpcEndPrecedesAsyncCallback(int port) {
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(port, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    char addr[64];
+    snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
+    ASSERT_EQ(0, channel.Init(addr, &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("timing-probe");
+
+    std::atomic<uint64_t> entry_cycles{0};
+    std::atomic<bool> done_flag{false};
+    stub.Echo(&cntl, &req, &res,
+              new TimingProbeAsyncDone(&entry_cycles, &done_flag));
+
+    ASSERT_TRUE(WaitForTrue([&done_flag]() {
+        return done_flag.load(std::memory_order_acquire);
+    }, 2000)) << "async callback never ran";
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    const brpc::LatencyTraceRecord* c = FindLastClientRecordForTest();
+    ASSERT_TRUE(c != nullptr);
+    ASSERT_NE(0u, c->ts[brpc::LT_C_RPC_END]) << "C17 (rpc_end) never stamped";
+
+    const uint64_t rpc_end_raw =
+        c->base_counter + (uint64_t)(c->ts[brpc::LT_C_RPC_END] - 1);
+    const uint64_t entry_raw = entry_cycles.load(std::memory_order_acquire);
+    ASSERT_LE(rpc_end_raw, entry_raw)
+        << "C17 (rpc_end) must be stamped at/before the async callback "
+           "starts running -- found it stamped AFTER the callback had "
+           "already started, meaning the callback's own duration leaked "
+           "into what should be pure RPC latency (design doc sec.3.3/D14)";
+
+    server.Stop(0);
+    server.Join();
+}
+
+TEST(LatencyTraceE2ETest, RpcEndPrecedesAsyncCallback) {
+    // Item 1's target: the regular async branch of Controller::EndRPC
+    // (-usercode_in_pthread stays at its default, false).
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    AssertRpcEndPrecedesAsyncCallback(9540);
+
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceE2ETest, RpcEndPrecedesAsyncCallbackWithUsercodeInPthread) {
+    // Item 1's target: Controller::DoneInBackupThread(), reached only via
+    // RunUserCode(RunDoneInBackupThread, this).
+    const bool saved_usercode_in_pthread = brpc::FLAGS_usercode_in_pthread;
+    struct Restore {
+        const bool* saved;
+        ~Restore() { brpc::FLAGS_usercode_in_pthread = *saved; }
+    } restore{&saved_usercode_in_pthread};
+
+    brpc::FLAGS_usercode_in_pthread = true;
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    AssertRpcEndPrecedesAsyncCallback(9541);
 
     brpc::FLAGS_latency_trace_enabled = false;
 }
@@ -1773,6 +1894,65 @@ TEST(LatencyTraceMetaTest, EachRetryAttemptGetsItsOwnRecord) {
     ASSERT_EQ(3u, attempts.size()) << "expected one record per attempt";
     ASSERT_EQ(0, *attempts.begin());
     ASSERT_EQ(2, *attempts.rbegin());
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// This round's item 2: ControllerPrivateAccessor::latency_trace_handle_for_
+// response()'s fallback -- reached when a response's correlation id
+// matches neither `_current_call` nor a live `_unfinished_call` -- used to
+// return `_cntl->_lt_handle` (the CONTROLLER-level handle, i.e. whichever
+// attempt was allocated most recently) instead of LT_INVALID_HANDLE. That
+// is wrong, not merely imprecise: `_stop_when_full` (the only supported
+// production setting) means slots are never recycled, so the generation
+// guard the old comment invoked does NOT refuse the resulting write -- it
+// silently lands a stale attempt's stamps onto whatever live record
+// `_lt_handle` currently names.
+//
+// The actual trigger is a genuine network race -- a superseded attempt's
+// response literally arriving after a retry has already been issued over
+// a (possibly different) connection -- which is not deterministically
+// constructible from a test. Exercise the resolver directly instead,
+// against a Controller left in a REAL post-retry state by a real (failed)
+// RPC: same dead-backend/max_retry=2 shape as EachRetryAttemptGetsItsOwn
+// Record above, so `_current_call.nretry == 2` and `_unfinished_call ==
+// nullptr` (plain retry, not backup -- backup keeps the superseded
+// attempt alive in `_unfinished_call`, which is a different, already-
+// covered resolution path). Ask for the handle a response for attempt 0
+// -- the FIRST, long-superseded attempt, whose Call no longer exists --
+// would have resolved to.
+TEST(LatencyTraceMetaTest, SupersededRetryAttemptResponseHandleFallsBackToInvalid) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    opt.max_retry = 2;
+    opt.timeout_ms = 200;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9599", &opt));  // nothing listening
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("x");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_TRUE(cntl.Failed());
+
+    // Call::id() == correlation_id.value + nretry + 1 (Controller::get_id());
+    // attempt 0's id is therefore call_id().value + 1.
+    brpc::ControllerPrivateAccessor accessor(&cntl);
+    const int64_t attempt0_id = (int64_t)cntl.call_id().value + 1;
+    const brpc::LatencyTraceHandle stale_handle =
+        accessor.latency_trace_handle_for_response(attempt0_id);
+    ASSERT_EQ(brpc::LT_INVALID_HANDLE, stale_handle)
+        << "a response for a superseded attempt whose Call is gone must "
+           "resolve to LT_INVALID_HANDLE, not fall back to the live "
+           "Controller-level handle -- which by now names attempt 2's "
+           "record (the last one IssueRPC allocated), not attempt 0's; "
+           "returning it would let this stale response's stamps overwrite "
+           "attempt 2's live record";
+
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
@@ -2085,6 +2265,21 @@ TEST(LatencyTraceMetaTest, OriginalAttemptWinningOverBackupGetsFinalOutcome) {
            "cancelled, not keep the zero (\"success\") it was allocated "
            "with";
 
+    // This round's item 3 (test gap, not to be confused with the "Fix-round
+    // item 3" comment above from an earlier round): every assertion in this
+    // test so far only checks `original` got its receive-side stamps -- it
+    // never checks that `backup` did NOT. An implementation that stamps
+    // BOTH handles on every response (instead of resolving the ONE handle
+    // that matches the response's own attempt, per fix-round item 1) would
+    // pass every assertion above and still be wrong. LT_C_WAKE is the
+    // natural point to check: it is the first point only the response path
+    // ever writes, so a non-zero value here can only mean this attempt's
+    // handle was (incorrectly) resolved for the original's response.
+    ASSERT_EQ(0u, backup->ts[brpc::LT_C_WAKE])
+        << "the losing backup's own record must not receive the original's "
+           "response-side stamps -- only the attempt a response actually "
+           "belongs to may be stamped for it";
+
     // Fix-round item 1 (whole-branch review of 685e6d9e): this is the
     // exact branch item 1's bug lives in -- "original wins over its own
     // backup". Before the fix, ProcessRpcResponse read C09-C16 and
@@ -2120,6 +2315,148 @@ TEST(LatencyTraceMetaTest, OriginalAttemptWinningOverBackupGetsFinalOutcome) {
     ASSERT_TRUE(original_srv != nullptr)
         << "no server record shares the original attempt's trace_id";
     AssertPerRecordCoreInvariants(original, original_srv);
+
+    server.Stop(0);
+    server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// This round's item 4 (test gap): every backup-request test above only
+// covers "the original wins over its own backup". The mirror direction --
+// the BACKUP wins, and the original's late response (if it ever arrives)
+// must be the one dropped -- had no test at all. An implementation that
+// always preferred `_unfinished_call` (the original) over `_current_call`
+// when resolving a response's handle -- e.g. checking `_unfinished_call`
+// before `_current_call` in latency_trace_handle_for_response, the reverse
+// of the order that function actually uses -- would pass every assertion
+// in OriginalAttemptWinningOverBackupGetsFinalOutcome above (that test
+// never exercises the backup's own response at all) while resolving the
+// backup's real response onto the wrong (original) record here.
+//
+// The mock service's first invocation (the original) sleeps long enough
+// that backup_request_ms elapses and a backup fires, then keeps sleeping
+// well past the point the backup's response has already ended the whole
+// RPC; its second invocation (the backup) responds immediately, so the
+// backup is guaranteed to be the one that completes the RPC.
+class LatencyTraceBackupWinsServiceImpl : public test::EchoService {
+public:
+    void Echo(google::protobuf::RpcController* /*cntl_base*/,
+              const test::EchoRequest* request,
+              test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        const int seen = _call_count.fetch_add(1, std::memory_order_relaxed);
+        if (seen == 0) {
+            // The original attempt: made to hang well past the point the
+            // backup's response has already ended the whole RPC (well
+            // past backup_request_ms plus loopback overhead), without
+            // dragging server.Join() below out any longer than necessary.
+            bthread_usleep(1000 * 1000);
+        }
+        // The backup attempt (seen == 1): responds immediately, so it
+        // wins the race against the still-sleeping original.
+        response->set_message(request->message());
+    }
+private:
+    std::atomic<int> _call_count{0};
+};
+
+TEST(LatencyTraceMetaTest, BackupAttemptWinningOverOriginalGetsFinalOutcome) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceBackupWinsServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9538, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9538", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    cntl.set_backup_request_ms(30);
+    cntl.set_timeout_ms(5000);
+    req.set_message("backup-wins");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ("backup-wins", res.message());
+
+    std::vector<const brpc::LatencyTraceRecord*> client_records;
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            break;
+        }
+        if (r->role == brpc::LT_ROLE_CLIENT) {
+            client_records.push_back(r);
+        }
+    }
+    ASSERT_EQ(2u, client_records.size())
+        << "expected one record for the original attempt and one for "
+           "its backup";
+
+    const brpc::LatencyTraceRecord* original = nullptr;
+    const brpc::LatencyTraceRecord* backup = nullptr;
+    for (const brpc::LatencyTraceRecord* r : client_records) {
+        if (r->attempt == 0) {
+            original = r;
+        } else if (r->attempt == 1) {
+            backup = r;
+        }
+    }
+    ASSERT_TRUE(original != nullptr && backup != nullptr);
+
+    // The backup attempt is the one that actually completed the RPC: its
+    // record must carry the true (successful) final outcome.
+    ASSERT_EQ(0, backup->error_code)
+        << "the backup attempt's record should carry the RPC's true final "
+           "outcome after it wins the race against the original";
+
+    // The losing original's own record should keep EBACKUPREQUEST -- written
+    // proactively by IssueRPC at the moment the backup was issued (before
+    // either attempt's outcome is known; see IssueRPC's `prev_rec->error_code
+    // = _error_code` write). This is the mirror of
+    // OriginalAttemptWinningOverBackupGetsFinalOutcome's ECANCELED check:
+    // there the winner is known *after* the loser already responded, so
+    // EndRPC can compute and persist ECANCELED into the loser's own record;
+    // here the loser (original) never responds at all within this test's
+    // lifetime, so its record is never revisited after that earlier
+    // EBACKUPREQUEST write.
+    ASSERT_EQ(brpc::EBACKUPREQUEST, original->error_code)
+        << "the losing original's own record should keep the EBACKUPREQUEST "
+           "outcome IssueRPC wrote it when the backup was issued";
+
+    // Design doc sec.10.1's four weight-bearing invariants, on the WINNING
+    // (backup) attempt specifically -- resolved via
+    // latency_trace_handle_for_response, not the stale Controller-level
+    // _lt_handle (fix-round item 1). Checked against
+    // AssertPerRecordCoreInvariants, not the full
+    // AssertAllWeightBearingInvariants: this test's server has the
+    // original's AND the backup's requests in flight at once, so
+    // outstanding=1 does not hold and the decomposition-item/link-time
+    // check does not apply (see AssertPerRecordCoreInvariants's comment).
+    const brpc::LatencyTraceRecord* backup_srv =
+        FindServerRecordForTraceId(backup->trace_id);
+    ASSERT_TRUE(backup_srv != nullptr)
+        << "no server record shares the backup attempt's trace_id";
+    AssertPerRecordCoreInvariants(backup, backup_srv);
+
+    // This round's item 4 proper: the mirror of item 3's check above. An
+    // implementation that always prefers `_unfinished_call` (the original)
+    // when resolving the response's handle -- the reverse bug from the one
+    // item 3 covers -- would land the backup's real response-side stamps
+    // onto `original` instead. Assert the LOSING original's record stayed
+    // unstamped on the receive side.
+    ASSERT_EQ(0u, original->ts[brpc::LT_C_WAKE])
+        << "the losing original attempt's record must not receive the "
+           "backup's response-side stamps -- only the attempt a response "
+           "actually belongs to may be stamped for it";
 
     server.Stop(0);
     server.Join();

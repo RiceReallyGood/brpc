@@ -104,12 +104,22 @@ public:
             _cntl->_unfinished_call->nretry == nretry) {
             return _cntl->_unfinished_call->lt_handle;
         }
-        // No live attempt matches (e.g. a response for an attempt that has
-        // already been superseded and had its Call destroyed). Fall back
-        // to the Controller-level handle rather than silently dropping the
-        // stamp; this mirrors the handle's own generation guard, which
-        // will refuse the write if the slot has meanwhile been recycled.
-        return _cntl->_lt_handle;
+        // No live attempt matches -- an ordinary case, not an exotic one:
+        // bthread/id.cpp's ranged id accepts any version, so a superseded
+        // attempt's late response can still reach ProcessRpcResponse after
+        // its Call has been destroyed (see the fix-round item 2 report;
+        // brpc's own comment near controller.cpp:1535 describes exactly
+        // this). Returning `_cntl->_lt_handle` here would be wrong, not
+        // merely imprecise: with `_stop_when_full` (the only supported
+        // production setting) slots are never recycled, so the generation
+        // guard does NOT refuse this write -- it would silently land this
+        // stale attempt's receive-side timestamps on whatever LIVE record
+        // `_lt_handle` currently points at (e.g. a retry/backup attempt
+        // already in flight), corrupting it with first-write-wins values
+        // that make no sense for that attempt. Dropping the stamp for an
+        // attempt whose Call is gone is correct; polluting a live one is
+        // not.
+        return LT_INVALID_HANDLE;
     }
 #else
     void set_latency_trace(uint64_t /*trace_id*/, LatencyTraceHandle /*h*/) {}

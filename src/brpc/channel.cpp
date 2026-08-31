@@ -685,11 +685,15 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         cntl->SubmitSpan();
         cntl->OnRPCEnd(butil::gettimeofday_us());
 #if defined(BRPC_LATENCY_TRACE)
-        // C19: end of the synchronous RPC lifecycle, once Join() has
-        // returned. The async (`done`-based) path calls Controller::OnRPCEnd
-        // earlier -- before `_done->Run()` -- so stamping there too would
-        // put a "later" point (C19) ahead of C17/C18 in that path; this
-        // call site is the only place C19 is guaranteed to come last.
+        // C17 (rpc_end, D14): stamped right after this OnRPCEnd() call,
+        // the same instant brpc itself considers the synchronous RPC
+        // finished -- Join() returning is what actually wakes this
+        // bthread, so this call site (not Controller::EndRPC, which runs
+        // earlier on a different bthread for the sync path) is where C17
+        // belongs. The async (`done`-based) path stamps C17 in
+        // Controller::EndRPC/DoneInBackupThread instead, right after
+        // THEIR OnRPCEnd() call and strictly before `_done->Run()` -- see
+        // those functions' comments.
         LT_STAMP(ControllerPrivateAccessor(cntl).latency_trace_handle(),
                  LT_C_RPC_END);
 #endif

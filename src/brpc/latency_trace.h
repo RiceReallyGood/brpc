@@ -30,7 +30,15 @@ namespace brpc {
 // here IS the decomposition and must stay monotonic in wall-clock terms.
 // See docs/superpowers/specs/2026-08-29-brpc-latency-trace-design.md sec.4
 enum LatencyTracePoint {
-    // ---- client, 19 points ----
+    // ---- client, 17 points ----
+    // D14: rpc_end lands at the same instant brpc calls Controller::
+    // OnRPCEnd() -- there used to be two more client points here
+    // (rsp_process_start/end, bracketing the user callback), deleted by
+    // design doc sec.3.3/D14 because brpc itself does not count the
+    // callback as RPC latency. Do not re-add them; re-derive the client
+    // count (17, not 19) and every downstream offset (LT_S_WAKE onward,
+    // LT_POINT_COUNT, LatencyTraceRecord's size) from this enum instead of
+    // a stale comment if this ever changes again.
     LT_C_RPC_START = 0,
     LT_C_REQ_PAYLOAD_SER_START,
     LT_C_REQ_PAYLOAD_SER_END,
@@ -47,8 +55,6 @@ enum LatencyTracePoint {
     LT_C_RSP_META_DESER_END,
     LT_C_RSP_PAYLOAD_DESER_START,
     LT_C_RSP_PAYLOAD_DESER_END,
-    LT_C_RSP_PROCESS_START,
-    LT_C_RSP_PROCESS_END,
     LT_C_RPC_END,
     // ---- server, 17 points ----
     LT_S_WAKE,
@@ -150,7 +156,7 @@ const uint32_t LT_TS_NOT_APPLICABLE = 0xFFFFFFFFu;
 // timescale this project cares about.
 const uint64_t LT_RAW_NOT_APPLICABLE = ~static_cast<uint64_t>(0);
 
-// Fixed-size POD, 200 bytes. Timestamps encode counter deltas (offset+1;
+// Fixed-size POD, 192 bytes. Timestamps encode counter deltas (offset+1;
 // see `ts` below) relative to `base_counter`; conversion to nanoseconds
 // happens offline.
 struct LatencyTraceRecord {
@@ -169,7 +175,7 @@ struct LatencyTraceRecord {
     uint64_t base_counter;
     // Generation guard, see LatencyTraceBuffer. Atomic so AllocSlot can
     // publish it with release semantics and Get() can pair that with an
-    // acquire load -- verified to keep this struct exactly 200 bytes and
+    // acquire load -- verified to keep this struct exactly 192 bytes and
     // trivially copyable (butil::atomic<uint64_t> matches uint64_t in both
     // size and object representation when lock-free, which it is here).
     butil::atomic<uint64_t> slot_seq;
@@ -218,9 +224,9 @@ struct LatencyTraceRecord {
 // ASSERT_EQ in a unit test that exists solely in traced (BRPC_LATENCY_TRACE)
 // builds, so a size regression would only show up if that specific test
 // build happened to run. Pin it the same way as the header, unconditionally.
-static_assert(sizeof(LatencyTraceRecord) == 200,
+static_assert(sizeof(LatencyTraceRecord) == 192,
               "LatencyTraceRecord is an on-disk format merge.py parses "
-              "verbatim -- it must stay exactly 200 bytes");
+              "verbatim -- it must stay exactly 192 bytes");
 
 // Spells "BRPLTRC1" -- 8 bytes, no 'C' after "BRP" -- when read as the
 // big-endian byte sequence that literal actually encodes. This file

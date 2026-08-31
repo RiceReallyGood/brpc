@@ -1294,19 +1294,19 @@ void Controller::EndRPC(const CompletionInfo& info) {
     // No need to retry or can't retry, just call user's `done'.
     const CallId saved_cid = _correlation_id;
 #if defined(BRPC_LATENCY_TRACE)
-    // C17: about to hand off to whatever runs "the client callback" --
-    // `_done->Run()` for an async RPC, or (with no `done` at all) whatever
-    // wakes the synchronous caller blocked in Channel::CallMethod's Join().
-    // Captured as a plain handle value, not read again through `this`,
-    // because the async branch below may delete this Controller inside
-    // `_done->Run()` before C18 can be stamped. Read here, i.e. AFTER the
+    // D14: rpc_end (C17) must land at the same instant brpc calls
+    // OnRPCEnd() -- strictly BEFORE `_done->Run()`, never after. A
+    // callback is user code that runs after brpc considers the RPC
+    // finished, so it is not RPC latency and gets no point of its own
+    // (design doc sec.3.3). Captured as a plain handle value, not read
+    // again through `this`, because the async branch below may delete
+    // this Controller inside `_done->Run()`. Read here, i.e. AFTER the
     // if/else block above has already run every Call::OnComplete() call
     // for this EndRPC() invocation -- _lt_handle is therefore already
     // repointed (fix-round item 2) at whichever Call actually completed
-    // the RPC, so C17-C19 land on that same winning attempt's record.
+    // the RPC, so C17 lands on that same winning attempt's record.
     const LatencyTraceHandle lt_process_handle =
         ControllerPrivateAccessor(this).latency_trace_handle();
-    LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_START);
 #endif
     if (_done) {
         if (!FLAGS_usercode_in_pthread || _done == DoNothing()/*Note*/) {
@@ -1322,18 +1322,14 @@ void Controller::EndRPC(const CompletionInfo& info) {
             // can't Run() because all backup threads are blocked by Join().
 
             OnRPCEnd(butil::gettimeofday_us());
-            const bool destroy_cid_in_done = has_flag(FLAGS_DESTROY_CID_IN_DONE);
-            _done->Run();
 #if defined(BRPC_LATENCY_TRACE)
-            LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_END);
-            // C19: same thread, same program order as the C18 stamp just
-            // above -- both read `lt_process_handle`, a plain local
-            // captured before `_done->Run()`, never `this` (which may
-            // already be deleted here). No reordering of OnRPCEnd() against
-            // `_done->Run()` is needed: stamping C19 right after C18 is
-            // trivially monotonic without it.
+            // C17 (rpc_end): right after OnRPCEnd(), strictly before
+            // `_done->Run()` below -- see this function's D14 comment
+            // above.
             LT_STAMP(lt_process_handle, LT_C_RPC_END);
 #endif
+            const bool destroy_cid_in_done = has_flag(FLAGS_DESTROY_CID_IN_DONE);
+            _done->Run();
             // NOTE: Don't touch this Controller anymore, because it's likely to be
             // deleted by done.
             if (!destroy_cid_in_done) {
@@ -1348,19 +1344,15 @@ void Controller::EndRPC(const CompletionInfo& info) {
         }
     } else {
         // OnRPCEnd for sync RPC is called in Channel::CallMethod to count in
-        // latency of the context-switch.
+        // latency of the context-switch. C17 (rpc_end) is stamped there too,
+        // right after that OnRPCEnd() call (see channel.cpp) -- not here,
+        // and not in this Controller's own EndRPC(): Channel::CallMethod is
+        // the only call site downstream of Join() returning, i.e. the only
+        // place guaranteed to run after the caller's bthread has actually
+        // resumed.
 
         // Check comments in above branch on bthread_about_to_quit.
         bthread_about_to_quit();
-#if defined(BRPC_LATENCY_TRACE)
-        // C18 must be stamped strictly before the unlock below: that call is
-        // what wakes the Join()'d caller in Channel::CallMethod, which goes
-        // on to stamp C19 (LT_C_RPC_END) on its own bthread. Stamping after
-        // the unlock would race the two bthreads with no ordering guarantee
-        // between them, occasionally landing C18 after C19 and breaking the
-        // point sequence's monotonicity.
-        LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_END);
-#endif
         CHECK_EQ(0, bthread_id_unlock_and_destroy(saved_cid));
     }
 }
@@ -1399,29 +1391,24 @@ void Controller::RunDoneInBackupThread(void* arg) {
 void Controller::DoneInBackupThread() {
     // OnRPCEnd for sync RPC is called in Channel::CallMethod to count in
     // latency of the context-switch.
-    OnRPCEnd(butil::gettimeofday_us());
-    const CallId saved_cid = _correlation_id;
-    const bool destroy_cid_in_done = has_flag(FLAGS_DESTROY_CID_IN_DONE);
 #if defined(BRPC_LATENCY_TRACE)
-    // C17 was already stamped by EndRPC() before it dispatched here via
-    // RunUserCode(RunDoneInBackupThread, this) -- that stamp sits before
-    // the `if (_done)` fork and so covers every `_done` branch, this one
-    // included. What EndRPC's stamp can't reach is C18/C19, which must
-    // happen after `_done->Run()` on THIS thread. Same lifetime hazard as
-    // EndRPC's lt_process_handle: `this` may be deleted inside
-    // `_done->Run()` below, so the handle is read into a local now, before
-    // that call, and never re-read through `this` afterward.
+    // D14: read the handle BEFORE OnRPCEnd()/`_done->Run()`, same lifetime
+    // hazard as EndRPC's lt_process_handle -- `this` may be deleted inside
+    // `_done->Run()` below, so the handle must not be re-read through
+    // `this` afterward. C17 (rpc_end) is then stamped immediately after
+    // OnRPCEnd(), strictly BEFORE `_done->Run()`: this is the
+    // -usercode_in_pthread dispatch target of EndRPC's async branch, which
+    // no longer stamps C17 itself once it hands off here (see EndRPC).
     const LatencyTraceHandle lt_process_handle =
         ControllerPrivateAccessor(this).latency_trace_handle();
 #endif
-    _done->Run();
+    OnRPCEnd(butil::gettimeofday_us());
 #if defined(BRPC_LATENCY_TRACE)
-    // C18 then C19: same thread, same program order, both off the local
-    // handle above -- trivially monotonic, matching how EndRPC's other
-    // async branch stamps them back-to-back after `_done->Run()`.
-    LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_END);
     LT_STAMP(lt_process_handle, LT_C_RPC_END);
 #endif
+    const CallId saved_cid = _correlation_id;
+    const bool destroy_cid_in_done = has_flag(FLAGS_DESTROY_CID_IN_DONE);
+    _done->Run();
     // NOTE: Don't touch fields of controller anymore, it may be deleted.
     if (!destroy_cid_in_done) {
         CHECK_EQ(0, bthread_id_unlock_and_destroy(saved_cid));
