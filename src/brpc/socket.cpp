@@ -1726,6 +1726,23 @@ int Socket::Write(SocketMessagePtr<>& msg, const WriteOptions* options_in) {
     // wait until it points to a valid WriteRequest or nullptr.
     req->next = WriteRequest::UNCONNECTED;
     req->id_wait = opt.id_wait;
+#if defined(BRPC_LATENCY_TRACE)
+    // Fix-round item 2: this overload (used by stream/h2/RTMP/packet_guard
+    // writes, i.e. anything packing into a SocketMessage rather than an
+    // IOBuf -- baidu_std always packs into an IOBuf via the overload above
+    // and is unaffected) used to leave `req->lt_handle` unset. `req` comes
+    // from butil::get_object<WriteRequest>(), so the field held whatever
+    // was in that pool slot before -- indeterminate memory on a fresh
+    // object, or a previous occupant's handle on a recycled one. Reading
+    // it is UB either way, and because `_stop_when_full` means slots are
+    // never recycled out from under a live generation, a stale handle
+    // still passes the generation guard and returns a live record: this
+    // could stamp C07/C08 or S16/S17 into a completely unrelated RPC's
+    // record. Set it explicitly, mirroring the IOBuf overload above.
+    req->lt_handle = opt.lt_handle;
+    LT_STAMP(req->lt_handle, (opt.lt_role == LT_ROLE_SERVER)
+                                 ? LT_S_WRITE_ENQUEUE : LT_C_WRITE_ENQUEUE);
+#endif
     req->clear_and_set_control_bits(opt.notify_on_success, opt.shutdown_write);
     req->set_pipelined_count_and_user_message(
         opt.pipelined_count, msg.release(), opt.auth_flags);

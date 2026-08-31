@@ -25,12 +25,15 @@
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
+#include <sys/socket.h>
 #include "brpc/channel.h"
 #include "brpc/closure_guard.h"
 #include "brpc/latency_trace.h"
 #include "brpc/policy/baidu_rpc_meta.pb.h"
 #include "brpc/server.h"
+#include "brpc/socket.h"
 #include "bthread/bthread.h"
+#include "butil/endpoint.h"
 #include "butil/time.h"
 #include "echo.pb.h"
 
@@ -581,9 +584,16 @@ TEST_F(LatencyTraceBufferTest, DumpRoundTripsHeaderAndRecords) {
     ASSERT_EQ((uint32_t)brpc::LT_POINT_COUNT, hdr.point_count);
     // Empirical frequency must be a plausible clock rate, not zero.
     ASSERT_GT(hdr.counter_freq_hz, 1000000.0);
-    // Head/tail calibration pairs must bracket a positive interval.
-    ASSERT_GT(hdr.tail_realtime_ns, hdr.head_realtime_ns);
+    // Head/tail calibration pairs must bracket a positive interval. The
+    // monotonic pair is what counter_freq_hz above is actually computed
+    // from (fix-round item 6: these fields hold CLOCK_MONOTONIC, not
+    // CLOCK_REALTIME -- renamed from *_realtime_ns to say so).
+    ASSERT_GT(hdr.tail_monotonic_ns, hdr.head_monotonic_ns);
     ASSERT_GT(hdr.tail_counter, hdr.head_counter);
+    // The genuine CLOCK_REALTIME pair (fix-round item 6) exists only for
+    // an offline cross-host sanity check and plays no part in the
+    // calibration above, but must still be real, moving wall-clock time.
+    ASSERT_GT(hdr.tail_realtime_ns, hdr.head_realtime_ns);
 
     brpc::LatencyTraceRecord rec;
     bool found = false;
@@ -843,6 +853,34 @@ static const brpc::LatencyTraceRecord* FindLastClientRecordForTest() {
 }
 static const brpc::LatencyTraceRecord* FindLastServerRecordForTest() {
     return FindLastRecordByRole(brpc::LT_ROLE_SERVER);
+}
+
+// Fix-round items 1 and 3: unlike FindLastRecordByRole above, retry and
+// backup tests below need the SERVER record belonging to one SPECIFIC
+// client attempt -- not simply "the most recent server record" -- since
+// more than one attempt (and therefore more than one server-side
+// request) can exist for a single logical RPC. The server's `attempt`
+// field is useless for this: it is only ever meaningfully set on the
+// client side (see Controller::IssueRPC's `rec->attempt =
+// (uint8_t)_current_call.nretry`; the server's own AllocSlot always
+// leaves it 0, design doc's D9 attempt numbering was never extended to
+// the server side). trace_id is what actually ties a server record back
+// to the one client attempt that produced it: the server reads
+// `request_meta.latency_trace_id()` off the wire rather than minting its
+// own (see ProcessRpcRequest), so the two sides' trace_ids for one
+// attempt are identical by construction.
+static const brpc::LatencyTraceRecord* FindServerRecordForTraceId(
+        uint64_t trace_id) {
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            return nullptr;
+        }
+        if (r->role == brpc::LT_ROLE_SERVER && r->trace_id == trace_id) {
+            return r;
+        }
+    }
 }
 
 class LatencyTraceEchoServiceImpl : public test::EchoService {
@@ -1333,12 +1371,19 @@ static void RunSequentialAsyncEchoRPCs(int port, int n_requests,
     server.Join();
 }
 
-// Shared body for the two tests below: section 10.1's weight-bearing
-// checks, factored out so they aren't duplicated verbatim a third time
-// (the sync tests above already state them twice, split by concern --
-// this collapses all of them into one call site per async test).
-static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
-                                              const brpc::LatencyTraceRecord* s) {
+// Fix-round items 1 and 3: the first three of design doc sec.10.1's four
+// weight-bearing checks (every point non-zero, monotonic, C09>=C08) are
+// purely LOCAL to each side's own record -- they hold regardless of how
+// many other requests are concurrently in flight anywhere else in the
+// process. Split out from AssertAllWeightBearingInvariants below so a
+// caller whose scenario does NOT satisfy the outstanding=1 precondition
+// (e.g. a backup request, where the server is by construction processing
+// the original and the backup at the same time) can still run these
+// three without also running the fourth -- design doc sec.10.1 itself
+// says the decomposition-item/link-time check requires outstanding=1
+// ("高并发下不做非负断言，只统计负值比例").
+static void AssertPerRecordCoreInvariants(const brpc::LatencyTraceRecord* c,
+                                           const brpc::LatencyTraceRecord* s) {
     ASSERT_TRUE(c != nullptr && s != nullptr);
 
     // Every point non-zero (design doc sec.10.1's only check that catches
@@ -1362,6 +1407,25 @@ static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
     const int64_t rtt = (int64_t)c->ts[brpc::LT_C_WAKE] -
                         (int64_t)c->ts[brpc::LT_C_WRITE_END];
     ASSERT_GE(rtt, 0) << "negative client round trip C09-C08";
+}
+
+// Shared body for the two async E2E tests below: section 10.1's full set
+// of weight-bearing checks (the three local ones above, plus the
+// outstanding=1-only decomposition-item/link-time check), factored out
+// so they aren't duplicated verbatim a third time (the sync tests above
+// already state them twice, split by concern -- this collapses all of
+// them into one call site per async test). Both of those tests issue one
+// RPC at a time on an otherwise-idle server, so outstanding=1 genuinely
+// holds; a caller that cannot make that guarantee should call
+// AssertPerRecordCoreInvariants above instead -- see its comment.
+static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
+                                              const brpc::LatencyTraceRecord* s) {
+    AssertPerRecordCoreInvariants(c, s);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    const int64_t rtt = (int64_t)c->ts[brpc::LT_C_WAKE] -
+                        (int64_t)c->ts[brpc::LT_C_WRITE_END];
 
     // Every decomposition item non-negative at outstanding=1 (design doc
     // sec.5's 7 client-send + 16 server + 10 client-receive items, plus
@@ -1639,6 +1703,103 @@ TEST(LatencyTraceMetaTest, RetryAttemptSeqContinuesInitialAttemptSeq) {
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
+// Fix-round items 1 and 3 (whole-branch review of 685e6d9e): the retry and
+// backup-request paths produce records but, before this test, had ZERO
+// invariant assertions on them anywhere in this file -- both tests above
+// only check the attempt set and (for the retry-sequence test) the trace
+// id ordering. That is exactly why items 1 and 3 survived fourteen tasks
+// and eight fix rounds: nothing here ever looked at whether a WINNING
+// retried/backed-up attempt's record actually satisfies design doc
+// sec.10.1's four weight-bearing invariants (every point non-zero,
+// monotonic, C09>=C08, every decomposition item non-negative).
+//
+// Both existing retry tests above point at a dead backend on purpose (to
+// exercise the attempt-numbering and trace-id-uniqueness properties they
+// each check), so no attempt of theirs ever WINS -- there is no
+// successful final record to check sec.10.1 against. This test drives a
+// retry that actually succeeds: the first attempt fails with a
+// retryable error code (ECONNRESET is in RpcRetryPolicy::DoRetry's
+// list), the client's default retry policy reissues against the SAME
+// live server over the SAME pooled connection (the response WAS
+// received, so Controller::EndRPC's `error_code==0 || responded` guard
+// keeps the connection in the pool for reuse -- this is a normal
+// application-level failure response, not a socket-level one), and the
+// second attempt succeeds -- giving a genuine winning attempt with
+// attempt>0 to check.
+class LatencyTraceRetryThenSucceedServiceImpl : public test::EchoService {
+public:
+    void Echo(google::protobuf::RpcController* cntl_base,
+              const test::EchoRequest* request,
+              test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        const int seen = _call_count.fetch_add(1, std::memory_order_relaxed);
+        if (seen == 0) {
+            cntl->SetFailed(ECONNRESET, "synthetic retryable failure");
+            return;
+        }
+        response->set_message(request->message());
+    }
+private:
+    std::atomic<int> _call_count{0};
+};
+
+TEST(LatencyTraceMetaTest, RetriedAttemptThatWinsGetsFullInvariants) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceRetryThenSucceedServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9537, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    opt.max_retry = 1;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9537", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("retry-wins");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ("retry-wins", res.message());
+    ASSERT_EQ(1, cntl.retried_count()) << "expected exactly one retry";
+
+    const brpc::LatencyTraceRecord* winner = FindLastClientRecordForTest();
+    ASSERT_TRUE(winner != nullptr);
+    ASSERT_EQ(1, winner->attempt)
+        << "the winning attempt should be the retry (attempt 1), not the "
+           "original (attempt 0) that got ECONNRESET";
+    ASSERT_EQ(0, winner->error_code);
+
+    const brpc::LatencyTraceRecord* srv =
+        FindServerRecordForTraceId(winner->trace_id);
+    ASSERT_TRUE(srv != nullptr)
+        << "no server record shares the winning attempt's trace_id";
+
+    // Design doc sec.10.1's four weight-bearing invariants, on the
+    // WINNING attempt specifically -- this is what item 3's bug breaks:
+    // C02/C03 are only stamped once, in Channel::CallMethod, for attempt
+    // 0; this record is attempt 1, so before the fix ts[C02]==ts[C03]==0
+    // while ts[C01]==1, failing both the non-zero and the monotonic
+    // checks inside AssertAllWeightBearingInvariants (defined above in
+    // this file, shared with the async E2E tests). Item 1's bug needs a
+    // backup, not a retry, to manifest -- see
+    // OriginalAttemptWinningOverBackupGetsFinalOutcome below for that
+    // one -- but running the same full check here means a future
+    // regression in either fix shows up wherever it actually reaches.
+    AssertAllWeightBearingInvariants(winner, srv);
+
+    server.Stop(0);
+    server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
 // Fix-round item 2 (review of Task 13): when a backup request's ORIGINAL
 // attempt responds and wins the race against its own backup (Controller
 // ::EndRPC's "a previous non-backup request responded" branch), the RPC's
@@ -1756,8 +1917,122 @@ TEST(LatencyTraceMetaTest, OriginalAttemptWinningOverBackupGetsFinalOutcome) {
            "cancelled, not keep the zero (\"success\") it was allocated "
            "with";
 
+    // Fix-round item 1 (whole-branch review of 685e6d9e): this is the
+    // exact branch item 1's bug lives in -- "original wins over its own
+    // backup". Before the fix, ProcessRpcResponse read C09-C16 and
+    // rsp_size through `accessor.latency_trace_handle()` (== Controller
+    // ::_lt_handle), which by the time the ORIGINAL's response arrives
+    // here has already been repointed at the BACKUP (IssueRPC repoints
+    // it the moment it allocates the backup's slot, well before this
+    // response comes back). So those eight stamps landed on `backup`
+    // instead of `original`: `original`'s C09-C16 stayed zero (failing
+    // the non-zero check below) while `backup` -- an attempt that never
+    // received anything -- ended up with a fully plausible, internally
+    // self-consistent set of receive-side timestamps that were actually
+    // the winning response's. This test previously asserted only
+    // error_code on each record, which is exactly why the bug survived:
+    // neither of those assertions can see a receive-side stamp landing
+    // on the wrong record. Check `original` -- the actual winner --
+    // against its own server-side record using
+    // AssertPerRecordCoreInvariants, not the full
+    // AssertAllWeightBearingInvariants: this test's server has the
+    // original's AND the backup's requests in flight at once (that is
+    // the whole point of a backup request), so outstanding=1 does not
+    // hold here and design doc sec.10.1's decomposition-item/link-time
+    // check does not apply (see AssertPerRecordCoreInvariants's
+    // comment). The three checks that DO still apply regardless of
+    // concurrency -- every point non-zero, monotonic, C09>=C08 -- are
+    // exactly the ones item 1's bug breaks: a receive-side stamp landing
+    // on the wrong record leaves the RIGHT record's C09-C16 at zero
+    // (failing non-zero) while leaving the WRONG record internally
+    // monotonic and self-consistent, which is precisely why this needs
+    // to be checked on `original` specifically, not `backup`.
+    const brpc::LatencyTraceRecord* original_srv =
+        FindServerRecordForTraceId(original->trace_id);
+    ASSERT_TRUE(original_srv != nullptr)
+        << "no server record shares the original attempt's trace_id";
+    AssertPerRecordCoreInvariants(original, original_srv);
+
     server.Stop(0);
     server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// Fix-round item 2 (whole-branch review of 685e6d9e): Socket::Write(
+// SocketMessagePtr<>&, ...) -- used by stream/h2/RTMP/packet_guard
+// writes, i.e. anything that packs into a SocketMessage rather than an
+// IOBuf -- never initialized req->lt_handle. `req` comes from butil::
+// get_object<WriteRequest>(), a process-wide pool this test's own
+// process has already put plenty of traffic through by the time this
+// runs (every earlier RPC-based test above writes through the sibling
+// IOBuf overload, which correctly sets req->lt_handle to a REAL handle
+// on every call), so the very next WriteRequest object this test's
+// SocketMessagePtr<> write receives from that pool is essentially
+// guaranteed to already hold some earlier test's real, non-zero handle
+// -- not the indeterminate-but-probably-zero value a truly fresh object
+// would have. Two things make that handle certainly WRONG for this
+// test, not merely different: (1) it names a record from a trace-buffer
+// generation the ResetForTest() call just below has already
+// invalidated -- LatencyTraceBuffer's generation guard makes Stamp()/
+// StampAt() on it a silent no-op rather than a crash, which is
+// precisely why this bug was easy to miss in practice; (2) even in the
+// FLAGS_latency_trace_enabled==false case this file's other tests
+// sometimes exercise, it is simply memory this write has no business
+// touching. Either way, the enqueue stamp -- taken synchronously inside
+// Socket::Write(), before any actual I/O; see the LT_STAMP call
+// immediately after where item 2 adds `req->lt_handle = opt.lt_handle;`
+// -- never reaches this write's own, correctly-allocated record unless
+// that line runs.
+class LatencyTraceRawSocketMessage : public brpc::SocketMessage {
+public:
+    LatencyTraceRawSocketMessage(const char* str, size_t len)
+        : _str(str), _len(len) {}
+private:
+    butil::Status AppendAndDestroySelf(butil::IOBuf* out_buf, brpc::Socket*) override {
+        out_buf->append(_str, _len);
+        delete this;
+        return butil::Status::OK();
+    }
+    const char* _str;
+    size_t _len;
+};
+
+TEST(LatencyTraceMetaTest, SocketMessagePathInitializesLtHandle) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+
+    const brpc::LatencyTraceHandle h = b->AllocSlot(0x5A5AULL, brpc::LT_ROLE_CLIENT);
+    ASSERT_NE(brpc::LT_INVALID_HANDLE, h);
+
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    brpc::SocketId id = 0;
+    butil::EndPoint dummy;
+    ASSERT_EQ(0, str2endpoint("192.168.1.26:8080", &dummy));
+    brpc::SocketOptions options;
+    options.fd = fds[1];
+    options.remote_side = dummy;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr s;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &s));
+
+    brpc::Socket::WriteOptions wopt;
+    wopt.lt_handle = h;
+    wopt.lt_role = brpc::LT_ROLE_CLIENT;
+    brpc::SocketMessagePtr<LatencyTraceRawSocketMessage> msg(
+        new LatencyTraceRawSocketMessage("hi", 2));
+    ASSERT_EQ(0, s->Write(msg, &wopt));
+
+    const brpc::LatencyTraceRecord* rec = b->GetForTest(h);
+    ASSERT_TRUE(rec != nullptr);
+    ASSERT_GT(rec->ts[brpc::LT_C_WRITE_ENQUEUE], 0u)
+        << "Socket::Write(SocketMessagePtr<>&, ...) never set "
+           "req->lt_handle, so the enqueue stamp (taken synchronously, "
+           "before any I/O) never reached this write's own record";
+
+    s.reset();
+    close(fds[0]);
     brpc::FLAGS_latency_trace_enabled = false;
 }
 

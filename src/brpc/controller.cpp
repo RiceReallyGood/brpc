@@ -1505,6 +1505,21 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
             rec->attempt = (uint8_t)_current_call.nretry;
         }
         LT_STAMP(h, LT_C_RPC_START);
+        // Fix-round item 3: `_serialize_request` runs exactly once, in
+        // Channel::CallMethod, for attempt 0 -- this attempt (nretry > 0)
+        // reuses that already-serialized request body and never calls it
+        // again, so there is no second C02/C03 pair to stamp at their
+        // usual call site. Without *some* write here, C02 and C03 stay 0
+        // on every retried/backed-up attempt's record: monotonicity and
+        // the every-point-non-zero check (spec sec.10.1) both fail on
+        // exactly the winning-attempt records this tool exists to
+        // explain (spec sec.9.1 merge.py then discards them outright).
+        // Stamp both back-to-back with C01, right after it: this is not
+        // approximating an unknown serialization time, it is recording
+        // the true fact for this attempt -- zero-length, because no
+        // serialization happened here.
+        LT_STAMP(h, LT_C_REQ_PAYLOAD_SER_START);
+        LT_STAMP(h, LT_C_REQ_PAYLOAD_SER_END);
     }
 #endif
 

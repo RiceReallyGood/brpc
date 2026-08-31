@@ -129,10 +129,22 @@ static uint64_t NextPowerOfTwo(uint64_t v) {
     return r;
 }
 
+// CLOCK_REALTIME, in nanoseconds since the Epoch. Distinct from
+// butil::monotonic_time_ns() (CLOCK_MONOTONIC, boot-relative): this one is
+// for LatencyTraceFileHeader's cross-host sanity-check pair, never for the
+// frequency calibration in Dump(), which must stay on CLOCK_MONOTONIC to
+// be immune to wall-clock adjustments.
+static int64_t RealtimeNowNs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
 LatencyTraceBuffer::LatencyTraceBuffer()
     : _dropped(0), _stop_when_full(true), _per_shard_capacity(0),
       _head_counter(butil::detail::clock_cycles()),
-      _head_realtime_ns(butil::monotonic_time_ns()),
+      _head_monotonic_ns(butil::monotonic_time_ns()),
+      _head_realtime_ns(RealtimeNowNs()),
       _process_tag(MakeProcessTag()),
       _atexit_registered(false) {
     ResetForTest(FLAGS_latency_trace_capacity);
@@ -466,14 +478,14 @@ static uint64_t ReadCntfrqHz() {
 }
 
 int LatencyTraceBuffer::Dump(const char* path) {
-    // Calibration window minimum: freq = Δcounter / Δrealtime, and a
+    // Calibration window minimum: freq = Δcounter / Δmonotonic, and a
     // window of only a few microseconds (e.g. ResetForTest() immediately
     // followed by Dump() in a unit test) makes that quotient pure noise.
     // Top the window up to at least 100ms before sampling the tail pair.
     // On a real dump-at-exit path this never triggers -- a process that
     // has run RPCs has been alive far longer than 100ms already.
     const int64_t kMinWindowNs = 100 * 1000000LL;
-    int64_t elapsed_ns = butil::monotonic_time_ns() - _head_realtime_ns;
+    int64_t elapsed_ns = butil::monotonic_time_ns() - _head_monotonic_ns;
     if (elapsed_ns < kMinWindowNs) {
         const int64_t remain_ns = kMinWindowNs - elapsed_ns;
         struct timespec ts;
@@ -482,7 +494,10 @@ int LatencyTraceBuffer::Dump(const char* path) {
         nanosleep(&ts, nullptr);
     }
     const uint64_t tail_counter = butil::detail::clock_cycles();
-    const int64_t tail_realtime_ns = butil::monotonic_time_ns();
+    const int64_t tail_monotonic_ns = butil::monotonic_time_ns();
+    // Sampled adjacent to the monotonic tail, purely for the cross-host
+    // pair below -- not part of the frequency calibration.
+    const int64_t tail_realtime_ns = RealtimeNowNs();
 
     LatencyTraceFileHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -490,12 +505,14 @@ int LatencyTraceBuffer::Dump(const char* path) {
     hdr.record_size = (uint32_t)sizeof(LatencyTraceRecord);
     hdr.point_count = (uint32_t)LT_POINT_COUNT;
     hdr.head_counter = _head_counter;
-    hdr.head_realtime_ns = _head_realtime_ns;
+    hdr.head_monotonic_ns = _head_monotonic_ns;
     hdr.tail_counter = tail_counter;
+    hdr.tail_monotonic_ns = tail_monotonic_ns;
+    hdr.head_realtime_ns = _head_realtime_ns;
     hdr.tail_realtime_ns = tail_realtime_ns;
     const double dt_counter = (double)(tail_counter - _head_counter);
-    const double dt_realtime_ns = (double)(tail_realtime_ns - _head_realtime_ns);
-    hdr.counter_freq_hz = dt_counter * 1e9 / dt_realtime_ns;
+    const double dt_monotonic_ns = (double)(tail_monotonic_ns - _head_monotonic_ns);
+    hdr.counter_freq_hz = dt_counter * 1e9 / dt_monotonic_ns;
     hdr.cntfrq_el0_hz = ReadCntfrqHz();
     // record_count and method_table_offset are filled in AFTER the write
     // loop below, from the count of records actually fwritten -- not

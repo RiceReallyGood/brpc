@@ -179,9 +179,27 @@ struct LatencyTraceRecord {
     // counter ticks once per ~10ns, so ts[LT_C_RPC_START] == 0 (offset
     // exactly 0) is a likely outcome of a perfectly correct capture on
     // the client, which would collide with the "not stamped" sentinel.
-    // Consumers -- including merge.py -- must subtract 1 from a non-zero
-    // entry to recover the real offset. See LatencyTraceBuffer::Stamp()/
-    // StampAt() (and design doc sec.8.1) for the full reasoning.
+    //
+    // Full decode rule -- three reserved values, everything else is
+    // "offset + 1" (design doc sec.8.1/9.1 has the authoritative table):
+    //   0          -- never stamped. Skip the point; do NOT treat as
+    //                 offset 0.
+    //   0xFFFFFFFF -- LT_TS_NOT_APPLICABLE: this point does not exist
+    //                 under this record's mode (e.g. RDMA polling-mode
+    //                 receive points, design doc sec.8.5). Not a
+    //                 subtrahend candidate either -- do NOT decrement.
+    //   0xFFFFFFFE -- offset saturated: the real interval is >= the
+    //                 uint32 offset range (~42.9s at 100MHz). Treat as a
+    //                 lower bound, not an exact value. Do NOT decrement.
+    //   anything else -- real offset is (value - 1). Consumers --
+    //                 including merge.py -- must subtract 1 to recover
+    //                 it, and must do so ONLY for this last case: both
+    //                 sentinels above are non-zero and must NOT be
+    //                 decremented, or 0xFFFFFFFF..0xFFFFFFFE silently
+    //                 becomes 0xFFFFFFFE..0xFFFFFFFD -- wrong on its own,
+    //                 and it also collides the two sentinels' meanings
+    //                 ("does not exist" vs. "took ~42.9s or longer").
+    // See LatencyTraceBuffer::Stamp()/StampAt() for the encoding side.
     uint32_t ts[LT_POINT_COUNT];
     uint32_t socket_id;
     uint32_t remote_ip;
@@ -194,7 +212,23 @@ struct LatencyTraceRecord {
     uint8_t  attempt;        // retry / backup-request index
 };
 
-const uint64_t LT_FILE_MAGIC = 0x4252504C54524331ULL;  // "BRPCLTRC1"
+// LatencyTraceRecord is ~99% of every dump's bytes and, like the file
+// header above, is parsed off disk verbatim by merge.py. Unlike the file
+// header, it previously had no compile-time size pin -- only a runtime
+// ASSERT_EQ in a unit test that exists solely in traced (BRPC_LATENCY_TRACE)
+// builds, so a size regression would only show up if that specific test
+// build happened to run. Pin it the same way as the header, unconditionally.
+static_assert(sizeof(LatencyTraceRecord) == 200,
+              "LatencyTraceRecord is an on-disk format merge.py parses "
+              "verbatim -- it must stay exactly 200 bytes");
+
+// Spells "BRPLTRC1" -- 8 bytes, no 'C' after "BRP" -- when read as the
+// big-endian byte sequence that literal actually encodes. This file
+// format is little-endian (matches every target this module ships on:
+// x86_64 and aarch64), so the bytes actually on disk, in file order, are
+// "1CRTLPRB". A parser must byteswap this constant (or compare against
+// b'1CRTLPRB', never b'BRPCLTRC1') on an LE host.
+const uint64_t LT_FILE_MAGIC = 0x4252504C54524331ULL;
 
 // 128 bytes, fixed. merge.py parses this verbatim.
 struct LatencyTraceFileHeader {
@@ -202,11 +236,22 @@ struct LatencyTraceFileHeader {
     uint32_t record_size;
     uint32_t point_count;
     // Empirical calibration: freq = (tail_counter - head_counter)
-    //                             * 1e9 / (tail_realtime_ns - head_realtime_ns)
+    //                             * 1e9 / (tail_monotonic_ns - head_monotonic_ns)
+    // head_monotonic_ns/tail_monotonic_ns hold CLOCK_MONOTONIC (boot-relative
+    // on this host, NOT comparable across hosts). That is deliberate, not a
+    // bug: computing a rate from two same-host samples is exactly what
+    // CLOCK_MONOTONIC is for, and it is immune to wall-clock adjustments
+    // (NTP steps, etc.) that would corrupt this calibration.
+    // head_realtime_ns/tail_realtime_ns below hold CLOCK_REALTIME (wall
+    // clock, Epoch-relative) purely so an offline tool can sanity-check two
+    // dumps from two different hosts against each other -- do not use them
+    // for the frequency calibration above.
     uint64_t head_counter;
-    int64_t  head_realtime_ns;
+    int64_t  head_monotonic_ns;
     uint64_t tail_counter;
-    int64_t  tail_realtime_ns;
+    int64_t  tail_monotonic_ns;
+    int64_t  head_realtime_ns;    // CLOCK_REALTIME; cross-host sanity check only
+    int64_t  tail_realtime_ns;    // CLOCK_REALTIME; cross-host sanity check only
     double   counter_freq_hz;     // authoritative, empirically measured
     uint64_t cntfrq_el0_hz;       // cross-check only; 0 on non-aarch64
     uint64_t record_count;
@@ -218,7 +263,7 @@ struct LatencyTraceFileHeader {
     // LatencyTraceRecord::method_id == i + 1 -- id 0 is never assigned (see
     // LatencyTraceMethodId), so it is intentionally absent from this table.
     uint64_t method_table_offset;
-    char     padding[128 - 96];
+    char     padding[128 - 112];
 };
 
 // merge.py parses this struct byte-for-byte off disk; a silent size or
@@ -345,10 +390,17 @@ private:
     int _per_shard_capacity;
 
     // Calibration anchor, sampled once at construction. Dump() pairs this
-    // with a freshly-sampled tail (counter, realtime) to compute an
+    // with a freshly-sampled tail (counter, monotonic) to compute an
     // empirical counter frequency -- see Dump()'s comment for why the
-    // window has a 100ms minimum.
+    // window has a 100ms minimum. CLOCK_MONOTONIC, not CLOCK_REALTIME:
+    // this is a same-host rate calculation and must not be perturbed by
+    // wall-clock adjustments. See LatencyTraceFileHeader for the
+    // CLOCK_REALTIME pair recorded purely for cross-host sanity checks.
     uint64_t _head_counter;
+    int64_t _head_monotonic_ns;
+    // CLOCK_REALTIME sampled adjacent to _head_monotonic_ns, purely for
+    // LatencyTraceFileHeader's cross-host sanity-check pair -- never used
+    // in the frequency calibration, which stays on _head_monotonic_ns.
     int64_t _head_realtime_ns;
     uint64_t _process_tag;
 
@@ -358,9 +410,18 @@ private:
 
 }  // namespace brpc
 
-// Compile-time switch. When BRPC_LATENCY_TRACE is not defined, every hook
-// vanishes and the library is byte-for-byte equivalent to an untraced
-// build -- including sizeof(Socket::WriteRequest) == 64.
+// Compile-time switch. When BRPC_LATENCY_TRACE is not defined, LT_STAMP
+// and LT_ALLOC vanish to no-ops, struct layouts affected by the switch
+// (Socket::WriteRequest, RpcMeta's request-carrier wrapper, etc.) revert
+// to their pre-feature sizes -- e.g. sizeof(Socket::WriteRequest) == 64 --
+// and every hot path is identical to an untraced build: zero stamps
+// execute. This is NOT a claim that the default library is byte-for-byte
+// identical to a pre-feature build. `latency_trace.cpp` has no top-level
+// `#if defined(BRPC_LATENCY_TRACE)` guard and is swept up by the default
+// build's `src/brpc/*.cpp` glob, so the module still links into every
+// default build, registers its (inert) gflags -- visible, doing nothing,
+// in every server's /flags -- and `RpcRequestMeta` still gains its
+// `latency_trace_id` field in every build, traced or not.
 #if defined(BRPC_LATENCY_TRACE)
 #define LT_STAMP(handle, point)                                    \
     ::brpc::LatencyTraceBuffer::instance()->Stamp((handle), (point))

@@ -73,10 +73,51 @@ public:
     LatencyTraceHandle latency_trace_handle() const {
         return _cntl->_lt_handle;
     }
+
+    // Fix-round item 1: resolve the handle for the Call that actually
+    // produced a given wire response, instead of `_cntl->_lt_handle`
+    // (which only gets repointed at the winning attempt later, inside
+    // EndRPC -> Call::OnComplete(end_of_rpc=true) -- see fix-round item 2's
+    // comment on that function). ProcessRpcResponse runs BEFORE that
+    // repoint, so reading `_lt_handle` there names whichever attempt
+    // IssueRPC allocated most recently, not necessarily the one whose
+    // response this is: with backup requests, "original wins over its own
+    // backup" is exactly the case where those two differ (this response is
+    // for the original, `_lt_handle` already points at the backup that
+    // IssueRPC allocated after it).
+    //
+    // `Call::id()` is `_correlation_id.value + nretry + 1` (see
+    // Controller::get_id()), and that id is what goes out on the wire and
+    // comes back as `meta.correlation_id()` -- so subtracting it back out
+    // gives the attempt index without needing any new wire field. Walk
+    // `_current_call` and `_unfinished_call` (there are never more than
+    // these two live attempts at once, see the class comment on
+    // `_unfinished_call`) and return whichever one's `nretry` matches.
+    LatencyTraceHandle latency_trace_handle_for_response(
+            int64_t correlation_id) const {
+        const int nretry =
+            (int)(correlation_id - _cntl->_correlation_id.value - 1);
+        if (_cntl->_current_call.nretry == nretry) {
+            return _cntl->_current_call.lt_handle;
+        }
+        if (_cntl->_unfinished_call != nullptr &&
+            _cntl->_unfinished_call->nretry == nretry) {
+            return _cntl->_unfinished_call->lt_handle;
+        }
+        // No live attempt matches (e.g. a response for an attempt that has
+        // already been superseded and had its Call destroyed). Fall back
+        // to the Controller-level handle rather than silently dropping the
+        // stamp; this mirrors the handle's own generation guard, which
+        // will refuse the write if the slot has meanwhile been recycled.
+        return _cntl->_lt_handle;
+    }
 #else
     void set_latency_trace(uint64_t /*trace_id*/, LatencyTraceHandle /*h*/) {}
     uint64_t latency_trace_id() const { return 0; }
     LatencyTraceHandle latency_trace_handle() const { return LT_INVALID_HANDLE; }
+    LatencyTraceHandle latency_trace_handle_for_response(int64_t) const {
+        return LT_INVALID_HANDLE;
+    }
 #endif
 
     ControllerPrivateAccessor &set_peer_id(SocketId peer_id) {

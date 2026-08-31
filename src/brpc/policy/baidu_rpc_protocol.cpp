@@ -1098,6 +1098,19 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
     
     ControllerPrivateAccessor accessor(cntl);
 #if defined(BRPC_LATENCY_TRACE)
+    // Fix-round item 1: `accessor.latency_trace_handle()` (== _lt_handle)
+    // is only repointed at the attempt that WINS the RPC, and that repoint
+    // happens later, inside EndRPC -> Call::OnComplete(end_of_rpc=true) --
+    // this function runs before it. With retries or backup requests, this
+    // response may belong to a DIFFERENT attempt than whichever one
+    // `_lt_handle` currently names (e.g. the original's response arriving
+    // after IssueRPC has already allocated a backup's slot and repointed
+    // `_lt_handle` there). Resolve the record from the response's own
+    // attempt -- via `meta.correlation_id()`, which is exactly
+    // `Call::id()` for whichever Call sent this request -- instead. All
+    // C09-C16 and `rsp_size` stamps below use this single resolved handle.
+    const LatencyTraceHandle lt_response_handle =
+        accessor.latency_trace_handle_for_response(meta.correlation_id());
     {
         // C09-C12: historical values sampled before this handle existed
         // (parked on Socket / InputMessageBase by Task 9). C13-C14: the two
@@ -1105,7 +1118,7 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         // became available once bthread_id_lock() above succeeded. Mirrors
         // ProcessRpcRequest's S01-S06 handling.
         LatencyTraceBuffer* lt_buffer = LatencyTraceBuffer::instance();
-        const LatencyTraceHandle lt_handle = accessor.latency_trace_handle();
+        const LatencyTraceHandle lt_handle = lt_response_handle;
         lt_buffer->StampAt(lt_handle, LT_C_WAKE, msg->lt_wake());
         lt_buffer->StampAt(lt_handle, LT_C_ONEDGE_START, msg->lt_onedge_start());
         lt_buffer->StampAt(lt_handle, LT_C_READV_START, msg->lt_readv_start());
@@ -1149,7 +1162,7 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
 #if defined(BRPC_LATENCY_TRACE)
         {
             LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(
-                accessor.latency_trace_handle());
+                lt_response_handle);
             if (lt_rec != nullptr) {
                 lt_rec->rsp_size = (uint32_t)res_size;
             }
@@ -1178,7 +1191,7 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         cntl->set_response_checksum_attachment(meta.checksum_with_attachment());
         accessor.set_checksum_value(meta.checksum_value());
 #if defined(BRPC_LATENCY_TRACE)
-        LT_STAMP(accessor.latency_trace_handle(), LT_C_RSP_PAYLOAD_DESER_START);
+        LT_STAMP(lt_response_handle, LT_C_RSP_PAYLOAD_DESER_START);
 #endif
         if (cntl->response()) {
             // response_attachment() has already been filled in above (swapped
@@ -1205,7 +1218,7 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
             }
         } // else silently ignore the response.
 #if defined(BRPC_LATENCY_TRACE)
-        LT_STAMP(accessor.latency_trace_handle(), LT_C_RSP_PAYLOAD_DESER_END);
+        LT_STAMP(lt_response_handle, LT_C_RSP_PAYLOAD_DESER_END);
 #endif
     } while (0);
     // Unlocks correlation_id inside. Revert controller's
