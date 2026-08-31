@@ -134,6 +134,22 @@ const LatencyTraceHandle LT_INVALID_HANDLE = 0;
 //                 different ("not applicable" vs. "this took forever").
 const uint32_t LT_TS_NOT_APPLICABLE = 0xFFFFFFFFu;
 
+// Sentinel a caller passes as StampAt()'s `raw_counter` to mean "this
+// point does not exist under the current mode" -- design doc sec.8.5:
+// under RDMA's polling mode (-rdma_use_polling) there is neither an
+// epoll wake-up nor an OnEdge bthread switch, so Socket::_lt_wake and
+// Socket::_lt_onedge_start (both raw uint64_t counter samples, not yet
+// encoded ts[] offsets) have no real value to hold. StampAt() recognizes
+// this exact 64-bit value and writes LT_TS_NOT_APPLICABLE into ts[point]
+// verbatim instead of computing offset = raw_counter - base_counter from
+// it. All ones rather than (uint64_t)LT_TS_NOT_APPLICABLE (which would
+// only occupy the low 32 bits): a real clock_cycles() reading equal to
+// that smaller value is a plausible (if early) counter state -- roughly
+// 43 seconds after boot at 100MHz -- so it must not be reinterpreted as
+// this sentinel. All 64 bits set is not a real counter reading on any
+// timescale this project cares about.
+const uint64_t LT_RAW_NOT_APPLICABLE = ~static_cast<uint64_t>(0);
+
 // Fixed-size POD, 200 bytes. Timestamps encode counter deltas (offset+1;
 // see `ts` below) relative to `base_counter`; conversion to nanoseconds
 // happens offline.

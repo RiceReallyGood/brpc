@@ -329,6 +329,18 @@ void LatencyTraceBuffer::StampAt(LatencyTraceHandle h, int point,
     if (r->ts[point] != 0) {
         return;
     }
+    // The caller (RDMA's PollCq under -rdma_use_polling; see design doc
+    // sec.8.5) is not reporting a historical sample here -- it is
+    // reporting that this point has no physical existence under the
+    // current mode. Write the sentinel verbatim rather than falling into
+    // the offset arithmetic below: LT_RAW_NOT_APPLICABLE is all-ones, so
+    // `raw_counter >= r->base_counter` below would hold, and the huge
+    // resulting "offset" would saturate to 0xFFFFFFFE ("took forever") --
+    // a different, wrong claim from "does not exist".
+    if (raw_counter == LT_RAW_NOT_APPLICABLE) {
+        r->ts[point] = LT_TS_NOT_APPLICABLE;
+        return;
+    }
     // `raw_counter` is a *historical* sample taken before this record's
     // handle existed (e.g. a Socket wake-up recorded ahead of the slot
     // that will end up describing it). AllocSlot's 3-argument overload

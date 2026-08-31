@@ -33,6 +33,10 @@
 #include "brpc/rdma_transport.h"
 #include "brpc/rdma/rdma_handshake.h"
 #include "brpc/rdma/rdma_handshake_constants.h"
+#if defined(BRPC_LATENCY_TRACE)
+#include "brpc/latency_trace.h"
+#include "butil/time.h"           // butil::detail::clock_cycles
+#endif
 
 DECLARE_int32(task_group_ntags);
 
@@ -1479,6 +1483,31 @@ void RdmaEndpoint::PollCq(Socket* m) {
     auto* rdma_transport = static_cast<RdmaTransport*>(s->_transport.get());
     CHECK(ep == rdma_transport->_rdma_ep);
 
+#if defined(BRPC_LATENCY_TRACE)
+    // Design doc sec.8.5: RDMA's data plane does not go through
+    // InputMessenger::OnNewMessages, so `wake`/`onedge_start` cannot rely
+    // on Transport::OnEdge's generic stamp (that stamps `m`, the
+    // dedicated CQ socket the epoll wakeup lands on, not `s`, the actual
+    // RDMA data socket that ProcessNewMessage is called on below and
+    // whose _lt_wake/_lt_onedge_start are what actually get read).
+    //
+    // Under -rdma_use_polling a standalone poller thread calls this
+    // function directly in a loop: there is no epoll wake-up and no
+    // OnEdge bthread switch, so neither point physically exists. Mark
+    // both with the not-applicable sentinel rather than leaving them at
+    // 0 (which would read as "never stamped", i.e. an instrumentation
+    // bug) or stamping a bogus "now" (which would read as a real,
+    // vanishingly small duration).
+    if (FLAGS_rdma_use_polling) {
+        s->_lt_wake = LT_RAW_NOT_APPLICABLE;
+        s->_lt_onedge_start = LT_RAW_NOT_APPLICABLE;
+    } else {
+        // Event mode: PollCq is itself the OnEdge callback, so its entry
+        // IS the onedge_start point.
+        s->_lt_onedge_start = butil::detail::clock_cycles();
+    }
+#endif
+
     bool send = false;
     ibv_cq* cq = ep->_resource->recv_cq;
 
@@ -1486,6 +1515,11 @@ void RdmaEndpoint::PollCq(Socket* m) {
         if (ep->GetAndAckEvents(s) < 0) {
             return;
         }
+#if defined(BRPC_LATENCY_TRACE)
+        // `wake` is the moment the epoll wakeup was consumed and
+        // acknowledged -- the RDMA analogue of epoll_wait() returning.
+        s->_lt_wake = butil::detail::clock_cycles();
+#endif
     } else {
         // Polling is considered as non-send, so no need to change `send'.
         // Only need to poll polling_cq.
@@ -1497,6 +1531,9 @@ void RdmaEndpoint::PollCq(Socket* m) {
     InputMessageClosure last_msg;
     ibv_wc wc[FLAGS_rdma_cqe_poll_once];
     while (true) {
+#if defined(BRPC_LATENCY_TRACE)
+        s->_lt_readv_start = butil::detail::clock_cycles();
+#endif
         int cnt = ibv_poll_cq(cq, FLAGS_rdma_cqe_poll_once, wc);
         if (cnt < 0) {
             const int saved_errno = errno;

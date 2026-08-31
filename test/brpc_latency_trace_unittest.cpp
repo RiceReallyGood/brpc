@@ -1756,6 +1756,131 @@ TEST(LatencyTraceMetaTest, DumpMethodTableResolvesRecordedMethodId) {
     brpc::FLAGS_latency_trace_enabled = false;
 }
 
+// Task 12: the RDMA receive path. Design doc sec.8.5 -- RDMA's data plane
+// does not go through InputMessenger::OnNewMessages at all. A dedicated CQ
+// socket's edge-triggered callback is RdmaEndpoint::PollCq
+// (src/brpc/rdma/rdma_endpoint.cpp), which only rejoins the TCP path at the
+// shared ProcessNewMessage() call (already covered by Task 9's threading of
+// Socket::_lt_wake/_lt_onedge_start/_lt_readv_start through
+// InputMessageBase). Under -rdma_use_polling a standalone poller thread
+// calls PollCq directly in a loop: there is no epoll wake-up and no OnEdge
+// bthread switch, so `wake`/`onedge_start` do not physically exist and must
+// carry LT_TS_NOT_APPLICABLE rather than a bogus zero or a bogus "now".
+//
+// Requires real (or Soft-RoCE) RDMA hardware reachable at -lt_rdma_test_ip
+// -- the loopback address does not reach an RDMA NIC (rxe0 is bound to the
+// physical interface, not `lo`). Defaults to the verified suzhou950
+// Soft-RoCE address; override (or point elsewhere) with the flag.
+//
+// The flag/DECLARE below must sit directly in `namespace brpc`/`namespace
+// brpc::rdma` (matching how this file's own DECLAREs at the top do it, for
+// the same reason -- see the comment there), so this closes the anonymous
+// namespace wrapping the rest of this file, declares them at the right
+// scope, then reopens it: a no-op for everything else already in the file.
+}  // namespace
+
+#if BRPC_WITH_RDMA
+namespace brpc {
+DEFINE_string(lt_rdma_test_ip, "192.168.25.145",
+              "IP of an RDMA-capable NIC (Soft-RoCE or real) to bind the "
+              "RDMA receive-path test's server/client to. 127.0.0.1 does "
+              "NOT work -- the RDMA device is bound to a physical NIC.");
+}  // namespace brpc
+namespace brpc { namespace rdma {
+DECLARE_bool(rdma_use_polling);
+} }  // namespace brpc::rdma
+#endif  // BRPC_WITH_RDMA
+
+namespace {
+
+#if BRPC_WITH_RDMA
+
+class LatencyTraceRdmaEchoServiceImpl : public test::EchoService {
+public:
+    void Echo(google::protobuf::RpcController* cntl_base,
+              const test::EchoRequest* request,
+              test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        response->set_message(request->message());
+    }
+};
+
+TEST(LatencyTraceRdmaTest, ReceivePathStampsWakeOnedgeReadv) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    char addr[64];
+    snprintf(addr, sizeof(addr), "%s:9539", brpc::FLAGS_lt_rdma_test_ip.c_str());
+
+    brpc::Server server;
+    LatencyTraceRdmaEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions sopt;
+    sopt.socket_mode = brpc::SOCKET_MODE_RDMA;
+    ASSERT_EQ(0, server.Start(addr, &sopt));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions copt;
+    copt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    copt.socket_mode = brpc::SOCKET_MODE_RDMA;
+    ASSERT_EQ(0, channel.Init(addr, &copt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    req.set_message("hello-rdma");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+    const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
+    ASSERT_TRUE(s != nullptr);
+
+    // readv_start exists in both modes -- see design doc sec.8.5's table.
+    ASSERT_GT(s->ts[brpc::LT_S_READV_START], 0u);
+    ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_READV_START]);
+
+    if (brpc::rdma::FLAGS_rdma_use_polling) {
+        // Sec.8.5: no epoll wake-up, no OnEdge bthread switch under
+        // polling -- these two points do not exist, so merge.py can mark
+        // the four receive-queueing decomposition items N/A instead of
+        // reading them as missing instrumentation.
+        ASSERT_EQ(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_WAKE]);
+        ASSERT_EQ(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_ONEDGE_START]);
+    } else {
+        ASSERT_GT(s->ts[brpc::LT_S_WAKE], 0u);
+        ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_WAKE]);
+        ASSERT_GT(s->ts[brpc::LT_S_ONEDGE_START], 0u);
+        ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_ONEDGE_START]);
+        ASSERT_LE(s->ts[brpc::LT_S_WAKE], s->ts[brpc::LT_S_ONEDGE_START]);
+        ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READV_START]);
+    }
+
+    server.Stop(0);
+    server.Join();
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+#endif  // BRPC_WITH_RDMA
+
 #endif  // defined(BRPC_LATENCY_TRACE)
 
 }  // namespace
+
+// Every other test in this file drives brpc::FLAGS_* directly from C++
+// (see e.g. brpc::FLAGS_latency_trace_enabled above), so the default
+// gtest_main -- InitGoogleTest() plus RUN_ALL_TESTS(), no gflags parsing
+// -- has always been enough. The RDMA receive-path test above is the
+// first one that needs the *process's own command line* honored (the
+// suzhou950 Soft-RoCE recipe drives it via --rdma_use_polling=... and
+// --rdma_memory_pool_*_mb=...; see brpc_rdma_unittest.cpp's own main()
+// for the established pattern this mirrors). Defining main() here is
+// safe alongside the -lgtest_main this binary still links: the linker
+// resolves `main` from this translation unit before it ever needs to
+// pull the matching object out of that archive.
+int main(int argc, char* argv[]) {
+    testing::InitGoogleTest(&argc, argv);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    return RUN_ALL_TESTS();
+}
