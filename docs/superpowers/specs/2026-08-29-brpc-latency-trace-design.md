@@ -338,6 +338,8 @@ link_up = link_down = L / 2
 
 **因此：`AllocSlot` 的三参重载必须拒绝哨兵基准。** 轮询模式下服务端改传 `readv_start`——§8.5 自己的表格已经写明该点位在两种模式下都是真实值。哨兵只属于 `ts[]` 的某一格，永远不属于 `base_counter`。
 
+**一条未被断言保护的隐式耦合**：轮询模式下 `base_counter` 的回退值 `readv_start`、以及事件模式下从 CQ socket 拷来的 `_lt_wake`，都依赖 `InputMessenger::ProcessNewMessage` 里那段把 `Socket` 上的三个字段拷进 `InputMessageBase` 的逻辑 —— TCP 与 RDMA 两条路径调用的是同一份代码。今天成立，但**没有任何断言在守它**，而 RDMA 测试只在有 Soft-RoCE 的机器上跑、不在默认套件里。将来重构那段拷贝逻辑，可能悄无声息地打断 RDMA 侧，而默认 CI 全绿。改动 `ProcessNewMessage` 的人需要知道这条依赖。
+
 **RDMA 事件模式的 `wake` 必须取 CQ socket 上已有的值，不能重新采样。** `Socket::OnInputEvent` 已经在真正的「epoll 返回、尚未分发」时刻把 `_lt_wake` 设好了（与 TCP 走同一套 TLS 机制）。若在 `GetAndAckEvents()` 返回**之后**重新读一次 `clock_cycles()`，得到的时刻晚于 `onedge_start`，与 TCP 的结构顺序相反 —— 而 clamp 会把这个倒挂悄悄抹平成两个 `ts = 1`，于是 `srv_wake_to_onedge` 与 `cli_wake_to_onedge` 这两个主分解项恒为零，且断言 `wake <= onedge_start` 空洞通过。正确做法是把 CQ socket 的 `_lt_wake` **拷贝**过去。
 
 **`ts[]` 的编码约定（三个保留值 + 偏移 + 1）**：
