@@ -90,6 +90,10 @@ fi
 # see which tree you just synced to -- a tree left in the wrong state once
 # stays wrong silently, and has: ~/brpc-lt spent a while configured as a
 # traced build because two earlier tasks reconfigured it in place.
-cfg=$(ssh "$HOST" "grep -q 'BRPC_LATENCY_TRACE=1' \"$DEST\"/config.mk 2>/dev/null \
-        && echo TRACED || { [ -f \"$DEST\"/config.mk ] && echo default || echo 'NOT CONFIGURED'; }")
+cfg=$(ssh "$HOST" "
+    f=\"$DEST\"/config.mk
+    if [ ! -f \"\$f\" ]; then echo 'NOT CONFIGURED'; exit 0; fi
+    grep -q 'BRPC_LATENCY_TRACE=1' \"\$f\" && t=TRACED || t=default
+    grep -q 'BRPC_WITH_RDMA' \"\$f\" && t=\"\$t+rdma\"
+    echo \"\$t\"")
 echo "synced to $HOST:$DEST  [config: $cfg]"
