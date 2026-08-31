@@ -2010,7 +2010,14 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
             LatencyTraceRecord* r =
                 LatencyTraceBuffer::instance()->Get(p->lt_handle);
             if (r != nullptr) {
-                LT_STAMP(p->lt_handle, (r->role == LT_ROLE_SERVER)
+                // Last-write-wins: KeepWrite re-enters DoWrite for a
+                // request that needs more than one writev, and the head
+                // WriteRequest on a later iteration can be this same
+                // still-undrained request. write_start must land on the
+                // attempt that actually drains it -- the last one -- not
+                // the first; see LatencyTraceBuffer::StampLast()'s
+                // comment and design doc sec.10.1.
+                LT_STAMP_LAST(p->lt_handle, (r->role == LT_ROLE_SERVER)
                              ? LT_S_WRITE_START : LT_C_WRITE_START);
             }
         }

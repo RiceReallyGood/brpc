@@ -240,8 +240,18 @@ void EventDispatcher::Run() {
         }
 #if defined(BRPC_LATENCY_TRACE)
         // All N events from one epoll_wait return share this timestamp.
-        // That is the correct semantics: they were one wake-up.
-        tls_lt_epoll_wake = butil::detail::clock_cycles();
+        // That is the correct semantics: they were one wake-up. Captured
+        // into a local here rather than written straight to the TLS,
+        // because Socket::OnInputEvent's bthread_start_urgent() runs the
+        // new bthread immediately on *this* pthread and queues the
+        // dispatcher bthread; when the dispatcher resumes to handle event
+        // 2, 3, ... it may resume on a *different* pthread, whose
+        // tls_lt_epoll_wake holds either zero or a stale value from
+        // another dispatcher (__thread is pthread-local, bthreads
+        // migrate). Each loop iteration below re-arms the TLS from this
+        // local immediately before the callback that reads it, so no
+        // pthread switch can land between the write and the read.
+        const uint64_t lt_wake = butil::detail::clock_cycles();
 #endif
         for (int i = 0; i < n; ++i) {
             if (e[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)
@@ -250,6 +260,9 @@ void EventDispatcher::Run() {
 #endif
                 ) {
                 int64_t start_ns = butil::cpuwide_time_ns();
+#if defined(BRPC_LATENCY_TRACE)
+                tls_lt_epoll_wake = lt_wake;
+#endif
                 // We don't care about the return value.
                 CallInputEventCallback(e[i].data.u64, e[i].events, _thread_attr);
                 (*g_edisp_read_lantency) << (butil::cpuwide_time_ns() - start_ns);

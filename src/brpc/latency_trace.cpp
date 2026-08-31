@@ -334,23 +334,48 @@ void LatencyTraceBuffer::Stamp(LatencyTraceHandle h, int point) {
         return;
     }
     // First-write-wins: a point that already holds a non-zero value keeps
-    // it, and this (necessarily later) write is discarded. This is not
-    // just defensive -- KeepWrite calls DoWrite repeatedly for a request
-    // that needs more than one writev (EAGAIN, backpressure, a batch
-    // capped by DATA_LIST_MAX), and the head WriteRequest on the next
-    // iteration can be the same still-undrained request. Without this
-    // rule, write_start would silently record the *last* attempt instead
-    // of the first, moving real queueing/backpressure time out of
-    // cli_write_queue and into cli_write_syscall. Every point being
-    // written at most once is a property this data structure guarantees,
-    // not something every call site has to remember -- see design doc
-    // sec.10.1. Since ts[] encodes offset+1 (see LatencyTraceRecord::ts),
-    // `0` unambiguously means "not stamped" here -- unlike a raw offset,
-    // it cannot also be a legitimate value this branch would wrongly
-    // treat as "already written".
+    // it, and this (necessarily later) write is discarded. Correct for a
+    // point whose meaning is an instantaneous event -- a second call means
+    // that event fired twice, which is a bug, and the first (correct) one
+    // must not be clobbered by it. NOT every point uses this policy: the
+    // "start of the operation that actually completed this unit" points
+    // (write_start, readv_start) are deliberately re-entered while earlier,
+    // unrelated attempts drain other units ahead of this one in the same
+    // queue -- see StampLast() and design doc sec.10.1 for that pair and
+    // why last-write-wins is the correct policy for them specifically.
+    // Since ts[] encodes offset+1 (see LatencyTraceRecord::ts), `0`
+    // unambiguously means "not stamped" here -- unlike a raw offset, it
+    // cannot also be a legitimate value this branch would wrongly treat as
+    // "already written".
     if (r->ts[point] != 0) {
         return;
     }
+    r->ts[point] = EncodeOffset(butil::detail::clock_cycles() - r->base_counter);
+}
+
+void LatencyTraceBuffer::StampLast(LatencyTraceHandle h, int point) {
+    LatencyTraceRecord* r = Get(h);
+    if (r == nullptr || point < 0 || point >= LT_POINT_COUNT) {
+        return;
+    }
+    // Last-write-wins -- the opposite policy from Stamp(), and just as
+    // deliberate. write_start (Socket::DoWrite, re-entered by KeepWrite
+    // for a request that needs more than one writev -- EAGAIN,
+    // backpressure, a batch capped by DATA_LIST_MAX) and readv_start
+    // (InputMessenger::OnNewMessages, re-entered on every DoRead while the
+    // message being assembled is still incomplete) both name "the start
+    // of the operation that actually completed this unit", not "the first
+    // time this unit's operation was attempted". While a unit sits queued
+    // behind other units ahead of it, earlier attempts serve THOSE units
+    // (or, for reads, service a different, already-complete message
+    // sitting in the same buffer); only the LAST attempt is the one whose
+    // syscall this unit's bytes actually rode. Always overwriting keeps
+    // that final attempt's timestamp, which is the correct boundary
+    // between queueing time and syscall time for this unit -- see design
+    // doc sec.10.1. `base_counter` predates every real sample here (this
+    // is a "now" stamp, not a historical one -- see StampAt() for that
+    // case), so the subtraction below cannot go negative in practice; no
+    // clamp is needed the way StampAt() needs one.
     r->ts[point] = EncodeOffset(butil::detail::clock_cycles() - r->base_counter);
 }
 

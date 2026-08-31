@@ -302,8 +302,27 @@ public:
                                   uint64_t base_counter);
 
     // Silently ignores an invalid or stale handle. First-write-wins: if
-    // ts[point] already holds a non-zero value, this call is a no-op.
+    // ts[point] already holds a non-zero value, this call is a no-op. Use
+    // for points that are instantaneous events -- a second write means
+    // the point fired twice, which is a bug, and the first (correct) one
+    // must not be clobbered. See StampLast() for the opposite policy and
+    // design doc sec.10.1 for which policy applies to which point.
     void Stamp(LatencyTraceHandle h, int point);
+
+    // Like Stamp(), but last-write-wins: unlike Stamp(), a call here
+    // always overwrites whatever `ts[point]` already holds. For points
+    // whose meaning is "the start of the operation that actually
+    // completed this unit" rather than "an instantaneous event" --
+    // currently write_start (Socket::DoWrite, re-entered by KeepWrite for
+    // every retried writev) and readv_start (InputMessenger::OnNewMessages,
+    // re-entered on every DoRead of the same still-incomplete message).
+    // A unit sitting behind others queued ahead of it sees the operation
+    // attempted repeatedly; only the LAST attempt is the one that actually
+    // moved *this* unit's bytes, so it is the correct boundary between
+    // "queueing" and "syscall" time for this unit -- see design doc
+    // sec.10.1. Silently ignores an invalid or stale handle, same as
+    // Stamp().
+    void StampLast(LatencyTraceHandle h, int point);
 
     // Like Stamp(), but for a timestamp that was already sampled earlier
     // (e.g. a Socket-level wake-up copied into an InputMessageBase before
@@ -425,10 +444,16 @@ private:
 #if defined(BRPC_LATENCY_TRACE)
 #define LT_STAMP(handle, point)                                    \
     ::brpc::LatencyTraceBuffer::instance()->Stamp((handle), (point))
+// Last-write-wins counterpart of LT_STAMP() -- see
+// LatencyTraceBuffer::StampLast()'s comment for which points use this
+// instead of LT_STAMP().
+#define LT_STAMP_LAST(handle, point)                                \
+    ::brpc::LatencyTraceBuffer::instance()->StampLast((handle), (point))
 #define LT_ALLOC(trace_id, role)                                   \
     ::brpc::LatencyTraceBuffer::instance()->AllocSlot((trace_id), (role))
 #else
 #define LT_STAMP(handle, point) ((void)0)
+#define LT_STAMP_LAST(handle, point) ((void)0)
 #define LT_ALLOC(trace_id, role) (::brpc::LT_INVALID_HANDLE)
 #endif
 

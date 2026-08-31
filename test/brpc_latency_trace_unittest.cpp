@@ -70,7 +70,150 @@ DECLARE_int32(latency_trace_capacity);
 // round's usercode_in_pthread test flips this at runtime; see item 2's
 // test below.
 DECLARE_bool(usercode_in_pthread);
+#if defined(BRPC_LATENCY_TRACE)
+// Defined in event_dispatcher_epoll.cpp with external linkage kept on
+// purpose for exactly this: see the fix-round item 1 test below,
+// EpollWakeIsReArmedBeforeEachCallbackInABatch.
+extern __thread uint64_t tls_lt_epoll_wake;
+#endif
 }  // namespace brpc
+
+#if defined(BRPC_LATENCY_TRACE)
+namespace {
+
+// Fix-round item 1: tls_lt_epoll_wake is `__thread`, so it belongs to a
+// pthread, not to the dispatcher bthread that logically "owns" one
+// epoll_wait() return. Socket::OnInputEvent's bthread_start_urgent()
+// runs the new bthread immediately on the CURRENT pthread and queues the
+// dispatcher bthread; when the dispatcher resumes to process event 2 of
+// N it may resume on a *different* pthread, whose tls_lt_epoll_wake
+// holds a stale or zero value (bthreads migrate, __thread does not). The
+// fix (event_dispatcher_epoll.cpp) re-arms the TLS from a local captured
+// once per epoll_wait() return, immediately before each callback in the
+// for loop, closing the window between the write and the read.
+//
+// A true end-to-end reproduction -- two real Sockets becoming readable
+// at the same instant, racing a real cross-pthread bthread migration in
+// between their callbacks -- is not constructible deterministically:
+// forcing epoll to batch two arbitrary sockets' readiness into one
+// epoll_wait() return is not something userspace can command, and
+// forcing a bthread migration between two specific statements is exactly
+// as underspecified as the race the fix closes. What follows instead
+// exercises the actual modified code in event_dispatcher_epoll.cpp
+// (not a hand-copy of its shape): two fds are made readable and
+// registered before a dedicated EventDispatcher is even Start()ed, so
+// its first epoll_wait() deterministically batches both (n==2) into one
+// Run() loop iteration. The callback for the first event mutates
+// tls_lt_epoll_wake to a sentinel right before returning -- standing in
+// for "a different pthread's stale copy", which is observationally
+// identical to the second callback either way. Without the fix, the
+// second callback reads that sentinel straight back (the TLS was armed
+// once, before the loop, and nothing rewrites it in between). With the
+// fix, the second callback reads the correct, shared wake value again.
+struct LtWakeReArmCtx {
+    std::atomic<int> call_seq{0};
+    std::atomic<bool> done{false};
+    uint64_t observed[2] = {0, 0};
+};
+
+class LtWakeReArmProbe {
+public:
+    static int OnInputEvent(void* user_data, uint32_t /*events*/,
+                             const bthread_attr_t& /*thread_attr*/) {
+        LtWakeReArmCtx* ctx = static_cast<LtWakeReArmCtx*>(user_data);
+        const int idx = ctx->call_seq.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 2) {
+            ctx->observed[idx] = brpc::tls_lt_epoll_wake;
+        }
+        if (idx == 0) {
+            // Stand-in for a different pthread's stale/zero TLS copy --
+            // see the block comment above.
+            brpc::tls_lt_epoll_wake = 0xDEADBEEFULL;
+        } else {
+            ctx->done.store(true, std::memory_order_release);
+        }
+        return 0;
+    }
+    static int OnOutputEvent(void*, uint32_t, const bthread_attr_t&) {
+        return 0;
+    }
+};
+
+}  // namespace
+
+TEST(LatencyTraceEventDispatcherTest,
+     EpollWakeIsReArmedBeforeEachCallbackInABatch) {
+    int fds_a[2] = {-1, -1};
+    int fds_b[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(fds_a));
+    ASSERT_EQ(0, pipe(fds_b));
+
+    // Make both readable BEFORE registering them, and register both
+    // BEFORE Start()ing the dispatcher -- so its very first epoll_wait()
+    // call reports both together, deterministically, instead of racing a
+    // live Run() loop across two separate writes. (AddConsumer uses
+    // EPOLLET, but a fd already readable at ADD time still counts as one
+    // rising edge and is reported on the next epoll_wait().)
+    ASSERT_EQ(1, write(fds_a[1], "a", 1));
+    ASSERT_EQ(1, write(fds_b[1], "b", 1));
+
+    // EventDispatcher::Run() writes through two process-global
+    // bvar::LatencyRecorder pointers that are only allocated by
+    // GetGlobalEventDispatcher()'s pthread_once (InitializeGlobalDispatchers,
+    // event_dispatcher.cpp) -- lazily, on the first Socket/Channel/Server
+    // anywhere in the process. This test deliberately builds its own
+    // standalone EventDispatcher below rather than going through the
+    // global one (see the comment above), which bypasses whatever would
+    // normally have triggered that init first. If this test runs before
+    // any other test in the binary happens to touch a real Socket, those
+    // pointers are still null and Run() would null-deref. Force the
+    // pthread_once here explicitly; the dummy fd/tag arguments are
+    // discarded along with the (real, but unused) global dispatcher
+    // reference -- only the one-time init side effect is wanted.
+    brpc::GetGlobalEventDispatcher(0, BTHREAD_TAG_DEFAULT);
+
+    brpc::EventDispatcher dispatcher;
+    LtWakeReArmCtx ctx;
+    brpc::IOEventDataOptions opts{
+        &LtWakeReArmProbe::OnInputEvent, &LtWakeReArmProbe::OnOutputEvent, &ctx};
+    brpc::IOEventDataId data_id_a = brpc::INVALID_IO_EVENT_DATA_ID;
+    brpc::IOEventDataId data_id_b = brpc::INVALID_IO_EVENT_DATA_ID;
+    ASSERT_EQ(0, brpc::IOEventData::Create(&data_id_a, opts));
+    ASSERT_EQ(0, brpc::IOEventData::Create(&data_id_b, opts));
+    ASSERT_EQ(0, dispatcher.AddConsumer(data_id_a, fds_a[0]));
+    ASSERT_EQ(0, dispatcher.AddConsumer(data_id_b, fds_b[0]));
+
+    ASSERT_EQ(0, dispatcher.Start(nullptr));
+
+    bool completed = false;
+    for (int i = 0; i < 1000; ++i) {  // up to ~2s
+        if (ctx.done.load(std::memory_order_acquire)) {
+            completed = true;
+            break;
+        }
+        usleep(2000);
+    }
+    ASSERT_TRUE(completed) << "both callbacks did not fire within the "
+        "timeout -- see the batching precondition in the comment above "
+        "this test";
+    ASSERT_EQ(2, ctx.call_seq.load())
+        << "test precondition failed: the two events were not delivered "
+           "in the same epoll_wait() batch (n should have been 2), so "
+           "this run cannot exercise the re-arm fix";
+    ASSERT_NE(0u, ctx.observed[0]) << "wake was never armed for event 1";
+    ASSERT_EQ(ctx.observed[0], ctx.observed[1])
+        << "event 2 in the same batch observed a different "
+           "tls_lt_epoll_wake than event 1 -- the TLS was not re-armed "
+           "immediately before its callback, so a value written between "
+           "the two calls (standing in for a cross-pthread migration) "
+           "leaked through";
+
+    close(fds_a[0]);
+    close(fds_a[1]);
+    close(fds_b[0]);
+    close(fds_b[1]);
+}
+#endif  // defined(BRPC_LATENCY_TRACE)
 
 namespace {
 
@@ -116,26 +259,51 @@ TEST_F(LatencyTraceBufferTest, StampWritesNonZeroDelta) {
 }
 
 TEST_F(LatencyTraceBufferTest, StampIsFirstWriteWins) {
-    // The property design doc sec.10.1 requires: a point already holding
-    // a non-zero value is left alone, and a later write is discarded.
-    // This is the fix for a real bug (see fix-round-q1q6 item 2): DoWrite
-    // calls LT_STAMP(write_start) unconditionally on every KeepWrite
-    // iteration, so without this rule a request needing more than one
-    // writev would silently record the *last* attempt's write_start
-    // instead of the first, moving real queueing time into the syscall
-    // bucket.
+    // The property design doc sec.10.1 requires for instantaneous-event
+    // points (the default, and every point except write_start/readv_start
+    // -- see StampLastIsLastWriteWins below for that pair): a point
+    // already holding a non-zero value is left alone, and a later write
+    // is discarded. Using LT_C_RPC_END here deliberately -- an
+    // unambiguous instantaneous event -- rather than write_start, which
+    // now uses StampLast() instead of Stamp() (design doc sec.10.1; a
+    // fix-round correction reversed an earlier, wrong ruling that had
+    // write_start on this first-write-wins path).
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
     const brpc::LatencyTraceHandle h = b->AllocSlot(8, brpc::LT_ROLE_CLIENT);
-    b->Stamp(h, brpc::LT_C_WRITE_START);
-    const uint32_t first = b->GetForTest(h)->ts[brpc::LT_C_WRITE_START];
+    b->Stamp(h, brpc::LT_C_RPC_END);
+    const uint32_t first = b->GetForTest(h)->ts[brpc::LT_C_RPC_END];
 
     // Busy-wait so a second Stamp() call would, if it were not discarded,
     // observe a strictly later (and thus different) counter delta.
     const uint64_t start = butil::detail::clock_cycles();
     while (butil::detail::clock_cycles() - start < 1000) {}
-    b->Stamp(h, brpc::LT_C_WRITE_START);
-    ASSERT_EQ(first, b->GetForTest(h)->ts[brpc::LT_C_WRITE_START])
+    b->Stamp(h, brpc::LT_C_RPC_END);
+    ASSERT_EQ(first, b->GetForTest(h)->ts[brpc::LT_C_RPC_END])
         << "second Stamp() call must be discarded, not overwrite the first";
+}
+
+TEST_F(LatencyTraceBufferTest, StampLastIsLastWriteWins) {
+    // Mirror of StampIsFirstWriteWins above, for the opposite policy.
+    // write_start's meaning is "the start of the operation that actually
+    // completed this unit" -- Socket::DoWrite's lt_stamp_write_start
+    // lambda calls this on every KeepWrite iteration for a request that
+    // needs more than one writev, and only the LAST call's timestamp is
+    // the correct queue/syscall boundary for this request (design doc
+    // sec.10.1). Using LT_C_WRITE_START, the actual production call
+    // site's point, rather than a generic one.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const brpc::LatencyTraceHandle h = b->AllocSlot(9, brpc::LT_ROLE_CLIENT);
+    b->StampLast(h, brpc::LT_C_WRITE_START);
+    const uint32_t first = b->GetForTest(h)->ts[brpc::LT_C_WRITE_START];
+    ASSERT_GT(first, 0u);
+
+    // Busy-wait so the second call observes a strictly later counter
+    // delta if it takes effect.
+    const uint64_t start = butil::detail::clock_cycles();
+    while (butil::detail::clock_cycles() - start < 1000) {}
+    b->StampLast(h, brpc::LT_C_WRITE_START);
+    ASSERT_GT(b->GetForTest(h)->ts[brpc::LT_C_WRITE_START], first)
+        << "second StampLast() call must overwrite the first, not be discarded";
 }
 
 TEST_F(LatencyTraceBufferTest, StampAtWritesHistoricalDeltaIntoRecord) {
@@ -2030,6 +2198,99 @@ TEST(LatencyTraceMetaTest, SocketMessagePathInitializesLtHandle) {
         << "Socket::Write(SocketMessagePtr<>&, ...) never set "
            "req->lt_handle, so the enqueue stamp (taken synchronously, "
            "before any I/O) never reached this write's own record";
+
+    s.reset();
+    close(fds[0]);
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+TEST(LatencyTraceMetaTest, WriteStartReflectsFinalKeepWriteAttempt) {
+    // Fix-round correction to design doc sec.10.1: write_start's meaning
+    // is "the start of the DoWrite attempt that actually drained this
+    // WriteRequest", so KeepWrite re-entering DoWrite for a request that
+    // needs more than one writev must let write_start keep moving forward
+    // to the LAST attempt (LatencyTraceBuffer::StampLast()), not freeze
+    // on the first one. Driven genuinely end-to-end here: a payload large
+    // enough that a AF_UNIX socketpair's kernel buffer cannot absorb it
+    // in one writev, with the peer deliberately not reading for a while,
+    // forces DoWrite to hit EAGAIN and KeepWrite to retry for real.
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(64);
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const brpc::LatencyTraceHandle h = b->AllocSlot(0x1357ULL, brpc::LT_ROLE_CLIENT);
+    ASSERT_NE(brpc::LT_INVALID_HANDLE, h);
+
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    brpc::SocketId id = 0;
+    butil::EndPoint dummy;
+    ASSERT_EQ(0, str2endpoint("192.168.1.27:8080", &dummy));
+    brpc::SocketOptions options;
+    options.fd = fds[1];
+    options.remote_side = dummy;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr s;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &s));
+
+    // Far exceeds default SO_SNDBUF/SO_RCVBUF (typically ~200KB) for an
+    // AF_UNIX socketpair, so a single writev() cannot drain it.
+    const size_t payload_size = 16 * 1024 * 1024;
+    butil::IOBuf iobuf;
+    iobuf.append(std::string(payload_size, 'x'));
+
+    brpc::Socket::WriteOptions wopt;
+    wopt.lt_handle = h;
+    wopt.lt_role = brpc::LT_ROLE_CLIENT;
+
+    const uint64_t t_before_write = butil::detail::clock_cycles();
+    ASSERT_EQ(0, s->Write(&iobuf, &wopt));
+
+    // Deliberately do not read from fds[0] yet: this stalls KeepWrite on
+    // EAGAIN (parked on epoll for EPOLLOUT, not busy-spinning) after its
+    // first, necessarily-partial DoWrite attempt.
+    usleep(150 * 1000);
+
+    const uint64_t t_before_drain = butil::detail::clock_cycles();
+    std::thread reader([&fds, payload_size]() {
+        size_t total = 0;
+        char buf[65536];
+        while (total < payload_size) {
+            ssize_t n = read(fds[0], buf, sizeof(buf));
+            if (n <= 0) {
+                break;
+            }
+            total += (size_t)n;
+        }
+    });
+
+    const brpc::LatencyTraceRecord* rec = b->GetForTest(h);
+    ASSERT_TRUE(rec != nullptr);
+    bool completed = false;
+    for (int i = 0; i < 2000; ++i) {  // up to ~4s
+        if (rec->ts[brpc::LT_C_WRITE_END] != 0) {
+            completed = true;
+            break;
+        }
+        usleep(2000);
+    }
+    reader.join();
+    ASSERT_TRUE(completed) << "write did not complete within the timeout -- "
+        "the payload/buffer-size assumptions this test relies on to force "
+        "a partial write may not hold on this host";
+
+    ASSERT_GT(rec->ts[brpc::LT_C_WRITE_START], 0u);
+    // ts[] stores offset+1 (see LatencyTraceRecord::ts).
+    const uint64_t write_start_raw =
+        rec->base_counter + (rec->ts[brpc::LT_C_WRITE_START] - 1);
+    // The unstalled, real drain could not have completed before we
+    // started reading -- the peer's buffer was full and stayed full for
+    // the entire 150ms hold-off. If write_start had frozen on the first
+    // (necessarily earlier, pre-stall) attempt -- the exact bug
+    // first-write-wins would reintroduce here -- this would fail.
+    ASSERT_GE(write_start_raw, t_before_drain)
+        << "write_start must reflect the final DoWrite attempt, not an "
+           "earlier one frozen in by first-write-wins";
+    ASSERT_GT(write_start_raw, t_before_write);
 
     s.reset();
     close(fds[0]);
