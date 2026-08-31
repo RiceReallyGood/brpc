@@ -1505,6 +1505,19 @@ void RdmaEndpoint::PollCq(Socket* m) {
         // Event mode: PollCq is itself the OnEdge callback, so its entry
         // IS the onedge_start point.
         s->_lt_onedge_start = butil::detail::clock_cycles();
+        // `wake` must be the true pre-dispatch epoll-return moment, not a
+        // fresh sample taken after GetAndAckEvents() (below) has already
+        // done real work -- that would land wake AFTER onedge_start,
+        // inverted from TCP's structural order, and the base_counter
+        // clamp in StampAt() would silently absorb the inversion into
+        // two equal ts=1 stamps (design doc sec.8.1's RDMA event-mode
+        // wake paragraph). `m`, the CQ socket PollCq was invoked on via
+        // the generic OnEdge dispatch, already carries the correct,
+        // earlier value: Socket::OnInputEvent stamped m->_lt_wake from
+        // the epoll-wake TLS at the true pre-dispatch moment, through
+        // the same mechanism TCP uses. Copy it across instead of
+        // resampling.
+        s->_lt_wake = m->_lt_wake;
     }
 #endif
 
@@ -1515,11 +1528,8 @@ void RdmaEndpoint::PollCq(Socket* m) {
         if (ep->GetAndAckEvents(s) < 0) {
             return;
         }
-#if defined(BRPC_LATENCY_TRACE)
-        // `wake` is the moment the epoll wakeup was consumed and
-        // acknowledged -- the RDMA analogue of epoll_wait() returning.
-        s->_lt_wake = butil::detail::clock_cycles();
-#endif
+        // `wake` was already copied from `m` above, before this call --
+        // see the comment there for why it must not be resampled here.
     } else {
         // Polling is considered as non-send, so no need to change `send'.
         // Only need to poll polling_cq.

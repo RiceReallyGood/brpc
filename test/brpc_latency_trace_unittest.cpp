@@ -1903,6 +1903,29 @@ TEST(LatencyTraceRdmaTest, ReceivePathStampsWakeOnedgeReadv) {
     ASSERT_GT(s->ts[brpc::LT_S_READV_START], 0u);
     ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_READV_START]);
 
+    // Fix-round item 1 regression coverage. S09 (LT_S_SERVICE_START) is
+    // written through plain Stamp() (see baidu_rpc_protocol.cpp and design
+    // doc sec.8.1's Stamp()-vs-StampAt() table), which has NO raw<base
+    // clamp -- unlike S01-S06, which go through StampAt() and would just
+    // collapse to ts=1 on a bad base_counter. Before this fix-round's item
+    // 1 fix, RDMA polling mode passed the wake sentinel (LT_RAW_NOT_
+    // APPLICABLE, i.e. ~0ULL) straight through as base_counter, so
+    // `clock_cycles() - base_counter` wrapped around and every point
+    // stamped via plain Stamp() (S09 onward) saturated to 0xFFFFFFFE
+    // ("took ~43s"). Assert a plausible small offset here instead --
+    // this is the assertion that actually distinguishes a corrupted
+    // record from a correct one; the wake/onedge_start checks below
+    // cannot, because StampAt()'s clamp makes them read the same either
+    // way (see the item 2 comment below).
+    ASSERT_GT(s->ts[brpc::LT_S_SERVICE_START], 0u)
+        << "S09 (service_start) was never stamped";
+    ASSERT_LT(s->ts[brpc::LT_S_SERVICE_START], 100000000u)
+        << "S09 (service_start) offset is implausibly large ("
+        << s->ts[brpc::LT_S_SERVICE_START] << ") -- looks like the "
+        << "~43s saturation produced by a sentinel base_counter "
+        << "(design doc sec.8.1's base_counter paragraph), not a real "
+        << "same-host RPC duration";
+
     if (brpc::rdma::FLAGS_rdma_use_polling) {
         // Sec.8.5: no epoll wake-up, no OnEdge bthread switch under
         // polling -- these two points do not exist, so merge.py can mark
@@ -1916,6 +1939,26 @@ TEST(LatencyTraceRdmaTest, ReceivePathStampsWakeOnedgeReadv) {
         ASSERT_GT(s->ts[brpc::LT_S_ONEDGE_START], 0u);
         ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_ONEDGE_START]);
         ASSERT_LE(s->ts[brpc::LT_S_WAKE], s->ts[brpc::LT_S_ONEDGE_START]);
+        // Fix-round item 2 regression coverage. `ASSERT_LE` above is
+        // vacuously true whether wake/onedge_start are genuinely ordered
+        // OR both got clamped into equality at ts=1 by StampAt()'s
+        // raw<base guard -- exactly how the inverted-order bug (design
+        // doc sec.8.1's RDMA event-mode wake paragraph) passed review
+        // undetected: with `wake` resampled after GetAndAckEvents() (so
+        // raw wake > raw onedge_start), the clamp silently collapses
+        // both to ts=1 and `wake <= onedge_start` "passes". Assert
+        // strict ordering instead: under the fix, `wake` is the CQ
+        // socket's genuinely earlier timestamp (copied, not resampled),
+        // so onedge_start -- sampled later, at PollCq's own entry, after
+        // real epoll-dispatch work already happened -- must show a real,
+        // non-zero, non-clamped gap above it.
+        ASSERT_GT(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_WAKE])
+            << "wake (" << s->ts[brpc::LT_S_WAKE] << ") and onedge_start ("
+            << s->ts[brpc::LT_S_ONEDGE_START] << ") are not strictly "
+            << "ordered -- looks like both were clamped to the same "
+            << "value by StampAt()'s raw<base guard rather than "
+            << "genuinely ordered (design doc sec.8.1's RDMA event-mode "
+            << "wake paragraph)";
         ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READV_START]);
     }
 
@@ -1941,8 +1984,20 @@ TEST(LatencyTraceRdmaTest, ReceivePathStampsWakeOnedgeReadv) {
 // safe alongside the -lgtest_main this binary still links: the linker
 // resolves `main` from this translation unit before it ever needs to
 // pull the matching object out of that archive.
+//
+// This must stay inside the BRPC_LATENCY_TRACE guard: with the feature
+// compiled out, this whole file (including the RDMA test that actually
+// needs the real command line) is inert, and the untraced build must
+// stay byte-for-byte equivalent to before this feature existed -- which
+// means falling back to plain -lgtest_main (InitGoogleTest() +
+// RUN_ALL_TESTS(), no gflags parsing) exactly as it did before this test
+// was added. An unconditional main() here would make every build,
+// traced or not, parse the process's command line through gflags where
+// it previously parsed nothing.
+#if defined(BRPC_LATENCY_TRACE)
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     return RUN_ALL_TESTS();
 }
+#endif  // defined(BRPC_LATENCY_TRACE)

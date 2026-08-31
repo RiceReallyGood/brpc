@@ -740,9 +740,21 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         // already parked on the message instead of sampling "now". See
         // design doc sec.8.1's base_counter paragraph and
         // LatencyTraceBuffer::AllocSlot()'s 3-arg overload.
+        //
+        // Under RDMA polling mode `wake` is LT_RAW_NOT_APPLICABLE (design
+        // doc sec.8.5: there is no epoll wake-up to sample in that mode) --
+        // a sentinel must never become base_counter (sec.8.1's
+        // reconciliation paragraph), so fall back to `readv_start`, which
+        // the same section's table guarantees is a real timestamp in both
+        // RDMA modes (and equals `wake` on plain TCP/RDMA-event paths only
+        // in the degenerate case where wake itself is unset, which cannot
+        // happen once a message has actually been parsed here).
         LatencyTraceBuffer* lt_buffer = LatencyTraceBuffer::instance();
+        const uint64_t lt_base_counter =
+            (msg->lt_wake() != LT_RAW_NOT_APPLICABLE) ? msg->lt_wake()
+                                                       : msg->lt_readv_start();
         const LatencyTraceHandle lt_handle = lt_buffer->AllocSlot(
-            request_meta.latency_trace_id(), LT_ROLE_SERVER, msg->lt_wake());
+            request_meta.latency_trace_id(), LT_ROLE_SERVER, lt_base_counter);
         accessor.set_latency_trace(request_meta.latency_trace_id(), lt_handle);
         // S01-S04: historical values sampled before this handle existed
         // (parked on Socket / InputMessageBase by Task 9). S05-S06: the

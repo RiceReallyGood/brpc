@@ -204,6 +204,29 @@ LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
     if (!FLAGS_latency_trace_enabled) {
         return LT_INVALID_HANDLE;
     }
+    // base_counter becomes this record's timeline origin -- every later
+    // Stamp()/StampAt() computes an offset against it. Unlike ts[], it has
+    // no encoding room for "not applicable": LT_RAW_NOT_APPLICABLE (all
+    // ones) slipping in here is not a valid sentinel, it is corruption.
+    // Stamp() has no clamp, so `clock_cycles() - base_counter` wraps
+    // around to `clock_cycles() + 1`, and because the counter runs from
+    // boot rather than process start, any host up longer than ~43s
+    // saturates every later Stamp()'d point to 0xFFFFFFFE ("took
+    // forever") -- design doc sec.8.1's base_counter paragraph. The
+    // known way this happens today is RDMA polling mode's wake sentinel
+    // reaching here unchanged; the call site (baidu_rpc_protocol.cpp)
+    // is fixed to never pass it. This check is defense in depth for
+    // every other/future 3-argument caller: refuse the sentinel and
+    // fall back to "now", same as the 2-argument overload, rather than
+    // silently corrupting the record.
+    if (base_counter == LT_RAW_NOT_APPLICABLE) {
+        LOG_EVERY_N(ERROR, 100) << "LatencyTraceBuffer::AllocSlot() called "
+            "with a sentinel base_counter (LT_RAW_NOT_APPLICABLE) -- this "
+            "should never happen after design doc sec.8.1's fix; falling "
+            "back to now() to avoid corrupting the record. Check the "
+            "caller.";
+        base_counter = butil::detail::clock_cycles();
+    }
     // One shard per thread, assigned round-robin on first use. Do NOT
     // derive this from a stack address: the address of a parameter is
     // effectively constant within a thread, which happens to give the
