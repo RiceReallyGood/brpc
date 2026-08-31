@@ -11,9 +11,46 @@
 ## Global Constraints
 
 - Python 3，只用标准库（`struct` / `json` / `argparse` / `statistics`）。不引入 numpy 等依赖 —— 这个工具要能在任何一台机器上直接跑。
-- **落盘格式以 `src/brpc/latency_trace.h` 为准**，不以设计文档为准。文档已经错过一次（校准对、magic 注释），代码是唯一事实。解析前先核对 `sizeof` 与字段偏移。
+- **代码是事实，文档跟随代码。** 二者冲突时**改文档**，不要在代码里迁就文档，也不要留着两份互相矛盾的说法。落盘格式以 `src/brpc/latency_trace.h` 为准。
 - HTML 必须是**单文件、可离线打开**，不引用任何 CDN。
 - 生成的 HTML 在明暗两种主题下都要可读。
+
+---
+
+## Task A0: 文档与代码的系统性对账
+
+设计文档和代码已经矛盾过两次 —— 校准对写成 `CLOCK_REALTIME`（实际是 monotonic）、
+magic 的注释三处皆错。两次都是 review **偶然撞见**的，不是查出来的。写 `merge.py` 的人
+如果信了文档，会得到一个能跑但结果错的解析器，而且错得不明显。
+
+在动手写解析器之前，把落盘契约逐项对齐一遍。
+
+**Files:** Modify `docs/superpowers/specs/2026-08-29-brpc-latency-trace-design.md`
+
+- [ ] **A0-1. 逐项对账**
+
+以 `src/brpc/latency_trace.h` 与 `latency_trace.cpp` 的 `Dump()` 为准，核对设计文档 §8.1 与 §9.1 的每一项：
+
+| 待核对项 | 以代码何处为准 |
+|---|---|
+| `LatencyTraceRecord` 的字段顺序、类型、偏移、`sizeof` | 结构体定义 + `static_assert` |
+| `LatencyTraceFileHeader` 的每个字段名与语义 | 结构体定义 + `static_assert` |
+| magic 的实际拼写与盘上字节序 | `LT_FILE_MAGIC` 的常量值 |
+| `ts[]` 的编码与三个保留值 | `EncodeOffset` 与 `Stamp`/`StampAt`/`StampLast` |
+| 频率由哪一对校准值算出 | `Dump()` 里实际参与除法的那两个字段 |
+| 方法表的布局与 `method_table_offset` 的基准 | `Dump()` 的写出顺序 |
+| 点位总数、名称、顺序 | `LatencyTracePoint` 枚举 |
+| 分解项的数量与命名 | §5 的表 vs 测试里逐项断言的那份清单 |
+
+**每一处不一致都改文档**（除非代码本身是错的，那要单独说明并另行修复）。
+把核对结果列成一张表写进报告，包括「已核对且一致」的项 —— 只报告差异的话，
+读者无从知道哪些是查过的、哪些是漏了的。
+
+- [ ] **A0-2. 加一条防复发的检查**
+
+写一个小脚本 `tools/latency_trace/check_format_doc.py`，从 `latency_trace.h` 提取
+`sizeof` 断言、magic 常量、点位枚举名与个数，与设计文档里对应的数字/名称比对，不一致则非零退出。
+不求覆盖全部语义，只钉住最容易漂移且最容易造成静默错误的那几个数字。
 
 ---
 
