@@ -81,11 +81,28 @@ enum LatencyTraceRole {
 // LatencyTraceBuffer's per-process tag (never zero, so two untagged
 // processes can't collide; also what LatencyTraceFileHeader::process_tag
 // records -- there is exactly one tag, reused for both purposes), the
-// low 32 bits are `seq`, a counter owned entirely by the caller (e.g.
-// channel.cpp's `s_lt_seq`) -- this function does not read or advance
-// any LatencyTraceBuffer::Shard::cursor. `seq` only needs to be unique
+// low 32 bits are `seq` -- this function does not read or advance any
+// LatencyTraceBuffer::Shard::cursor. `seq` only needs to be unique
 // within this process; see the .cpp for why its wraparound is safe.
+//
+// Every caller MUST source `seq` from NextLatencyTraceSeq() below, never
+// from a counter of its own: two independent counters both starting near
+// zero (e.g. one for a channel's first attempt, another for a retry or
+// backup-request attempt) would each feed this function low bits that
+// can coincide, producing two DIFFERENT physical attempts with the SAME
+// trace id -- exactly the collision the whole point of this id is to
+// prevent. See NextLatencyTraceSeq()'s comment.
 uint64_t MakeLatencyTraceId(uint64_t seq);
+
+// The single process-wide sequence counter backing every call to
+// MakeLatencyTraceId() -- the client's first-attempt allocation
+// (channel.cpp) and a retry/backup-request attempt's allocation
+// (controller.cpp's IssueRPC) both call this, never a counter of their
+// own, so the two call sites can never hand out the same `seq` and
+// therefore can never mint the same trace id. `seq` wraps after ~4B
+// calls from this process; see MakeLatencyTraceId's .cpp comment for why
+// that wraparound is safe.
+uint64_t NextLatencyTraceSeq();
 
 // Interns `full_name` into a process-wide, thread-safe string->id table and
 // returns the id -- stable for the life of the process, and the same string

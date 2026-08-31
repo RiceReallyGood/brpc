@@ -824,6 +824,17 @@ private:
         // in every constructor and Reset(). See BindSockAction.
         BindSockAction bind_sock_action;
         StreamUserData* stream_user_data;
+#if defined(BRPC_LATENCY_TRACE)
+        // This attempt's OWN latency-trace slot -- bound to the Call, not
+        // to the Controller, so a backup request (which keeps the
+        // original Call alive as `_unfinished_call` while `_current_call`
+        // is repurposed for the backup's own attempt) can't have the
+        // backup's allocation silently clobber the original's handle. See
+        // OnComplete() below and Controller::IssueRPC's retry/backup
+        // allocation block, which is the only writer of this field other
+        // than Reset()/the move constructor.
+        LatencyTraceHandle lt_handle;
+#endif
     };
 
     void HandleStreamConnection(Socket *host_socket);

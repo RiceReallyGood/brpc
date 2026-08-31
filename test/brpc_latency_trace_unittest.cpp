@@ -16,6 +16,7 @@
 // under the License.
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <set>
@@ -28,6 +29,7 @@
 #include "brpc/latency_trace.h"
 #include "brpc/policy/baidu_rpc_meta.pb.h"
 #include "brpc/server.h"
+#include "bthread/bthread.h"
 #include "butil/time.h"
 #include "echo.pb.h"
 
@@ -604,6 +606,86 @@ TEST_F(LatencyTraceBufferTest, DumpPathFlagRegistersAtexitHook) {
     ASSERT_TRUE(brpc::LatencyTraceBuffer::instance()->atexit_registered());
 }
 
+// Fix-round item 3 (review of Task 13): Dump() used to snapshot
+// hdr.record_count via recorded_count() BEFORE the record-writing loop,
+// then derive method_table_offset from that early snapshot. If more
+// slots finish allocating (and publish via AllocSlot's release-store to
+// slot_seq) while the loop is still running, the loop -- which scans
+// live slot state, not the snapshot -- writes more records than the
+// snapshot counted, so the header ends up claiming a record_count (and
+// therefore a method_table_offset) that does not match what actually
+// landed on disk. Dump()'s own return value (`written`) is always the
+// ground truth: it is the exact number of records the loop fwrote.
+//
+// Producing that exact race deterministically is not possible from a
+// test -- but running unthrottled producers is actually
+// counterproductive: this buffer's capacity is only ever in the tens or
+// hundreds of thousands, and a handful of threads hammering AllocSlot()
+// as fast as possible saturate that well within the first millisecond of
+// Dump()'s own ~100ms calibration-window sleep, long before Dump() even
+// takes its early snapshot -- at which point production has already
+// stopped and there is nothing left to race. Instead, each producer
+// below sleeps briefly between allocations so it keeps trickling new
+// records in for the ENTIRE duration of the Dump() call (calibration
+// sleep, method-table snapshot, and the record-writing loop alike)
+// without ever exhausting capacity -- and the whole thing runs several
+// rounds so that a race landing in the (comparatively narrow) window
+// between the early snapshot and the loop's completion is caught with
+// high probability even though no single round guarantees it.
+TEST_F(LatencyTraceBufferTest, DumpHeaderMatchesActuallyWrittenRecordCount) {
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+
+    const int kRounds = 20;
+    for (int round = 0; round < kRounds; ++round) {
+        b->ResetForTest(100000);
+        b->set_stop_when_full_for_test(true);
+
+        std::atomic<bool> stop(false);
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 4; ++i) {
+            workers.emplace_back([b, &stop]() {
+                uint64_t local_seq = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const uint64_t trace_id = brpc::MakeLatencyTraceId(local_seq++);
+                    const brpc::LatencyTraceHandle h =
+                        b->AllocSlot(trace_id, brpc::LT_ROLE_CLIENT);
+                    b->Stamp(h, brpc::LT_C_RPC_START);
+                    usleep(50);  // throttle -- see this test's top comment
+                }
+            });
+        }
+
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/brpc_lt_dump_race_test_%d.bin", round);
+        const int written = b->Dump(path);
+
+        stop.store(true, std::memory_order_relaxed);
+        for (auto& w : workers) {
+            w.join();
+        }
+
+        ASSERT_GE(written, 0) << "Dump() failed outright, round=" << round;
+
+        FILE* fp = fopen(path, "rb");
+        ASSERT_TRUE(fp != nullptr);
+        brpc::LatencyTraceFileHeader hdr;
+        ASSERT_EQ(1u, fread(&hdr, sizeof(hdr), 1, fp));
+        fclose(fp);
+        unlink(path);
+
+        ASSERT_EQ((uint64_t)written, hdr.record_count)
+            << "round=" << round << ": hdr.record_count must match how "
+               "many records Dump() actually wrote (its own return "
+               "value), not an early snapshot taken before the write "
+               "loop ran";
+        ASSERT_EQ(sizeof(hdr) + (uint64_t)written * sizeof(brpc::LatencyTraceRecord),
+                  hdr.method_table_offset)
+            << "round=" << round << ": method_table_offset must point "
+               "exactly past the records actually written, not past a "
+               "stale pre-loop count";
+    }
+}
+
 TEST(LatencyTraceMacroTest, StampCompilesAndIsNoOpWhenHandleInvalid) {
     // Must be safe to call with an invalid handle from any thread.
     LT_STAMP(brpc::LT_INVALID_HANDLE, brpc::LT_C_RPC_START);
@@ -728,14 +810,18 @@ static const brpc::LatencyTraceRecord* FindServerRecordForTest() {
 //     holding, with no test failure to flag it.
 //
 // Selecting on trace_id sidesteps the question rather than resting on
-// either assumption above. Its low 32 bits are channel.cpp's `s_lt_seq`,
-// one process-wide atomic counter incremented per RPC issued by
-// Channel::CallMethod (see MakeLatencyTraceId); the server's record
-// carries that exact same trace_id via propagation -- baidu_rpc_protocol.
-// cpp reads request_meta.latency_trace_id() off the wire rather than
-// minting its own (see ProcessRpcRequest). So "max trace_id for this
-// role" means "most recently issued RPC" regardless of which shard either
-// side's record ended up in.
+// either assumption above. Its low 32 bits come from
+// NextLatencyTraceSeq(), the one process-wide counter shared by every
+// attempt this process ever issues -- the first send (Channel::
+// CallMethod) and any retry/backup-request attempt (Controller::
+// IssueRPC) alike (see MakeLatencyTraceId; sharing that one counter is
+// what the fix round's item 1 made true -- it used to be two independent
+// counters); the server's record carries that exact same trace_id via
+// propagation -- baidu_rpc_protocol.cpp reads request_meta.
+// latency_trace_id() off the wire rather than minting its own (see
+// ProcessRpcRequest). So "max trace_id for this role" means "most
+// recently issued RPC" regardless of which shard either side's record
+// ended up in.
 static const brpc::LatencyTraceRecord* FindLastRecordByRole(brpc::LatencyTraceRole role) {
     const brpc::LatencyTraceRecord* found = nullptr;
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
@@ -1394,6 +1480,208 @@ TEST(LatencyTraceMetaTest, EachRetryAttemptGetsItsOwnRecord) {
     ASSERT_EQ(3u, attempts.size()) << "expected one record per attempt";
     ASSERT_EQ(0, *attempts.begin());
     ASSERT_EQ(2, *attempts.rbegin());
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// Fix-round item 1 (review of Task 13): channel.cpp's first-attempt
+// allocation and controller.cpp's retry/backup-request allocation used
+// to draw from two INDEPENDENT counters, each starting near zero -- so a
+// process's first-ever RPC and its first-ever retry could (and, on
+// alignment, would) mint the exact same trace id, breaking the
+// cross-process join's uniqueness guarantee.
+//
+// This is deliberately NOT a test that a specific pair of trace ids
+// collides -- whether the two old counters were ever exactly aligned by
+// the time this test runs depends on how many RPCs/retries earlier tests
+// in this same binary already issued, which this test does not control.
+// Instead it asserts a property that holds if and only if every attempt
+// this process ever issues -- first sends and retries/backups alike --
+// draws from ONE shared, monotonically increasing counter: a retry's own
+// sequence number must be strictly greater than every sequence number
+// already handed out to any first-attempt allocation before it, no
+// matter how much unrelated traffic (from other tests) already advanced
+// either counter. Under the old, independent-counters code this fails
+// deterministically: the retry-only counter's value the first time this
+// test (or any earlier test) forces a retry is small (0, 1, 2, ...)
+// while the first-attempt counter has already been advanced far past
+// that by every other RPC-issuing test that ran first in this binary --
+// so the retry's sequence number ends up SMALLER than the first-attempt
+// sequence numbers already observed, not larger.
+TEST(LatencyTraceMetaTest, RetryAttemptSeqContinuesInitialAttemptSeq) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceEchoServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9535, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9535", &opt));
+    test::EchoService_Stub stub(&channel);
+
+    // Several ordinary (first-attempt-only) RPCs, advancing whichever
+    // counter backs Channel::CallMethod's allocation, and remembering
+    // the largest sequence number (trace_id's low 32 bits) any of them
+    // produced.
+    uint32_t max_initial_seq = 0;
+    for (int i = 0; i < 5; ++i) {
+        test::EchoRequest req;
+        test::EchoResponse res;
+        brpc::Controller cntl;
+        req.set_message("x");
+        stub.Echo(&cntl, &req, &res, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        const brpc::LatencyTraceRecord* r = FindLastClientRecordForTest();
+        ASSERT_TRUE(r != nullptr);
+        max_initial_seq = std::max(max_initial_seq, (uint32_t)r->trace_id);
+    }
+    server.Stop(0);
+    server.Join();
+
+    // Now force exactly one retry against a dead backend.
+    brpc::Channel dead_channel;
+    brpc::ChannelOptions dead_opt;
+    dead_opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    dead_opt.max_retry = 1;
+    dead_opt.timeout_ms = 200;
+    ASSERT_EQ(0, dead_channel.Init("127.0.0.1:9598", &dead_opt));  // nothing listening
+    test::EchoService_Stub dead_stub(&dead_channel);
+    test::EchoRequest req2;
+    test::EchoResponse res2;
+    brpc::Controller cntl2;
+    req2.set_message("y");
+    dead_stub.Echo(&cntl2, &req2, &res2, nullptr);
+    ASSERT_TRUE(cntl2.Failed());
+
+    const brpc::LatencyTraceRecord* retry_rec = nullptr;
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            break;
+        }
+        if (r->role == brpc::LT_ROLE_CLIENT && r->attempt == 1) {
+            retry_rec = r;
+        }
+    }
+    ASSERT_TRUE(retry_rec != nullptr) << "expected a retry-attempt record";
+
+    ASSERT_GT((uint32_t)retry_rec->trace_id, max_initial_seq)
+        << "the retry attempt's sequence number did not continue past "
+           "every first-attempt sequence number already handed out -- "
+           "the two allocation paths are drawing from separate counters "
+           "and can mint colliding trace ids";
+
+    brpc::FLAGS_latency_trace_enabled = false;
+}
+
+// Fix-round item 2 (review of Task 13): when a backup request's ORIGINAL
+// attempt responds and wins the race against its own backup (Controller
+// ::EndRPC's "a previous non-backup request responded" branch), the RPC's
+// true final outcome must land in the ORIGINAL attempt's own record --
+// the one whose trace id the server that actually produced the winning
+// response saw -- not in the backup's, which was allocated later and
+// never received a response at all. Before the fix, Controller::_lt_
+// handle was Controller-level rather than per-Call, so IssueRPC's own
+// backup allocation clobbered it with the backup's handle, and OnRPCEnd
+// (via that same handle) always stamped the final outcome onto whichever
+// attempt happened to be allocated LAST -- the backup -- even when the
+// backup never got a response.
+//
+// The mock service's first invocation (the original) sleeps long enough
+// for backup_request_ms to fire a backup, then still succeeds; its
+// second invocation (the backup) sleeps much longer, so the original's
+// response is guaranteed to be the one that completes the RPC.
+class LatencyTraceBackupRaceServiceImpl : public test::EchoService {
+public:
+    void Echo(google::protobuf::RpcController* /*cntl_base*/,
+              const test::EchoRequest* request,
+              test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        const int seen = _call_count.fetch_add(1, std::memory_order_relaxed);
+        if (seen == 0) {
+            // The original attempt: slow enough that backup_request_ms
+            // elapses and a backup fires, but still responds
+            // successfully afterward -- "original wins over its backup".
+            bthread_usleep(200 * 1000);
+        } else {
+            // The backup attempt: made to hang well past the point the
+            // original's response has already ended the whole RPC (200ms
+            // plus loopback overhead), without dragging server.Join()
+            // below out any longer than necessary.
+            bthread_usleep(1000 * 1000);
+        }
+        response->set_message(request->message());
+    }
+private:
+    std::atomic<int> _call_count{0};
+};
+
+TEST(LatencyTraceMetaTest, OriginalAttemptWinningOverBackupGetsFinalOutcome) {
+    brpc::FLAGS_latency_trace_enabled = true;
+    brpc::LatencyTraceBuffer::instance()->ResetForTest(1024);
+
+    brpc::Server server;
+    LatencyTraceBackupRaceServiceImpl svc;
+    ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9536, nullptr));
+
+    brpc::Channel channel;
+    brpc::ChannelOptions opt;
+    opt.protocol = brpc::PROTOCOL_BAIDU_STD;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9536", &opt));
+
+    test::EchoService_Stub stub(&channel);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    brpc::Controller cntl;
+    cntl.set_backup_request_ms(30);
+    cntl.set_timeout_ms(5000);
+    req.set_message("race");
+    stub.Echo(&cntl, &req, &res, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ("race", res.message());
+
+    std::vector<const brpc::LatencyTraceRecord*> client_records;
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            break;
+        }
+        if (r->role == brpc::LT_ROLE_CLIENT) {
+            client_records.push_back(r);
+        }
+    }
+    ASSERT_EQ(2u, client_records.size())
+        << "expected one record for the original attempt and one for "
+           "its backup";
+
+    const brpc::LatencyTraceRecord* original = nullptr;
+    const brpc::LatencyTraceRecord* backup = nullptr;
+    for (const brpc::LatencyTraceRecord* r : client_records) {
+        if (r->attempt == 0) {
+            original = r;
+        } else if (r->attempt == 1) {
+            backup = r;
+        }
+    }
+    ASSERT_TRUE(original != nullptr && backup != nullptr);
+
+    // The original attempt is the one that actually completed the RPC:
+    // its record must carry the true (successful) final outcome, not
+    // the placeholder EBACKUPREQUEST value IssueRPC speculatively wrote
+    // into it at the moment the backup was sent.
+    ASSERT_EQ(0, original->error_code)
+        << "the original attempt's record should carry the RPC's true "
+           "final outcome after it wins the race against its own backup";
+
+    server.Stop(0);
+    server.Join();
     brpc::FLAGS_latency_trace_enabled = false;
 }
 

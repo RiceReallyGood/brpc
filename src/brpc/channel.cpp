@@ -20,9 +20,6 @@
 #include <google/protobuf/descriptor.h>
 #include <gflags/gflags.h>
 #include <memory>
-#if defined(BRPC_LATENCY_TRACE)
-#include "butil/atomicops.h"                         // s_lt_seq below
-#endif
 #include "butil/time.h"                              // milliseconds_from_now
 #include "butil/logging.h"
 #include "butil/third_party/murmurhash3/murmurhash3.h"
@@ -542,9 +539,13 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
 
 #if defined(BRPC_LATENCY_TRACE)
     {
-        static butil::atomic<uint64_t> s_lt_seq(0);
-        const uint64_t seq = s_lt_seq.fetch_add(1, butil::memory_order_relaxed);
-        const uint64_t trace_id = MakeLatencyTraceId(seq);
+        // NextLatencyTraceSeq() is the ONE process-wide counter feeding
+        // every trace id this process mints -- this first-attempt
+        // allocation and IssueRPC's retry/backup-request allocation both
+        // draw from it, so the two paths can never hand out the same
+        // (process_tag, seq) pair. See latency_trace.h's comment on
+        // MakeLatencyTraceId() and the fix round's item 1.
+        const uint64_t trace_id = MakeLatencyTraceId(NextLatencyTraceSeq());
         ControllerPrivateAccessor accessor(cntl);
         accessor.set_latency_trace(trace_id,
                                    LT_ALLOC(trace_id, LT_ROLE_CLIENT));

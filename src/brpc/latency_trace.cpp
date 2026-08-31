@@ -68,10 +68,11 @@ static uint32_t MakeProcessTag() {
 uint64_t MakeLatencyTraceId(uint64_t seq) {
     const uint64_t tag = LatencyTraceBuffer::instance()->process_tag();
     // The low 32 bits (`seq`) wrap after ~4B calls from this process.
-    // `seq` here is the caller's own process-wide counter (e.g.
-    // channel.cpp's `s_lt_seq`, a plain atomic<uint64_t> counting client
-    // RPCs) -- it is NOT a LatencyTraceBuffer::Shard::cursor, a separate
-    // per-shard index this function never touches. Dump() never resets
+    // `seq` here comes from NextLatencyTraceSeq() below -- the ONE
+    // process-wide counter every caller shares (channel.cpp's
+    // first-attempt allocation and controller.cpp's retry/backup-request
+    // allocation alike) -- it is NOT a LatencyTraceBuffer::Shard::cursor,
+    // a separate per-shard index this function never touches. Dump() never resets
     // any cursor, and it is not called repeatedly in production either:
     // -latency_trace_dump_path registers exactly one atexit dump, so
     // there is no "next dump" for a cursor reset to matter to even if
@@ -85,10 +86,21 @@ uint64_t MakeLatencyTraceId(uint64_t seq) {
     // trace id. So the only `seq` values that ever actually reach a
     // recorded LatencyTraceRecord are bounded by
     // -latency_trace_capacity (100000 by default across all shards) --
-    // nowhere near 2^32 -- regardless of how high the caller's own
-    // counter climbs over the life of the process. Raising
+    // nowhere near 2^32 -- regardless of how high the shared counter
+    // climbs over the life of the process. Raising
     // -latency_trace_capacity toward 2^32 would break that.
     return (tag << 32) | (uint32_t)seq;
+}
+
+uint64_t NextLatencyTraceSeq() {
+    // Function-local static: lazily constructed, thread-safe one-time
+    // init (same guarantee LatencyTraceBuffer::instance() relies on).
+    // Deliberately the ONLY counter of its kind in the process -- see
+    // this function's declaration and MakeLatencyTraceId's comment for
+    // why a second, independent counter here would reintroduce the
+    // exact trace-id collision this function exists to prevent.
+    static butil::atomic<uint64_t> s_lt_seq(0);
+    return s_lt_seq.fetch_add(1, butil::memory_order_relaxed);
 }
 
 // ts[] stores offset+1, never the raw offset -- see LatencyTraceRecord::ts
@@ -450,43 +462,59 @@ int LatencyTraceBuffer::Dump(const char* path) {
     const double dt_realtime_ns = (double)(tail_realtime_ns - _head_realtime_ns);
     hdr.counter_freq_hz = dt_counter * 1e9 / dt_realtime_ns;
     hdr.cntfrq_el0_hz = ReadCntfrqHz();
-    hdr.record_count = recorded_count();
+    // record_count and method_table_offset are filled in AFTER the write
+    // loop below, from the count of records actually fwritten -- not
+    // here. Computing them here from recorded_count() would snapshot a
+    // count that can go stale before the loop even starts (let alone
+    // finishes): live traffic keeps calling AllocSlot() concurrently with
+    // this whole function, so by the time the loop reaches a given
+    // shard, more of its slots may have published (via AllocSlot's
+    // release-store to slot_seq) than recorded_count() saw a moment ago.
+    // The loop below writes every slot it finds published, regardless of
+    // this snapshot, so a header built from the early snapshot can claim
+    // fewer records than actually land on disk -- and, derived from that
+    // same wrong count, point method_table_offset into the middle of the
+    // real record data instead of just past it. Deferring both fields
+    // until `written` (the loop's own tally) is known makes the header
+    // agree with reality no matter how much traffic races this dump.
     hdr.dropped_count = dropped_count();
     hdr.process_tag = _process_tag;
-    // Snapshot the method table once, under lock, so the offset computed
-    // here (which assumes exactly hdr.record_count records precede the
-    // table) and the bytes actually written after the record loop below
-    // both describe the same table -- a LatencyTraceMethodId() call
-    // racing this Dump() must not see half the snapshot.
+    // Snapshot the method table once, under lock, so the bytes written
+    // for it after the records below are a single consistent snapshot --
+    // a LatencyTraceMethodId() call racing this Dump() must not see half
+    // of it.
     std::vector<std::string> method_names;
     {
         MethodTable* mt = GetMethodTable();
         std::unique_lock<butil::Mutex> lck(mt->mutex);
         method_names = mt->names;
     }
-    hdr.method_table_offset =
-        sizeof(hdr) + hdr.record_count * (uint64_t)sizeof(LatencyTraceRecord);
 
     FILE* fp = fopen(path, "wb");
     if (fp == nullptr) {
         return -1;
     }
-    // hdr.record_count above is the count this dump PROMISES to contain.
     // If any fwrite below fails partway through -- or, less obviously,
     // if the fclose() at the bottom fails to flush stdio's buffer to
-    // disk even though every fwrite reported success -- that promise is
-    // already wrong for whatever actually landed on disk. A header
-    // claiming N records over a file holding fewer (or a file that never
-    // fully hit disk at all) is worse than no file, because an offline
-    // reader has no way to tell the two apart from the header alone. So
-    // every failure below funnels into one `ok = false`, and the single
-    // cleanup path at the end unlinks the path rather than leaving a
-    // file that lies about what it contains; the caller (Dump()'s own
-    // return value, or DumpAtExitCallback's log line below) is the
-    // failure signal instead. One `fclose` call, one `remove` call, both
-    // unconditional past this point but only the latter gated on `ok` --
-    // no path here can double-close `fp` or remove a file this call
-    // didn't itself create.
+    // disk even though every fwrite reported success -- the file is
+    // incomplete. A header claiming N records over a file holding fewer
+    // (or a file that never fully hit disk at all) is worse than no
+    // file, because an offline reader has no way to tell the two apart
+    // from the header alone. So every failure below funnels into one
+    // `ok = false`, and the single cleanup path at the end unlinks the
+    // path rather than leaving a file that lies about what it contains;
+    // the caller (Dump()'s own return value, or DumpAtExitCallback's log
+    // line below) is the failure signal instead. One `fclose` call, one
+    // `remove` call, both unconditional past this point but only the
+    // latter gated on `ok` -- no path here can double-close `fp` or
+    // remove a file this call didn't itself create.
+    //
+    // The header written here still carries record_count == 0 and
+    // method_table_offset == 0 -- both get corrected by a second,
+    // in-place write below once the real count is known. Writing a
+    // placeholder now (rather than deferring this fwrite too) keeps the
+    // file's write position exactly where the record loop expects it:
+    // right after a full sizeof(hdr)-byte header.
     bool ok = (fwrite(&hdr, sizeof(hdr), 1, fp) == 1);
 
     int written = 0;
@@ -528,13 +556,32 @@ int LatencyTraceBuffer::Dump(const char* path) {
         }
     }
 
+    // Now that `written` is the real, final count, go back and fill in
+    // the two header fields that depend on it. The file's write position
+    // is already sitting exactly at sizeof(hdr) + written*sizeof(record)
+    // -- precisely where the method table belongs -- so this only needs
+    // to rewrite the header in place at offset 0, then seek back to
+    // resume right where the record loop left off; no bytes already
+    // written for the records themselves are touched.
+    if (ok) {
+        hdr.record_count = (uint64_t)written;
+        hdr.method_table_offset =
+            sizeof(hdr) + (uint64_t)written * (uint64_t)sizeof(LatencyTraceRecord);
+        const long resume_pos = ftell(fp);
+        ok = (resume_pos >= 0) &&
+             (fseek(fp, 0, SEEK_SET) == 0) &&
+             (fwrite(&hdr, sizeof(hdr), 1, fp) == 1) &&
+             (fseek(fp, resume_pos, SEEK_SET) == 0);
+    }
+
     // Method-name table: appended immediately after the records, at the
-    // byte offset already computed into hdr.method_table_offset above
-    // (sizeof(hdr) + hdr.record_count * sizeof(record)) -- which is where
-    // this write lands as long as `written` matches hdr.record_count.
-    // Format: uint32 count, then `count` entries of uint32 len + raw
-    // bytes; entry i names the method whose method_id is i+1 (see
-    // LatencyTraceMethodId and LatencyTraceFileHeader::method_table_offset).
+    // byte offset now correctly recorded in hdr.method_table_offset
+    // above (sizeof(hdr) + written * sizeof(record)) -- which is exactly
+    // where the file's write position already sits after the seek-back
+    // just above. Format: uint32 count, then `count` entries of uint32
+    // len + raw bytes; entry i names the method whose method_id is i+1
+    // (see LatencyTraceMethodId and
+    // LatencyTraceFileHeader::method_table_offset).
     if (ok) {
         const uint32_t count = (uint32_t)method_names.size();
         ok = (fwrite(&count, sizeof(count), 1, fp) == 1);

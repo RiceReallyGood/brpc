@@ -54,6 +54,16 @@ public:
     void set_latency_trace(uint64_t trace_id, LatencyTraceHandle h) {
         _cntl->_lt_trace_id = trace_id;
         _cntl->_lt_handle = h;
+        // Mirror onto _current_call too (fix-round item 2): on the
+        // client, this is Channel::CallMethod allocating the FIRST
+        // attempt's slot, and _current_call IS that first attempt --
+        // Call::OnComplete()/a later backup request both need this
+        // attempt's own handle available on the Call itself, not only on
+        // the Controller. Harmless on the server side (this same setter
+        // also runs there, from baidu_rpc_protocol.cpp's
+        // ProcessRpcRequest): a server-side Controller never retries, so
+        // _current_call.lt_handle just sits unread there.
+        _cntl->_current_call.lt_handle = h;
     }
 
     uint64_t latency_trace_id() const {

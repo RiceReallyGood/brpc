@@ -540,13 +540,32 @@ Controller::Call::Call(Controller::Call* rhs)
     , sending_sock(rhs->sending_sock.release())
     // A backup/retry call never inherits the source call's bind-sock affinity.
     , bind_sock_action(BIND_SOCK_NONE)
-    , stream_user_data(rhs->stream_user_data) {
+    , stream_user_data(rhs->stream_user_data)
+#if defined(BRPC_LATENCY_TRACE)
+    // This is the ONLY path that must carry `lt_handle` forward: a
+    // backup request moves the original attempt's Call (still in
+    // flight, still possibly the one that ends up winning) out to
+    // `_unfinished_call` via exactly this constructor, right before
+    // `_current_call` gets a brand-new handle of its own for the backup
+    // attempt in IssueRPC. Losing rhs's handle here is exactly Task 13's
+    // fix-round item 2: the original's own outcome would then have
+    // nowhere of its own to land.
+    , lt_handle(rhs->lt_handle)
+#endif
+{
     // NOTE: fields in rhs should be reset because RPC could fail before
     // setting all the fields to next call and _current_call.OnComplete
     // will behave incorrectly.
     rhs->need_feedback = false;
     rhs->peer_id = INVALID_SOCKET_ID;
     rhs->stream_user_data = nullptr;
+#if defined(BRPC_LATENCY_TRACE)
+    // rhs (`_current_call`) is about to be repurposed for a brand-new
+    // attempt with its own handle (IssueRPC allocates one right after
+    // this constructor returns) -- clearing the copy left behind avoids
+    // two Call objects transiently pointing at the same slot.
+    rhs->lt_handle = LT_INVALID_HANDLE;
+#endif
 }
 
 Controller::Call::~Call() {
@@ -562,6 +581,9 @@ void Controller::Call::Reset() {
     sending_sock.reset(nullptr);
     bind_sock_action = BIND_SOCK_NONE;
     stream_user_data = nullptr;
+#if defined(BRPC_LATENCY_TRACE)
+    lt_handle = LT_INVALID_HANDLE;
+#endif
 }
 
 void Controller::set_progressive_read_timeout_ms(
@@ -1032,6 +1054,28 @@ inline bool does_error_affect_main_socket(int error_code) {
 //      entire RPC (specified by c->FailedInline()).
 void Controller::Call::OnComplete(
         Controller* c, int error_code/*note*/, bool responded, bool end_of_rpc) {
+#if defined(BRPC_LATENCY_TRACE)
+    // Fix-round item 2: `end_of_rpc == true` means THIS Call -- not
+    // necessarily `c->_current_call` -- is the one whose outcome is the
+    // whole (possibly-retried/backed-up) RPC's real, final result. See
+    // EndRPC(): the common path passes it for `_current_call`, but the
+    // "original attempt responds and wins over its own backup" branch
+    // passes it for `_unfinished_call` instead, precisely because that
+    // Call -- not whatever IssueRPC allocated most recently -- produced
+    // the response the caller actually sees. Repoint c->_lt_handle at
+    // THIS call's own slot before returning, so that OnRPCEnd()'s
+    // ErrorCode() write below -- and EndRPC's C17-C19 client-side
+    // response-processing stamps, which read c->_lt_handle after this
+    // function returns -- land on the attempt that actually completed,
+    // not on whichever attempt happened to be allocated last (e.g. a
+    // backup that never got a response because the original it was
+    // racing against won). Nested classes have access to their
+    // enclosing class's private members since C++11, so this needs no
+    // separate accessor.
+    if (end_of_rpc) {
+        c->_lt_handle = lt_handle;
+    }
+#endif
     if (stream_user_data) {
         stream_user_data->DestroyStreamUserData(sending_sock, c, error_code, end_of_rpc);
         stream_user_data = nullptr;
@@ -1229,7 +1273,11 @@ void Controller::EndRPC(const CompletionInfo& info) {
     // wakes the synchronous caller blocked in Channel::CallMethod's Join().
     // Captured as a plain handle value, not read again through `this`,
     // because the async branch below may delete this Controller inside
-    // `_done->Run()` before C18 can be stamped.
+    // `_done->Run()` before C18 can be stamped. Read here, i.e. AFTER the
+    // if/else block above has already run every Call::OnComplete() call
+    // for this EndRPC() invocation -- _lt_handle is therefore already
+    // repointed (fix-round item 2) at whichever Call actually completed
+    // the RPC, so C17-C19 land on that same winning attempt's record.
     const LatencyTraceHandle lt_process_handle =
         ControllerPrivateAccessor(this).latency_trace_handle();
     LT_STAMP(lt_process_handle, LT_C_RSP_PROCESS_START);
@@ -1294,11 +1342,18 @@ void Controller::EndRPC(const CompletionInfo& info) {
 void Controller::OnRPCEnd(int64_t end_time_us) {
     _end_time_us = end_time_us;
 #if defined(BRPC_LATENCY_TRACE)
-    // Final outcome of whichever attempt is current when the whole,
-    // possibly-retried RPC actually finishes -- 0 on success, or the
-    // terminal error once retries are exhausted. Earlier, abandoned
-    // attempts get their own error_code written at the point IssueRPC
-    // decides to retry (see IssueRPC), before their slot is replaced.
+    // Final outcome of whichever Call actually completed the RPC -- 0 on
+    // success, or the terminal error once retries are exhausted. `_lt_
+    // handle` is not simply "whatever IssueRPC allocated most recently"
+    // by the time this runs: EndRPC() (which always runs before this,
+    // see its callers) invokes Call::OnComplete(end_of_rpc=true) on
+    // whichever Call -- _current_call, or _unfinished_call when the
+    // original attempt won a race against its own backup -- actually
+    // produced the response, and that call repoints _lt_handle at its
+    // own slot precisely so this write lands there (fix-round item 2).
+    // Earlier, abandoned attempts get their own error_code written at
+    // the point IssueRPC decides to retry/back up (see IssueRPC), before
+    // their slot is replaced.
     {
         LatencyTraceRecord* lt_rec = LatencyTraceBuffer::instance()->Get(_lt_handle);
         if (lt_rec != nullptr) {
@@ -1401,14 +1456,24 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         if (prev_rec != nullptr) {
             prev_rec->error_code = _error_code;
         }
-        static butil::atomic<uint64_t> s_lt_retry_seq(0);
-        const uint64_t seq =
-            s_lt_retry_seq.fetch_add(1, butil::memory_order_relaxed);
-        const uint64_t trace_id = MakeLatencyTraceId(seq);
+        // NextLatencyTraceSeq() is the SAME counter Channel::CallMethod's
+        // first-attempt allocation draws from -- fix-round item 1. Two
+        // independent counters here would let this retry/backup
+        // attempt's trace id collide with some unrelated RPC's very
+        // first attempt in this process.
+        const uint64_t trace_id = MakeLatencyTraceId(NextLatencyTraceSeq());
         const LatencyTraceHandle h =
             LatencyTraceBuffer::instance()->AllocSlot(trace_id, LT_ROLE_CLIENT);
         _lt_trace_id = trace_id;
         _lt_handle = h;
+        // _current_call IS this new attempt from here on (IssueRPC is
+        // about to populate its peer/socket below); mirroring the handle
+        // onto it -- not just onto the Controller-level field above --
+        // is what lets a LATER backup request (Call::Call(Call*) in the
+        // move constructor) carry this exact attempt's own handle
+        // forward into `_unfinished_call` if this attempt is itself
+        // superseded by one. See fix-round item 2.
+        _current_call.lt_handle = h;
         LatencyTraceRecord* rec = LatencyTraceBuffer::instance()->Get(h);
         if (rec != nullptr) {
             rec->attempt = (uint8_t)_current_call.nretry;
