@@ -17,7 +17,6 @@
 3. **单调不减**：`ts[i] <= ts[i+1]`，捕获点位落在错误的时间顺序上。
 4. **每个分解项非负**（低并发 outstanding=1 下），捕获点位落在错误的位置。
 5. **每个点位遵循它自己的写入策略**：绝大多数点位是瞬时事件，只应写入一次——重复写入意味着该事件触发了两次，是 bug，必须首次写入优先（后写丢弃）。但 `write_start`/`readv_start` 这一对点位的含义是「真正完成本单元这次操作的那次尝试的起点」，同一单元排在队列里时会被前面单元的尝试重入多次，只有最后一次尝试才是真正搬动本单元字节的那次，因此这一对必须最后写入优先（见 §10.1）。
-2. 34 个点位在正常路径上全部非零且时间戳单调不减。
 6. 打点开销经 microbenchmark 实测，并据此确定最终点位集。
 7. HTML 支持 1 万~10 万条记录的渲染与逐请求 hover 下钻。
 
@@ -325,19 +324,26 @@ link_up = link_down = L / 2
 
 ### 8.1 `src/brpc/latency_trace.{h,cpp}`
 
-**记录结构**（POD，8 字节对齐后 192 字节）：
+**记录结构**（POD，8 字节对齐后 192 字节）。下表按字段在结构体中的**实际声明顺序**列出（即 `merge.py` 用 `struct.unpack` 解包时必须遵循的顺序），偏移列以字节为单位、从记录起始处算起——字段顺序不是随意的排版，是 on-disk 字节布局本身：
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `trace_id` | `uint64` | 跨进程唯一 |
-| `base_counter` | `uint64` | 本进程原始计数器基准（aarch64: `cntvct_el0`；x86: TSC） |
-| `slot_seq` | `uint64` | generation 校验用。**置于 `ts[]` 之前**，与实现一致 |
-| `ts[34]` | `uint32 × 34` | **存「相对 `base_counter` 的偏移 + 1」**，见下方编码约定。`0` = 未采集；`0xFFFFFFFF` = 该模式下不存在（见 §8.5）；`0xFFFFFFFE` = 偏移饱和（区间 ≥ 约 42.9 秒 @100MHz） |
-| `socket_id` | `uint32` | |
-| `remote_ip` / `remote_port` | `uint32` / `uint16` | |
-| `role` / `attempt` | `uint8` / `uint8` | client / server；重试序号 |
-| `error_code` | `int32` | |
-| `req_size` / `rsp_size` / `method_id` | `uint32 × 3` | method 名走离线查表，避免变长字段 |
+| 字段 | 类型 | 偏移 | 说明 |
+|---|---|---|---|
+| `trace_id` | `uint64` | 0 | 跨进程唯一 |
+| `base_counter` | `uint64` | 8 | 本进程原始计数器基准（aarch64: `cntvct_el0`；x86: TSC） |
+| `slot_seq` | `uint64` | 16 | generation 校验用。**置于 `ts[]` 之前**，与实现一致 |
+| `ts[34]` | `uint32 × 34` | 24 | **存「相对 `base_counter` 的偏移 + 1」**，见下方编码约定。`0` = 未采集；`0xFFFFFFFF` = 该模式下不存在（见 §8.5）；`0xFFFFFFFE` = 偏移饱和（区间 ≥ 约 42.9 秒 @100MHz） |
+| `socket_id` | `uint32` | 160 | |
+| `remote_ip` | `uint32` | 164 | |
+| `req_size` | `uint32` | 168 | |
+| `rsp_size` | `uint32` | 172 | |
+| `method_id` | `uint32` | 176 | method 名走离线查表，避免变长字段；id 0 保留（未识别 method），见「方法名表」一节 |
+| `error_code` | `int32` | 180 | |
+| `remote_port` | `uint16` | 184 | |
+| `role` | `uint8` | 186 | `LatencyTraceRole`：client=0 / server=1 |
+| `attempt` | `uint8` | 187 | 重试 / backup-request 序号 |
+| （尾部填充） | — | 188 | 4 字节对齐填充，凑满 192；无意义字节，不代表数据 |
+
+`remote_ip`/`remote_port`/`role`/`attempt` 在结构体里并不相邻——它们被 `req_size`/`rsp_size`/`method_id`/`error_code` 隔开（见上表偏移列）。一个只看字段名分组、不看实际声明顺序写的 `struct.unpack` 格式串会在这四个字段上错位。
 
 存**相对偏移**而非绝对值，把 `34 × 8` 压到 `34 × 4`。`uint32` 在 3 GHz TSC 下可表示 1.43 秒，足够覆盖单次 RPC。
 
@@ -345,7 +351,7 @@ link_up = link_down = L / 2
 
 不使用 `butil::cpuwide_time_ns()` 的理由：两个构建系统的 `WITH_CPU_FREQUENCY` **默认均为 0**（`config_brpc.sh:70`，`CMakeLists.txt:81`），此时 `cpuwide_time_ns()` 退化为 `clock_gettime(CLOCK_MONOTONIC)` 的 vDSO 调用（`butil/time.h:279-284`），比一条 `mrs` 指令贵得多。Phase 0 将实测二者差值。
 
-**缓冲**：分片环形数组，分片数取「worker 数向上取 2 的幂」。分配槽为 `cursor.fetch_add(1)`；`handle = (shard << 56) | seq`，槽下标 `seq & mask`。每次写入前校验槽内 `slot_seq` 是否仍等于 handle 携带的 seq，不等则丢弃该次写入 —— 防止迟到的回填（例如卡住很久的 `KeepWrite`）写脏已被复用的槽。
+**缓冲**：分片环形数组，分片数取「worker 数向上取 2 的幂」。分配槽为 `cursor.fetch_add(1)`；`handle = ((shard + 1) << 56) | seq`（**注意是 `shard + 1`，不是 `shard`**——`shard` 从 0 开始，若不加 1，`shard == 0` 且 `seq == 0` 的第一个槽会编码出 `handle == 0`，与 `LT_INVALID_HANDLE` 撞车；`Get()` 解码时相应地做 `shard = (h >> 56) - 1`。`latency_trace.h` 里 `LatencyTraceHandle` 声明处的注释仍写的是旧公式 `(shard << 56) | seq`，与 `.cpp` 的 `AllocSlot()`/`Get()` 实现不一致——这是那条注释本身的问题，不是这份设计文档说的机制；`merge.py` 不需要关心这个字段，句柄从不落盘，只存在于进程内），槽下标 `seq & mask`。每次写入前校验槽内 `slot_seq` 是否仍等于 handle 携带的 seq，不等则丢弃该次写入 —— 防止迟到的回填（例如卡住很久的 `KeepWrite`）写脏已被复用的槽。
 
 **`base_counter` 必须是该记录时间轴的起点，而不是「槽被分配的那一刻」。** 二者在客户端碰巧一致，在服务端必然不一致：
 
@@ -435,6 +441,33 @@ LT_STAMP(handle, POINT_ID)   // BRPC_LATENCY_TRACE 未定义时展开为空语�
 | `-latency_trace_capacity` | `100000` | 记录条数上限 |
 | `-latency_trace_dump_path` | 空 | 落盘路径；空则不落盘 |
 
+**文件头结构 `LatencyTraceFileHeader`**（POD，128 字节固定，`merge.py` 按此顺序 `struct.unpack`；偏移以字节为单位，从文件起始处算起）：
+
+| 字段 | 类型 | 偏移 | 说明 |
+|---|---|---|---|
+| `magic` | `uint64` | 0 | 见下方「magic 常量」 |
+| `record_size` | `uint32` | 8 | `sizeof(LatencyTraceRecord)`，当前为 192 |
+| `point_count` | `uint32` | 12 | `LT_POINT_COUNT`，当前为 34 |
+| `head_counter` | `uint64` | 16 | 进程启动时采样的计数器值 |
+| `head_monotonic_ns` | `int64` | 24 | 进程启动时的 `CLOCK_MONOTONIC`（见下方校准表） |
+| `tail_counter` | `uint64` | 32 | dump 时采样的计数器值 |
+| `tail_monotonic_ns` | `int64` | 40 | dump 时的 `CLOCK_MONOTONIC` |
+| `head_realtime_ns` | `int64` | 48 | 进程启动时的 `CLOCK_REALTIME`，仅供跨机 sanity check |
+| `tail_realtime_ns` | `int64` | 56 | dump 时的 `CLOCK_REALTIME`，仅供跨机 sanity check |
+| `counter_freq_hz` | `double` | 64 | 权威值，由 `(tail_counter − head_counter) × 1e9 / (tail_monotonic_ns − head_monotonic_ns)` 经验计算 |
+| `cntfrq_el0_hz` | `uint64` | 72 | 交叉校验用；非 aarch64 上恒为 0 |
+| `record_count` | `uint64` | 80 | 实际写入的记录条数（写完记录循环后回填，见下） |
+| `dropped_count` | `uint64` | 88 | 因缓冲已满而丢弃的记录数 |
+| `process_tag` | `uint64` | 96 | 本进程随机 tag，即每条 `trace_id` 的高 32 位 |
+| `method_table_offset` | `uint64` | 104 | 方法名表的**文件绝对偏移**（从文件起始算起，非从头部或记录区之后算起，虽然两者数值上一致，见下方「方法名表」） |
+| （尾部填充） | — | 112 | 16 字节填充，凑满 128；无意义字节 |
+
+`record_count` 与 `method_table_offset` 这两个字段不是在写头部时一次性确定的：`Dump()` 先以占位值（`0`）写出头部，再写完所有记录、统计出真实写入条数 `written` 后，回退到文件开头用真实值重写头部，再回到记录区末尾继续写方法表。这保证了即使并发流量在 dump 过程中继续调用 `AllocSlot()`，头部记录的条数也始终等于磁盘上实际存在的记录数，不会出现头部声称的条数比实际写入的多（进而 `method_table_offset` 指向记录区中间）的情况。
+
+**magic 常量**：`LT_FILE_MAGIC` 的值是 `0x4252504C54524331ULL`。按大端字节序读这个字面量，拼出的字符串是 `"BRPLTRC1"`（`BRP` 之后**没有** `C`——不是 `"BRPCLTRC1"`）。但落盘格式是小端（本模块编译目标 x86_64 与 aarch64 都是小端主机），所以文件里从低地址到高地址实际的 8 个字节拼出的是 `"1CRTLPRB"`。`merge.py` 校验 magic 时要么按小端读出 8 字节后与 `b'1CRTLPRB'` 比较，要么把 `0x4252504C54524331` 按小端 pack 成 8 字节再比较；**不要**直接与 `b'BRPCLTRC1'`（9 字符，还多拼了个不存在的 `C`）比较——那既拼错了字符串，字节序也反了。
+
+**方法名表**：紧跟在最后一条记录之后，起始偏移即 `method_table_offset`（= `sizeof(header) + record_count × sizeof(record)`，128 + 192 × 实际记录数）。格式为一个 `uint32 count`，随后是 `count` 个条目，每个条目是 `uint32 len` + `len` 字节原始内容（UTF-8，无结尾 `NUL`）。第 `i` 个条目（0-based）对应 `LatencyTraceRecord::method_id == i + 1` 的方法全名；`method_id == 0` 保留给「未识别 method」，因此表里没有第 0 项。
+
 **时钟校准**：dump 文件头写入**两对**采样，进程启动时与 dump 时各取一次：
 
 | 字段对 | 时钟 | 用途 |
@@ -504,7 +537,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 
 输入两端 dump 文件，输出中间 JSON：
 
-1. 读文件头。**频率只能由 `head_monotonic_ns` / `tail_monotonic_ns` 这一对算出**（见 §8.1 的表；realtime 那一对仅供跨机 sanity check，不参与频率计算）。**按 §8.1 的编码约定解码 `ts[i]`**：`0` 表示未采集（跳过，不要当成 0 偏移）；`0xFFFFFFFF` 表示该模式下不存在（标注 N/A，见 §8.5）；`0xFFFFFFFE` 表示饱和（区间 ≥ 约 42.9 秒，标注为下界而非精确值）；其余值的真实偏移是 `ts[i] − 1`。据此把 `base_counter + (ts[i] − 1)` 换算为各自进程时钟下的纳秒值。
+1. 读文件头（128 字节，字段顺序与偏移见 §8.1 的 `LatencyTraceFileHeader` 表）。**先校验 `magic`**：文件里小端读出的 8 字节应为 `b'1CRTLPRB'`（见 §8.1「magic 常量」），不匹配则拒绝该文件，不要继续解析。**频率只能由 `head_monotonic_ns` / `tail_monotonic_ns` 这一对算出**（见 §8.1 的表；realtime 那一对仅供跨机 sanity check，不参与频率计算）。**按 §8.1 的编码约定解码 `ts[i]`**：`0` 表示未采集（跳过，不要当成 0 偏移）；`0xFFFFFFFF` 表示该模式下不存在（标注 N/A，见 §8.5）；`0xFFFFFFFE` 表示饱和（区间 ≥ 约 42.9 秒，标注为下界而非精确值）；其余值的真实偏移是 `ts[i] − 1`。据此把 `base_counter + (ts[i] − 1)` 换算为各自进程时钟下的纳秒值。方法名按 `method_table_offset`（§8.1「方法名表」）读出，`method_id − 1` 索引其中的条目，`method_id == 0` 表示未识别。
 2. 按 `trace_id` join 客户端与服务端记录。未配对的记录单独统计并报告（数量、原因分类）。
 3. 按 §6 的两种模型分别计算 `link_up` / `link_down`。
 4. 计算 33 个分解项。
