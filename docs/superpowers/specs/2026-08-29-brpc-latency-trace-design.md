@@ -324,6 +324,22 @@ link_up = link_down = L / 2
 
 因此 `AllocSlot` 接受基准计数值作为参数：客户端传当前时刻，服务端传它已经寄存在 `Socket` 上的 wake 时间戳（§8.2 的透传链路）。这样每条记录的 `base_counter` 都不晚于它自己的第一个点位。
 
+**`base_counter` 永远是真实计数值，绝不能是哨兵。** 这是 §8.1 与 §8.5 之间一处必须显式对账的地方，两条决策分别成立、合起来却会互相摧毁：
+
+- §8.1 要求服务端把 **wake 时间戳**作为 `base_counter` 传给 `AllocSlot`（因为 S01–S04 都早于建槽时刻）。
+- §8.5 要求轮询模式下 wake **写哨兵**（因为那个事件根本不存在）。
+
+两者相乘的结果是 `base_counter = 0xFFFFFFFF...`，而 `AllocSlot` 原样存下它、不做哨兵检查。于是：
+
+| 点位类别 | 后果 |
+|---|---|
+| 经 `StampAt` 写入（S01–S06） | 撞上 `raw < base` 的 clamp，全部塌成 `ts = 1`。错，但不刺眼 |
+| 经 `Stamp()` 写入（S09 起） | **没有 clamp**。`clock_cycles() − ~0ULL` 回绕成 `clock_cycles()+1`；而计数器是**自开机**计数，主机开机超过约 43 秒即饱和到 `0xFFFFFFFE`。**每一条轮询模式的服务端记录都显示 S09–S17 耗时约 43 秒**，确定性发生 |
+
+**因此：`AllocSlot` 的三参重载必须拒绝哨兵基准。** 轮询模式下服务端改传 `readv_start`——§8.5 自己的表格已经写明该点位在两种模式下都是真实值。哨兵只属于 `ts[]` 的某一格，永远不属于 `base_counter`。
+
+**RDMA 事件模式的 `wake` 必须取 CQ socket 上已有的值，不能重新采样。** `Socket::OnInputEvent` 已经在真正的「epoll 返回、尚未分发」时刻把 `_lt_wake` 设好了（与 TCP 走同一套 TLS 机制）。若在 `GetAndAckEvents()` 返回**之后**重新读一次 `clock_cycles()`，得到的时刻晚于 `onedge_start`，与 TCP 的结构顺序相反 —— 而 clamp 会把这个倒挂悄悄抹平成两个 `ts = 1`，于是 `srv_wake_to_onedge` 与 `cli_wake_to_onedge` 这两个主分解项恒为零，且断言 `wake <= onedge_start` 空洞通过。正确做法是把 CQ socket 的 `_lt_wake` **拷贝**过去。
+
 **`ts[]` 的编码约定（三个保留值 + 偏移 + 1）**：
 
 | 值 | 含义 |
