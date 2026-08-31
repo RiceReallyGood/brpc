@@ -405,9 +405,16 @@ LT_STAMP(handle, POINT_ID)   // BRPC_LATENCY_TRACE 未定义时展开为空语�
 | `-latency_trace_capacity` | `100000` | 记录条数上限 |
 | `-latency_trace_dump_path` | 空 | 落盘路径；空则不落盘 |
 
-**时钟校准**：dump 文件头写入若干组 `(raw_counter, CLOCK_REALTIME)` 采样对（进程启动时与 dump 时各一组），供离线换算。
+**时钟校准**：dump 文件头写入**两对**采样，进程启动时与 dump 时各取一次：
 
-**频率必须由本模块自行标定，不能依赖 `butil`**：`BUTIL_USE_CPU_FREQUENCY=0` 时 `detail::invariant_cpu_freq` 根本不计算。标定方式为**经验测量** —— 用首尾两组采样对求 `Δcounter / Δrealtime`。这比读 `CNTFRQ_EL0` 更可靠：它与架构无关（x86 无对应寄存器），且反映实际速率而非标称值。同时额外读取 `CNTFRQ_EL0`（aarch64）写入文件头作**交叉校验**，两者偏差超过 0.1% 时 `merge.py` 告警。
+| 字段对 | 时钟 | 用途 |
+|---|---|---|
+| `head_monotonic_ns` / `tail_monotonic_ns` | `CLOCK_MONOTONIC` | **频率标定的唯一依据**：`freq = Δcounter / Δmonotonic`。必须用单调钟 —— 实时钟会被 NTP 步进，一次校正就能毁掉整段窗口的商 |
+| `head_realtime_ns` / `tail_realtime_ns` | `CLOCK_REALTIME` | **仅供跨机 sanity check**，不参与频率计算。两台机器的单调钟各自从自己开机起算，直接相减无意义；实时钟才有共同参照 |
+
+`merge.py` 算频率时**只能用 monotonic 那一对**。用错会引入 NTP 步进带来的系统性偏差，而这个偏差看起来完全像是计数器频率不准。
+
+**频率必须由本模块自行标定，不能依赖 `butil`**：`BUTIL_USE_CPU_FREQUENCY=0` 时 `detail::invariant_cpu_freq` 根本不计算。标定方式为**经验测量** —— 用首尾两组 monotonic 采样求 `Δcounter / Δmonotonic`（理由见上表）。这比读 `CNTFRQ_EL0` 更可靠：它与架构无关（x86 无对应寄存器），且反映实际速率而非标称值。同时额外读取 `CNTFRQ_EL0`（aarch64）写入文件头作**交叉校验**，两者偏差超过 0.1% 时 `merge.py` 告警。
 
 这一项是 D1 公式的正确性前提：`L = RTT − S` 用客户端时钟的时长减服务端时钟的时长，任一台机器的频率标定错误都会给 `L` 引入系统性偏差。
 
@@ -467,7 +474,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 
 输入两端 dump 文件，输出中间 JSON：
 
-1. 读文件头，取频率与校准对。**按 §8.1 的编码约定解码 `ts[i]`**：`0` 表示未采集（跳过，不要当成 0 偏移）；`0xFFFFFFFF` 表示该模式下不存在（标注 N/A，见 §8.5）；`0xFFFFFFFE` 表示饱和（区间 ≥ 约 42.9 秒，标注为下界而非精确值）；其余值的真实偏移是 `ts[i] − 1`。据此把 `base_counter + (ts[i] − 1)` 换算为各自进程时钟下的纳秒值。
+1. 读文件头。**频率只能由 `head_monotonic_ns` / `tail_monotonic_ns` 这一对算出**（见 §8.1 的表；realtime 那一对仅供跨机 sanity check，不参与频率计算）。**按 §8.1 的编码约定解码 `ts[i]`**：`0` 表示未采集（跳过，不要当成 0 偏移）；`0xFFFFFFFF` 表示该模式下不存在（标注 N/A，见 §8.5）；`0xFFFFFFFE` 表示饱和（区间 ≥ 约 42.9 秒，标注为下界而非精确值）；其余值的真实偏移是 `ts[i] − 1`。据此把 `base_counter + (ts[i] − 1)` 换算为各自进程时钟下的纳秒值。
 2. 按 `trace_id` join 客户端与服务端记录。未配对的记录单独统计并报告（数量、原因分类）。
 3. 按 §6 的两种模型分别计算 `link_up` / `link_down`。
 4. 计算 35 个分解项。
