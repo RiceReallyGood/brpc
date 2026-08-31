@@ -282,7 +282,24 @@ static_assert(sizeof(LatencyTraceFileHeader) == 128,
               "parses verbatim -- it must stay exactly 128 bytes");
 
 // Sharded ring buffer of records. One shard per group of workers keeps
-// the allocation cursor off a single contended cacheline.
+// the allocation cursor off a single contended cacheline in the common
+// (uncontended) case.
+//
+// Fix-round item 1: -latency_trace_capacity must mean what it says even
+// for a single-threaded producer (a synchronous benchmark client is this
+// project's own motivating use case -- design doc sec.1.1), not just for
+// a server whose many worker threads spread across all SHARD_COUNT
+// shards. A thread is pinned to one "home" shard for life (AllocSlot's
+// tls_shard), so before this fix a single-threaded caller could only
+// ever fill 1/SHARD_COUNT of the configured capacity before every
+// further call was dropped, even though the other 15/16 of the buffer
+// sat empty -- see task-a2-report.md's "What was run" for the real
+// capture that surfaced this (100000 requested, 8192 usable). AllocSlot
+// now falls back to another shard once the caller's home shard is full,
+// and only refuses (and counts a drop) once every shard is full. See
+// AllocSlot's own comment for the mechanism and TryReserveSlot for why
+// the fallback path needs a bounded reservation instead of a plain
+// fetch_add.
 class LatencyTraceBuffer {
 public:
     static const int SHARD_COUNT = 16;   // power of two
@@ -290,10 +307,13 @@ public:
 
     static LatencyTraceBuffer* instance();
 
-    // Returns LT_INVALID_HANDLE when tracing is off or the buffer is
-    // full. Samples the counter itself as this record's timeline origin
-    // (base_counter) -- the client's case, where allocation and origin
-    // coincide. See the 3-argument overload for the server's case.
+    // Returns LT_INVALID_HANDLE when tracing is off or every shard is
+    // full (see the class comment for the home-shard-then-fallback
+    // policy -- "the buffer is full" now means ALL shards are, not just
+    // the caller's own). Samples the counter itself as this record's
+    // timeline origin (base_counter) -- the client's case, where
+    // allocation and origin coincide. See the 3-argument overload for
+    // the server's case.
     LatencyTraceHandle AllocSlot(uint64_t trace_id, LatencyTraceRole role);
 
     // Same, but the caller supplies base_counter explicitly instead of
@@ -351,7 +371,20 @@ public:
 
     // Iterates every written slot across all shards by a flat index, so a
     // test can find records without knowing the sharding. Returns nullptr
-    // once `global_seq` is past the last written slot.
+    // once `global_seq` is past the last written slot. Walks shards in
+    // FIXED index order (0, 1, ..., SHARD_COUNT-1) -- with the fix-round
+    // item 1 fallback, that is NOT necessarily allocation order for a
+    // single-threaded producer whose "home" shard isn't shard 0 (its
+    // overflow can land in lower-numbered shards this walk visits
+    // first). What stays true, and is all this function's callers may
+    // rely on: each shard's written slots are still exactly its first
+    // `written` entries with no gaps and no wraparound (see AllocSlot's
+    // fallback comment for why), so every written record is visited
+    // exactly once -- just not necessarily in the order it was recorded
+    // once fallback has spread one thread's records across shards. A
+    // caller that needs "most recent" should key off something in the
+    // record itself (e.g. trace_id) rather than this traversal order --
+    // see this file's end-to-end tests for that pattern.
     const LatencyTraceRecord* GetBySeqForTest(uint64_t global_seq) const;
 
     size_t recorded_count() const;
@@ -408,6 +441,26 @@ private:
         uint64_t mask = 0;
         char padding[BAIDU_CACHELINE_SIZE];
     };
+
+    // Bounded fetch-and-increment: reserves the next slot in `sh` (i.e.
+    // returns its pre-increment cursor value in `*seq` and advances the
+    // cursor by one) ONLY if doing so keeps the cursor under `capacity`;
+    // returns false, leaving `sh` untouched, once the shard is already
+    // full. Used for a fallback target in AllocSlot -- unlike the
+    // caller's own home shard, which the fast path always increments
+    // unconditionally via a plain fetch_add (see AllocSlot), a fallback
+    // target can be raced by unrelated threads: other overflowing
+    // threads probing the same candidate, and -- if `sh` is some OTHER
+    // thread's home shard that has not filled yet -- that thread's own
+    // unconditional fast-path fetch_add too. Mixing a plain fetch_add
+    // and this bounded compare-exchange on the same atomic is safe
+    // (every successful increment, by either mechanism, atomically
+    // claims a distinct, contiguous cursor value with no gaps -- see
+    // AllocSlot's fallback comment) but only THIS bounded form can
+    // refuse once the shard is full instead of overshooting `capacity`
+    // and corrupting the "written slots are exactly the first N, no
+    // wraparound" invariant GetBySeqForTest and Dump() depend on.
+    static bool TryReserveSlot(Shard& sh, int capacity, uint64_t* seq);
 
     Shard _shards[SHARD_COUNT];
     butil::atomic<uint64_t> _dropped;

@@ -467,17 +467,102 @@ TEST_F(LatencyTraceBufferTest, StaleHandleIsRejectedAfterWrapAround) {
 TEST_F(LatencyTraceBufferTest, StopsRecordingWhenFullInsteadOfOverwriting) {
     // Spec D-decision: a full buffer stops recording rather than wrapping,
     // so both ends keep the SAME earliest-N window and stay joinable.
+    //
+    // Fix-round item 1 changed what "full" means: before, one thread only
+    // ever used one shard, so 8 allocations (this shard's capacity) were
+    // enough to exhaust it and see a drop. Now AllocSlot falls back to
+    // another shard once the caller's home shard is full (see the class
+    // comment in latency_trace.h and SingleThreadFillsEntireConfigured
+    // CapacityViaFallback below, which is dedicated to that fallback
+    // itself) -- "full" means every shard is, so this test must actually
+    // exhaust all SHARD_COUNT of them before the drop it asserts on is a
+    // real one and not just an early return this rewrite failed to catch.
     brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
-    // Capacity is per-shard after division, and one thread only ever uses
-    // one shard -- so ask for SHARD_COUNT*8 to get 8 usable slots here.
-    b->ResetForTest(brpc::LatencyTraceBuffer::SHARD_COUNT * 8);
+    const int kPerShardCapacity = 8;   // already a power of two: exact,
+                                        // no NextPowerOfTwo rounding to
+                                        // reason about
+    const int total_capacity =
+        brpc::LatencyTraceBuffer::SHARD_COUNT * kPerShardCapacity;
+    b->ResetForTest(total_capacity);
     b->set_stop_when_full_for_test(true);
-    for (int i = 0; i < 8; ++i) {
-        ASSERT_NE(brpc::LT_INVALID_HANDLE, b->AllocSlot(i, brpc::LT_ROLE_CLIENT));
+    for (int i = 0; i < total_capacity; ++i) {
+        ASSERT_NE(brpc::LT_INVALID_HANDLE, b->AllocSlot(i, brpc::LT_ROLE_CLIENT))
+            << "record " << i << " of " << total_capacity << " should "
+               "still fit -- either this thread's home shard or a "
+               "fallback shard must have room until every shard is full";
     }
-    ASSERT_EQ(brpc::LT_INVALID_HANDLE, b->AllocSlot(999, brpc::LT_ROLE_CLIENT));
-    ASSERT_EQ(8u, b->recorded_count());
+    ASSERT_EQ(brpc::LT_INVALID_HANDLE, b->AllocSlot(999, brpc::LT_ROLE_CLIENT))
+        << "every shard is genuinely full now -- this one must be dropped";
+    ASSERT_EQ((size_t)total_capacity, b->recorded_count());
     ASSERT_EQ(1u, b->dropped_count());
+}
+
+TEST_F(LatencyTraceBufferTest,
+       SingleThreadFillsEntireConfiguredCapacityViaFallback) {
+    // Fix-round item 1: -latency_trace_capacity must mean what it says
+    // even for a single-threaded producer -- this project's own
+    // motivating use case is a synchronous benchmark client (design doc
+    // sec.1.1), and AllocSlot pins a thread to one "home" shard for
+    // life. Before this fix, a single-threaded caller could only ever
+    // fill 1/SHARD_COUNT of the requested capacity before every further
+    // call was dropped, even with 15/16 of the buffer still empty --
+    // see task-a2-report.md's "What was run" for the real capture that
+    // surfaced this (100000 requested, only 8192 usable). The fix: once
+    // a thread's own shard is full, AllocSlot falls back to another
+    // shard instead of dropping, and only refuses once every shard is
+    // full.
+    brpc::LatencyTraceBuffer* b = brpc::LatencyTraceBuffer::instance();
+    const int kShards = brpc::LatencyTraceBuffer::SHARD_COUNT;
+    const int kPerShardCapacity = 256;   // already a power of two: exact,
+                                          // no NextPowerOfTwo rounding to
+                                          // reason about
+    const int total_capacity = kShards * kPerShardCapacity;
+    b->ResetForTest(total_capacity);
+    b->set_stop_when_full_for_test(true);
+
+    // Every call below runs on this one test thread, so it all lands on
+    // a single "home" shard until fallback kicks in -- exactly the
+    // single-threaded-client shape this fix targets.
+    for (int i = 0; i < total_capacity; ++i) {
+        ASSERT_NE(brpc::LT_INVALID_HANDLE, b->AllocSlot(i, brpc::LT_ROLE_CLIENT))
+            << "record " << i << " of " << total_capacity << " should "
+               "have been accepted -- either the home shard's fast path "
+               "or a fallback shard must still have room";
+    }
+    // One past capacity: every shard is genuinely full now, so this one
+    // (and only this one) must be dropped.
+    ASSERT_EQ(brpc::LT_INVALID_HANDLE,
+              b->AllocSlot(999999, brpc::LT_ROLE_CLIENT));
+
+    ASSERT_EQ((size_t)total_capacity, b->recorded_count())
+        << "the whole configured capacity must be usable by a single "
+           "thread, not just one shard's worth of it";
+    ASSERT_EQ(1u, b->dropped_count());
+
+    // Prove the fallback actually spread records across shards, rather
+    // than the counts above coincidentally matching some other way:
+    // every trace_id in [0, total_capacity) must appear exactly once via
+    // GetBySeqForTest's flat traversal (which is robust to allocation
+    // order -- see its own comment on why fallback breaks "shard order
+    // == chronological order" but not "no gaps, no wraparound").
+    std::set<uint64_t> seen;
+    for (uint64_t seq = 0; ; ++seq) {
+        const brpc::LatencyTraceRecord* r = b->GetBySeqForTest(seq);
+        if (r == nullptr) {
+            break;
+        }
+        ASSERT_TRUE(seen.insert(r->trace_id).second)
+            << "trace_id " << r->trace_id << " observed twice -- a slot "
+               "was written into by two different records (a fallback "
+               "correctness bug), not just visited in a different order";
+    }
+    ASSERT_EQ((size_t)total_capacity, seen.size());
+    for (uint64_t i = 0; i < (uint64_t)total_capacity; ++i) {
+        ASSERT_EQ(1u, seen.count(i))
+            << "trace_id " << i << " missing -- a gap in some shard's "
+               "written-slot range, breaking GetBySeqForTest's "
+               "no-wraparound assumption";
+    }
 }
 
 TEST_F(LatencyTraceBufferTest, GetBySeqForTestWalksWrittenSlotsInOrder) {

@@ -20,6 +20,23 @@
 #   CAPTURE_REQUESTS    number of sequential requests to drive on the
 #                        client's single channel before stopping it
 #                        (default: 3000)
+#   CAPTURE_TRACE_CAPACITY
+#                        overrides -latency_trace_capacity on BOTH ends
+#                        (default: unset, i.e. the flag's own default,
+#                        100000). Added for fix-round item 1: proving
+#                        -latency_trace_capacity means what it says for
+#                        the client's single blocking thread means
+#                        requesting a specific capacity and checking the
+#                        client's dump actually holds that many records
+#                        (recorded_count/dropped_count are in the file
+#                        header -- see decode_c08_c09.py or merge.py for
+#                        how to read it back out). Before that fix this
+#                        had to be done with a one-off hand-rolled ssh
+#                        invocation (see task-a2-report.md's "What was
+#                        run") because the client -- one thread -- could
+#                        only ever fill 1/SHARD_COUNT of the requested
+#                        capacity before being dropped, no matter how
+#                        large CAPTURE_REQUESTS was.
 #
 # out_dir (positional, optional): local directory to copy the two dump
 # files into (default: /tmp/lt_capture_out). Not committed -- this script
@@ -34,6 +51,7 @@ HOST="${LT_BUILD_HOST:-suzhou950}"
 DEST="${LT_BUILD_DIR:-brpc-lt-traced}"
 PORT="${CAPTURE_PORT:-9541}"
 N="${CAPTURE_REQUESTS:-3000}"
+CAPACITY="${CAPTURE_TRACE_CAPACITY:-}"
 OUT_DIR="${1:-/tmp/lt_capture_out}"
 
 cd "$(dirname "$0")/../.."
@@ -68,11 +86,26 @@ ssh "$HOST" "cd \"$DEST/example/echo_c++\" && \
     make NEED_GPERFTOOLS=0 -j8 >/tmp/lt_capture_ex_build.log 2>&1" \
   || { echo "capture.sh: remote example build failed -- see $HOST:/tmp/lt_capture_ex_build.log" >&2; exit 1; }
 
-echo "== [5/6] running server + client ($N sequential requests on one channel, port $PORT) =="
-ssh "$HOST" bash -s -- "$DEST" "$PORT" "$N" <<'REMOTE'
+CAPACITY_DESC="${CAPACITY:-<default>}"
+echo "== [5/6] running server + client ($N sequential requests on one channel, port $PORT, latency_trace_capacity=$CAPACITY_DESC) =="
+# "NONE" as a placeholder for "not set", not the empty string: ssh joins
+# its trailing arguments into a single remote command line without
+# preserving empty-string quoting, so an empty "$CAPACITY" here would
+# silently vanish instead of arriving as $4 -- the remote side would then
+# read $3 into its own $4 and fail on the missing final argument.
+ssh "$HOST" bash -s -- "$DEST" "$PORT" "$N" "${CAPACITY:-NONE}" <<'REMOTE'
 set -uo pipefail
-DEST="$HOME/$1"; PORT="$2"; N="$3"
+DEST="$HOME/$1"; PORT="$2"; N="$3"; CAPACITY="$4"
 cd "$DEST/example/echo_c++"
+
+# CAPACITY == NONE (the common case) means "use the flag's own default" --
+# passing -latency_trace_capacity= with no value would be a gflags parse
+# error, so build the extra arg conditionally instead of always emitting
+# the flag.
+CAPACITY_FLAG=""
+if [ "$CAPACITY" != "NONE" ]; then
+    CAPACITY_FLAG="-latency_trace_capacity=$CAPACITY"
+fi
 
 # Clean up a stale run on the same port, if any.
 pkill -f "echo_server -port=$PORT " 2>/dev/null || true
@@ -92,6 +125,7 @@ rm -f "$DEST/lt_server.dump" "$DEST/lt_client.dump" \
 # dump files, SIGINT produced correctly-sized ones.
 ./echo_server -port="$PORT" -idle_timeout_s=-1 \
     -latency_trace_enabled=true -latency_trace_dump_path="$DEST/lt_server.dump" \
+    $CAPACITY_FLAG \
     > /tmp/lt_capture_server.log 2>&1 &
 SERVER_PID=$!
 sleep 1
@@ -108,6 +142,7 @@ fi
 # under which every decomposition item is asserted non-negative.
 ./echo_client -server=127.0.0.1:"$PORT" -interval_ms=0 -timeout_ms=2000 -max_retry=0 \
     -latency_trace_enabled=true -latency_trace_dump_path="$DEST/lt_client.dump" \
+    $CAPACITY_FLAG \
     > /tmp/lt_capture_client.log 2>&1 &
 CLIENT_PID=$!
 

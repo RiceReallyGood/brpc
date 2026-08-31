@@ -210,6 +210,26 @@ LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
     return AllocSlot(trace_id, role, butil::detail::clock_cycles());
 }
 
+// See the declaration in latency_trace.h for the full rationale. This is
+// the standard "bounded fetch-and-increment" idiom: read the current
+// value, and only attempt to publish current+1 while it is still under
+// `capacity`; a failed compare_exchange_weak (spurious or a real
+// concurrent change) reloads `cur` with the actual current value, so the
+// retry always re-checks the up-to-date bound rather than looping on a
+// stale one.
+bool LatencyTraceBuffer::TryReserveSlot(Shard& sh, int capacity,
+                                        uint64_t* seq) {
+    uint64_t cur = sh.cursor.load(butil::memory_order_relaxed);
+    while (cur < (uint64_t)capacity) {
+        if (sh.cursor.compare_exchange_weak(cur, cur + 1,
+                                            butil::memory_order_relaxed)) {
+            *seq = cur;
+            return true;
+        }
+    }
+    return false;
+}
+
 LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
                                                  LatencyTraceRole role,
                                                  uint64_t base_counter) {
@@ -250,12 +270,59 @@ LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
                     & (SHARD_COUNT - 1);
     }
     const int shard = tls_shard;
-    Shard& sh = _shards[shard];
-    const uint64_t seq = sh.cursor.fetch_add(1, butil::memory_order_relaxed);
-    if (_stop_when_full && seq >= (uint64_t)_per_shard_capacity) {
-        _dropped.fetch_add(1, butil::memory_order_relaxed);
-        return LT_INVALID_HANDLE;
+    Shard& home = _shards[shard];
+    // Fast path: unconditional, uncontended-in-the-common-case fetch_add,
+    // exactly as before this fix. Left unbounded on purpose (it keeps
+    // incrementing past `_per_shard_capacity` for as long as this thread
+    // keeps calling AllocSlot after its home shard is full) -- bounding
+    // it here would cost every uncontended call a compare_exchange loop
+    // instead of one fetch_add, and nothing downstream needs it bounded:
+    // recorded_count() already clamps per shard, and a `home_seq` at or
+    // past capacity below is never used to index `home.records`.
+    const uint64_t home_seq = home.cursor.fetch_add(1, butil::memory_order_relaxed);
+
+    int use_shard = shard;
+    uint64_t use_seq = home_seq;
+    if (home_seq >= (uint64_t)_per_shard_capacity) {
+        if (_stop_when_full) {
+            // Home shard is full. Fall back to another shard rather than
+            // dropping while space sits unused elsewhere -- fix-round
+            // item 1, see the class comment. Tried in a fixed ring order
+            // starting just past `shard` so a single-threaded producer's
+            // overflow fills shards one at a time rather than scattering
+            // (not load-balanced -- unnecessary, since this path only
+            // runs once a shard has already filled). Reached only at the
+            // capacity boundary, where the alternative is dropping the
+            // record outright, so the extra cross-shard compare_exchange
+            // traffic here is strictly better than what it replaces.
+            bool found = false;
+            for (int i = 1; i < SHARD_COUNT; ++i) {
+                const int cand = (shard + i) & (SHARD_COUNT - 1);
+                uint64_t cand_seq;
+                if (TryReserveSlot(_shards[cand], _per_shard_capacity, &cand_seq)) {
+                    use_shard = cand;
+                    use_seq = cand_seq;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // Every shard is full: this is the only case that still
+                // counts as "the buffer is full" and gets dropped.
+                _dropped.fetch_add(1, butil::memory_order_relaxed);
+                return LT_INVALID_HANDLE;
+            }
+        }
+        // else: _stop_when_full == false is the test-only overwrite mode
+        // (set_stop_when_full_for_test) -- keep the original behavior
+        // unchanged, verbatim: wrap within the home shard via `& mask`
+        // below using `home_seq` as-is, never fall back to another
+        // shard. Recycling a shard's own slots (the generation-guard
+        // path) is the only thing this mode exists to exercise.
     }
+
+    Shard& sh = _shards[use_shard];
+    const uint64_t seq = use_seq;
     LatencyTraceRecord* r = &sh.records[seq & sh.mask];
     // Invalidate the slot FIRST, before touching anything else in it. The
     // previous occupant's real seq must not still be sitting in slot_seq
@@ -303,8 +370,13 @@ LatencyTraceHandle LatencyTraceBuffer::AllocSlot(uint64_t trace_id,
     // the cursor could ever make it one; a reader on another thread (e.g.
     // Task 5's Dump) must synchronize through slot_seq instead.
     r->slot_seq.store(seq, butil::memory_order_release);
-    // Handle carries seq; slot_seq is the generation guard.
-    return ((uint64_t)(shard + 1) << SHARD_SHIFT) | (seq & 0x00FFFFFFFFFFFFFFULL);
+    // Handle carries seq; slot_seq is the generation guard. Encodes
+    // `use_shard` (where the record actually landed -- the fallback
+    // shard, if this call overflowed its caller's home shard), NOT
+    // `shard` (the caller's home): Get() decodes the shard straight from
+    // the handle, so encoding the wrong one would make every later
+    // Stamp()/Get() call on this handle look at an unrelated slot.
+    return ((uint64_t)(use_shard + 1) << SHARD_SHIFT) | (seq & 0x00FFFFFFFFFFFFFFULL);
 }
 
 LatencyTraceRecord* LatencyTraceBuffer::Get(LatencyTraceHandle h) {
