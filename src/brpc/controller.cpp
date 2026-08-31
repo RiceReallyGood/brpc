@@ -1224,6 +1224,32 @@ void Controller::EndRPC(const CompletionInfo& info) {
                          << " stream_user_data=" << _current_call.stream_user_data
                          << " sending_sock=" << _current_call.sending_sock.get();
         }
+#if defined(BRPC_LATENCY_TRACE)
+        // Fix-round item 3: `_current_call` here is the backup attempt
+        // that lost the race against `_unfinished_call` (the original,
+        // about to be OnComplete'd with end_of_rpc=true just below and
+        // become the RPC's real, final outcome). Call::OnComplete() only
+        // repoints c->_lt_handle -- and therefore only lets OnRPCEnd()
+        // write a real error_code -- for the Call passed with
+        // end_of_rpc=true; this losing backup's own record would
+        // otherwise keep the error_code == 0 it was allocated with,
+        // which reads as "succeeded" to the offline analysis even though
+        // this attempt was in fact cancelled. ECANCELED is already
+        // computed as the error passed to OnComplete() just below --
+        // simply also persist it into this Call's own record. Mirrors
+        // the prev_rec->error_code = EBACKUPREQUEST write IssueRPC makes
+        // into the superseded original's record at the moment a backup
+        // is issued (see IssueRPC): that write marks "the original was
+        // superseded by a backup"; this one marks the opposite outcome,
+        // "the backup was cancelled because the original won".
+        if (_current_call.lt_handle != LT_INVALID_HANDLE) {
+            LatencyTraceRecord* lt_rec =
+                LatencyTraceBuffer::instance()->Get(_current_call.lt_handle);
+            if (lt_rec != nullptr) {
+                lt_rec->error_code = ECANCELED;
+            }
+        }
+#endif
         _current_call.OnComplete(this, ECANCELED, false, false);
         if (_unfinished_call != nullptr) {
             if (_unfinished_call->sending_sock != nullptr) {

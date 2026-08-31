@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <set>
 #include <thread>
@@ -1256,13 +1257,59 @@ static void RunSequentialAsyncEchoRPCs(int port, int n_requests,
             const brpc::LatencyTraceRecord* r = FindLastClientRecordForTest();
             return r != nullptr && r->ts[brpc::LT_C_RPC_END] != 0;
         }, 2000);
+
+        // Fix-round item 2: check the RPC's own outcome BEFORE asserting on
+        // the wait's result, not after. ASSERT_TRUE is fatal (it returns
+        // from this function immediately on failure), so with the old
+        // order an RPC that failed outright and one that succeeded but
+        // never got C19 stamped were indistinguishable -- both stopped at
+        // "timed out waiting for C19" and cntl.Failed() was never reached.
+        // Safe to read cntl here regardless of whether the wait timed out:
+        // cntl's error state was finalized by OnRPCEnd(), which runs
+        // before _done->Run() is ever invoked -- strictly before either
+        // outcome below.
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
         ASSERT_TRUE(stamped)
             << "timed out waiting for C19 (LT_C_RPC_END) to be stamped "
                "on async request " << i;
-        // Safe to read now: cntl's error state was finalized by OnRPCEnd()
-        // before _done->Run() was ever invoked, well before the C19 stamp
-        // this wait just confirmed.
-        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+        // Fix-round item 1: the poll above only proves the plain,
+        // non-atomic ts[LT_C_RPC_END] WORD it read is itself visible on
+        // this thread -- that word is aligned and cannot tear, and the
+        // wait is bounded so it cannot hang, but neither property says
+        // anything about this record's EARLIER ts[] entries, written
+        // (possibly from a different thread/bthread) before C19. aarch64
+        // is not other-multi-copy-atomic for plain stores: this thread
+        // observing the producer's last store does not imply it observes
+        // every earlier store that same producer made, in the same
+        // order. A stale read reads back 0, which is the SAFE direction
+        // (it trips the non-zero assertion below rather than passing
+        // silently) but would send someone chasing an instrumentation
+        // bug that does not actually exist.
+        //
+        // An acquire *load* on the polled word -- e.g. loading
+        // ts[LT_C_RPC_END] with acquire semantics instead of the plain
+        // read WaitForTrue's predicate does today -- would NOT have been
+        // enough. Acquire only orders THIS thread's later operations
+        // (program order) to not move before the load; it says nothing
+        // about ordering the writes that happen-before it on the
+        // PRODUCER's side into visibility here. What is actually needed
+        // is a fence between "observed the sentinel" and "read the
+        // earlier fields" -- i.e. exactly the asymmetry already hit once
+        // on the write side of this same buffer (see
+        // LatencyTraceBuffer::AllocSlot's release-store-is-not-enough
+        // comment in latency_trace.cpp, and the seqlock-reader
+        // discussion in design doc sec.8.1): a plain release *store*
+        // there wasn't enough because release doesn't hold back writes
+        // that follow it; here, symmetrically, a plain (or even acquire-
+        // loaded) read of the sentinel isn't enough to hold back reads
+        // that follow IT. Only an explicit fence closes that gap.
+        //
+        // Stamp() itself deliberately uses plain, unfenced stores (see
+        // design doc sec.8.1) -- that is an accepted trade-off on the
+        // write side, not an oversight, so the fix belongs here, on the
+        // read side.
+        butil::atomic_thread_fence(butil::memory_order_acquire);
     }
 
     *out_client = FindLastClientRecordForTest();
@@ -1679,6 +1726,21 @@ TEST(LatencyTraceMetaTest, OriginalAttemptWinningOverBackupGetsFinalOutcome) {
     ASSERT_EQ(0, original->error_code)
         << "the original attempt's record should carry the RPC's true "
            "final outcome after it wins the race against its own backup";
+
+    // Fix-round item 3: the LOSING backup's own record must not keep the
+    // error_code == 0 it was allocated with -- that reads as "succeeded"
+    // to the offline analysis even though this attempt was in fact
+    // cancelled (Controller::EndRPC's "a previous non-backup request
+    // responded" branch calls _current_call.OnComplete(this, ECANCELED,
+    // false, false) for exactly this attempt). ECANCELED is already
+    // computed at that call site; it must also be persisted into this
+    // Call's own record, mirroring the prev_rec->error_code =
+    // EBACKUPREQUEST write IssueRPC makes into the superseded original's
+    // record at the moment a backup is issued.
+    ASSERT_EQ(ECANCELED, backup->error_code)
+        << "the losing backup's own record should record that it was "
+           "cancelled, not keep the zero (\"success\") it was allocated "
+           "with";
 
     server.Stop(0);
     server.Join();
