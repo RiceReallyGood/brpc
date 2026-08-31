@@ -187,3 +187,64 @@ LT_BUILD_DIR=brpc-lt-traced ./tools/latency_trace/capture.sh /tmp/lt_capture_out
 hexdump -C /tmp/lt_capture_out/server.dump | head -8
 hexdump -C /tmp/lt_capture_out/client.dump | head -8
 ```
+
+## Run 3: committed fixture for `test_merge.py` (Task B)
+
+**Date:** 2026-09-01, same session as Task B (`merge.py`). Run 2's dump files lived
+under `/tmp` on `suzhou950` and did not survive to this task (`/tmp` is not
+persistent on that host) -- `merge.py`'s test suite needs bytes it can load without
+SSH access to a remote build host, so this run's dumps are committed at
+`tools/latency_trace/testdata/{client,server}.dump` (618784 bytes each) rather than
+regenerated on demand. Produced by the exact `capture.sh` invocation in
+"Reproducing" above, same build (`latency-trace` branch, traced config, aarch64
+`suzhou950`), same workload (`echo_c++`, one channel, sequential blocking calls,
+`outstanding=1`) -- only the record count differs from Run 2, which is expected:
+`capture.sh` stops the client once it has logged `CAPTURE_REQUESTS` (default 3000)
+responses, and the exact count that accumulates before the polling loop notices and
+sends SIGINT depends on scheduling, not a fixed target. Do not expect a future
+re-run to reproduce 3222 exactly; expect it to reproduce the *properties* below.
+
+| | server.dump | client.dump |
+|---|---|---|
+| file size | 618784 bytes | 618784 bytes |
+| `record_count` | 3222 | 3222 |
+| `dropped_count` | 0 | 0 |
+| `counter_freq_hz` | 100000023.19 Hz | 100000049.54 Hz |
+| `cntfrq_el0_hz` | 100000000 Hz | 100000000 Hz |
+| `process_tag` | 3710456675 (0xdd162d63) | 1233189988 (0x498...; low 32 of every client trace_id) |
+| `method_table_offset` | 618752 | 618752 |
+
+Method table: both files, `count=1`, `{1: "example.EchoService.Echo"}` -- matches
+Run 2.
+
+**Join**: client ids 3222, server ids 3222, joined 3222, only-in-client 0,
+only-in-server 0 -- **100.0000% join both directions**, same as Run 2.
+
+**`merge.py`'s four sec.10.1 assertions, applied to all 3222 joined pairs**:
+
+| rejection reason | count |
+|---|---|
+| `unstamped_point` | 0 |
+| `non_monotonic` | 0 |
+| `negative_decomposition_item` | 5 |
+| `negative_rtt_late_write_end_stamp` | 0 |
+
+3217/3222 (99.845%) accepted into statistics. The 5 rejects are **not** the
+`C09 < C08` anomaly Run 1 surfaced (that bucket is 0 here, consistent with Run 2's
+0/3169) -- they are records where `link_total = RTT - S` is slightly negative (range
+-6000ns to -820ns, i.e. sub-6-microsecond), which design doc sec.6.1 explicitly
+anticipates as a real, unclipped outcome of measuring two independently-clocked
+hosts' round trip and one-way span this way, not a bug. See
+`.superpowers/sdd/2026-08-29-latency-trace-instrumentation/task-b-report.md` for
+the per-record detail and for a real merge.py bug this run caught (model B's
+sliding-window offset estimator was anchoring on one of these same 5
+already-rejected records before the fix).
+
+One additional real finding: the very first request (`trace_id` low32 `0`) has
+`e2e_ns` ≈ 7.06ms against a median around 30-80µs for the rest -- two orders of
+magnitude higher. The decomposition attributes essentially all of it to a single
+item, `srv_dispatch` (S06→S07, "查 service/method、并发限制、建 Controller") at
+≈5.82ms. Not investigated further here (out of Task B's scope, which is the merger,
+not the runtime) but worth flagging for whoever looks at cold-start/warm-up
+behavior next: this smells like a one-time lookup or lock cost on the very first
+request to hit a freshly-started service, not steady-state dispatch cost.
