@@ -10,6 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-29-brpc-latency-trace-design.md`
 
+> **2026-09-02 的改名，本文已同步：** 收侧点位 `LT_{C,S}_READV_START` /
+> `Socket::_lt_readv_start` / `InputMessageBase::lt_readv_start()` 已分别改名为
+> `LT_{C,S}_READ_START` / `_lt_read_start` / `lt_read_start()`，分解项 `*_readv` 与
+> `*_write_syscall` 改为 `*_read` 与 `*_write`。原因见设计文档 §5 的命名说明：
+> 这些区间在 RDMA 下既不是 `readv` 也不是系统调用。**本计划执行当时用的是旧名**，
+> 正文里的标识符是事后同步过来的 —— 若要对照 2026-09-02 之前的提交，请按上面的对应关系换算。
+> 点位顺序、`ts[]` 下标与落盘格式均未变动。
+
 ## Global Constraints
 
 - 代码风格：Google C++ Style，**4 空格缩进**（brpc 惯例）
@@ -403,7 +411,7 @@ enum LatencyTracePoint {
     LT_C_WRITE_END,
     LT_C_WAKE,
     LT_C_ONEDGE_START,
-    LT_C_READV_START,
+    LT_C_READ_START,
     LT_C_MSG_RECV_DONE,
     LT_C_RSP_META_DESER_START,
     LT_C_RSP_META_DESER_END,
@@ -415,7 +423,7 @@ enum LatencyTracePoint {
     // ---- server, 17 points ----
     LT_S_WAKE,
     LT_S_ONEDGE_START,
-    LT_S_READV_START,
+    LT_S_READ_START,
     LT_S_MSG_RECV_DONE,
     LT_S_REQ_META_DESER_START,
     LT_S_REQ_META_DESER_END,
@@ -1387,8 +1395,8 @@ git commit -m "feat(latency-trace): stamp client send-side points C01-C08"
 
 **Interfaces:**
 - Produces:
-  - `Socket::_lt_wake` / `_lt_onedge_start` / `_lt_readv_start`（原始计数值，`#if` 保护）
-  - `InputMessageBase::_lt_wake` / `_lt_onedge_start` / `_lt_readv_start` / `_lt_msg_recv_done`
+  - `Socket::_lt_wake` / `_lt_onedge_start` / `_lt_read_start`（原始计数值，`#if` 保护）
+  - `InputMessageBase::_lt_wake` / `_lt_onedge_start` / `_lt_read_start` / `_lt_msg_recv_done`
   - TLS 变量 `tls_lt_epoll_wake`（同一次 `epoll_wait` 返回的 N 个事件共享）
 
 - [ ] **Step 1: 写失败的测试**
@@ -1406,10 +1414,10 @@ TEST(LatencyTraceE2ETest, ReceivePointsAreStampedOnBothSides) {
     for (int p = brpc::LT_S_WAKE; p <= brpc::LT_S_MSG_RECV_DONE; ++p) {
         ASSERT_GT(s->ts[p], 0u) << "server point " << p;
     }
-    // 同一批次内的消息共享 wake 值，因此 wake <= onedge <= readv <= recv_done
+    // 同一批次内的消息共享 wake 值，因此 wake <= onedge <= read <= recv_done
     ASSERT_LE(s->ts[brpc::LT_S_WAKE], s->ts[brpc::LT_S_ONEDGE_START]);
-    ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READV_START]);
-    ASSERT_LE(s->ts[brpc::LT_S_READV_START], s->ts[brpc::LT_S_MSG_RECV_DONE]);
+    ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READ_START]);
+    ASSERT_LE(s->ts[brpc::LT_S_READ_START], s->ts[brpc::LT_S_MSG_RECV_DONE]);
 }
 ```
 
@@ -1434,7 +1442,7 @@ Expected: FAIL —— 各点位为 0
 
 `Transport::OnEdge`（`transport.h:31`）在 `on_edge_trigger(s.get())` 之前写 `s->_lt_onedge_start`。
 
-`InputMessenger::OnNewMessages` 循环内 `m->DoRead()` 之前写 `m->_lt_readv_start`。
+`InputMessenger::OnNewMessages` 循环内 `m->DoRead()` 之前写 `m->_lt_read_start`。
 
 `ProcessNewMessage` 中每切出一条消息后，把 Socket 上的三个值拷进该 `InputMessageBase`，并记 `_lt_msg_recv_done`。
 
@@ -1608,7 +1616,7 @@ git commit -m "feat(latency-trace): stamp client receive-side points and assert 
 - Test: `test/brpc_latency_trace_unittest.cpp`
 
 **Interfaces:**
-- Consumes: Task 9 的 `Socket::_lt_wake` / `_lt_onedge_start` / `_lt_readv_start`
+- Consumes: Task 9 的 `Socket::_lt_wake` / `_lt_onedge_start` / `_lt_read_start`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1622,7 +1630,7 @@ TEST(LatencyTraceRdmaTest, PollingModeMarksWakeAndOnedgeAsSentinel) {
     const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
     ASSERT_EQ(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_WAKE]);
     ASSERT_EQ(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_ONEDGE_START]);
-    ASSERT_GT(s->ts[brpc::LT_S_READV_START], 0u);
+    ASSERT_GT(s->ts[brpc::LT_S_READ_START], 0u);
 }
 #endif
 ```
@@ -1646,7 +1654,7 @@ Expected: FAIL
 
 `PollCq`（`rdma_endpoint.cpp:1469`）入口：事件模式下把 `GetAndAckEvents` 返回后的计数值写进 `s->_lt_wake`，并把 `PollCq` 入口计数值写进 `s->_lt_onedge_start`；轮询模式（`FLAGS_rdma_use_polling`）下两者都写 `LT_TS_NOT_APPLICABLE` 的哨兵表示。
 
-`ibv_poll_cq`（`:1500`）之前写 `s->_lt_readv_start`。
+`ibv_poll_cq`（`:1500`）之前写 `s->_lt_read_start`。
 
 `:1599` 调 `ProcessNewMessage` 时，Task 9 的拷贝逻辑自动生效，无需改动。
 
