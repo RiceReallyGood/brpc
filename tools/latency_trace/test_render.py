@@ -129,3 +129,192 @@ class TestSyntheticNegativeAndNA(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The zoom/pan/statistics upgrade: end-to-end summary row, two-axis zoom,
+# scrollbars.
+#
+# The existing class above can only assert that certain JS *source*
+# survives, because there is no JS runtime in `python3 -m unittest`.  For
+# the arithmetic added here -- weighted end-to-end percentiles, and the
+# zoom/pan window clamping -- that would be a weak test: the interesting
+# failures are off-by-one and clamping bugs, which string matching cannot
+# see.  So render.py fences its pure numeric helpers between
+# LT_PURE_MATH_BEGIN/END markers, and these tests extract that block and
+# run it under `node` with hand-derived expected values.  The block is
+# deliberately free of DOM and of module-level state so it can run
+# standalone; anything that touches `document` belongs outside the fence.
+# ---------------------------------------------------------------------------
+import shutil
+import subprocess
+
+PURE_BEGIN = "// ---- LT_PURE_MATH_BEGIN ----"
+PURE_END = "// ---- LT_PURE_MATH_END ----"
+
+
+def extract_pure_math(html):
+    """The fenced block of DOM-free numeric helpers from a rendered page."""
+    start = html.index(PURE_BEGIN) + len(PURE_BEGIN)
+    end = html.index(PURE_END)
+    return html[start:end]
+
+
+class TestPureMath(unittest.TestCase):
+    """Runs render.py's fenced numeric helpers under node."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node") or shutil.which("nodejs")
+        if not cls.node:
+            raise unittest.SkipTest("node not found -- cannot execute the page's JS")
+        cls.js = extract_pure_math(render.HTML_TEMPLATE)
+
+    def run_js(self, expr):
+        """Evaluate `expr` after the fenced block; returns the parsed JSON."""
+        script = self.js + "\nconsole.log(JSON.stringify(" + expr + "));\n"
+        out = subprocess.run([self.node, "-e", script], capture_output=True, text=True)
+        if out.returncode != 0:
+            self.fail(f"node failed: {out.stderr.strip()}")
+        return json.loads(out.stdout)
+
+    # -- weightedSummary -------------------------------------------------
+
+    def test_summary_of_1_to_10_all_weight_1(self):
+        # Hand-derived from the h = p*(total-1) linear-interpolation rule
+        # the existing weightedQuantile already uses: for values 1..10,
+        # p50 sits at h=4.5 -> 5.5, p90 at h=8.1 -> 9.1, and so on.
+        pairs = [{"v": v, "w": 1} for v in range(1, 11)]
+        got = self.run_js(f"weightedSummary({json.dumps(pairs)}, 0)")
+        self.assertEqual(got["n"], 10)
+        self.assertEqual(got["naCount"], 0)
+        self.assertAlmostEqual(got["mean"], 5.5)
+        self.assertAlmostEqual(got["p50"], 5.5)
+        self.assertAlmostEqual(got["p90"], 9.1)
+        self.assertAlmostEqual(got["p99"], 9.91)
+        self.assertAlmostEqual(got["p999"], 9.991)
+
+    def test_summary_respects_weights(self):
+        # Values [1, 2] with weights [3, 1] stand for the population
+        # [1,1,1,2] (total weight 4).  Mean = (1*3 + 2*1)/4 = 1.25.
+        # p50: h = 0.5*3 = 1.5, both surrounding ranks land on the value
+        # 1 -> 1.  p99: h = 0.99*3 = 2.97, rank 2 -> 1 and rank 3 -> 2,
+        # interpolated -> 1 + 0.97 = 1.97.  An UNWEIGHTED computation
+        # over the same two rows would give mean 1.5 and p50 1.5.
+        pairs = [{"v": 1, "w": 3}, {"v": 2, "w": 1}]
+        got = self.run_js(f"weightedSummary({json.dumps(pairs)}, 0)")
+        self.assertEqual(got["n"], 4)
+        self.assertAlmostEqual(got["mean"], 1.25)
+        self.assertAlmostEqual(got["p50"], 1.0)
+        self.assertAlmostEqual(got["p99"], 1.97)
+
+    def test_summary_of_nothing_is_null_not_zero(self):
+        # An empty scope (e.g. a zoom window a filter emptied out) must
+        # read as "no data" -- a 0 here would print as "0 ns", which is a
+        # measurement claim, not an absence.
+        got = self.run_js("weightedSummary([], 5)")
+        self.assertEqual(got["n"], 0)
+        self.assertEqual(got["naCount"], 5)
+        self.assertIsNone(got["mean"])
+        self.assertIsNone(got["p50"])
+
+    # -- zoomRankWindow --------------------------------------------------
+
+    def test_zoom_in_halves_the_window_about_the_anchor(self):
+        # [0,100) zoomed in 2x about its centre -> [25,75).
+        self.assertEqual(self.run_js("zoomRankWindow(0, 100, 0.5, 0.5, 100)"),
+                         {"lo": 25, "hi": 75})
+        # About the left edge -> the left edge stays put.
+        self.assertEqual(self.run_js("zoomRankWindow(0, 100, 0.5, 0, 100)"),
+                         {"lo": 0, "hi": 50})
+        # About the right edge -> the right edge stays put.
+        self.assertEqual(self.run_js("zoomRankWindow(0, 100, 0.5, 1, 100)"),
+                         {"lo": 50, "hi": 100})
+
+    def test_zoom_out_doubles_and_clamps_to_the_dataset(self):
+        self.assertEqual(self.run_js("zoomRankWindow(25, 75, 2, 0.5, 100)"),
+                         {"lo": 0, "hi": 100})
+        # Already at full extent: zooming out further is a no-op, it must
+        # not run off either end.
+        self.assertEqual(self.run_js("zoomRankWindow(0, 100, 2, 0.5, 100)"),
+                         {"lo": 0, "hi": 100})
+        # Clamping at one end must not eat the width at the other: a
+        # window pinned to rank 0 zoomed out 2x still grows to 2x.
+        self.assertEqual(self.run_js("zoomRankWindow(0, 20, 2, 0, 100)"),
+                         {"lo": 0, "hi": 40})
+
+    def test_zoom_in_stops_at_one_request(self):
+        # The x axis is a virtual rank axis; a window narrower than one
+        # request has nothing to draw.
+        self.assertEqual(self.run_js("zoomRankWindow(10, 11, 0.5, 0.5, 100)"),
+                         {"lo": 10, "hi": 11})
+        self.assertEqual(self.run_js("zoomRankWindow(10, 12, 0.5, 0.5, 100)"),
+                         {"lo": 10, "hi": 11})
+
+    # -- zoomYRange ------------------------------------------------------
+
+    def test_y_zoom_in_from_auto_snapshots_the_auto_domain(self):
+        # First vertical zoom with no lock yet: the current auto-fit
+        # domain becomes the thing being halved.
+        auto = {"lo": 0, "hi": 1000}
+        got = self.run_js(f"zoomYRange(null, {json.dumps(auto)}, 0.5, 500)")
+        self.assertEqual(got, {"lo": 250, "hi": 750})
+
+    def test_y_zoom_anchors_on_the_cursor(self):
+        auto = {"lo": 0, "hi": 1000}
+        got = self.run_js(f"zoomYRange(null, {json.dumps(auto)}, 0.5, 0)")
+        self.assertEqual(got, {"lo": 0, "hi": 500})
+
+    def test_y_zoom_out_past_the_auto_domain_returns_to_auto(self):
+        # The design's "zoom out to the bottom and the axis goes back to
+        # auto-fitting" rule: null, not a range that happens to contain
+        # the data, so a later x-zoom refits instead of staying frozen.
+        auto = {"lo": 0, "hi": 1000}
+        self.assertIsNone(self.run_js(f"zoomYRange({{lo:250,hi:750}}, {json.dumps(auto)}, 4, 500)"))
+        # But a zoom-out that still crops the data keeps the lock.
+        self.assertEqual(self.run_js(f"zoomYRange({{lo:400,hi:600}}, {json.dumps(auto)}, 2, 500)"),
+                         {"lo": 300, "hi": 700})
+
+    # -- panWindow -------------------------------------------------------
+
+    def test_pan_clamps_without_changing_width(self):
+        self.assertEqual(self.run_js("panWindow(10, 20, 5, 0, 100)"), {"lo": 15, "hi": 25})
+        self.assertEqual(self.run_js("panWindow(10, 20, -50, 0, 100)"), {"lo": 0, "hi": 10})
+        self.assertEqual(self.run_js("panWindow(90, 100, 50, 0, 100)"), {"lo": 90, "hi": 100})
+
+
+class TestUpgradeShipsInThePage(unittest.TestCase):
+    """String-level regression net for the parts that need a browser."""
+
+    def setUp(self):
+        if not os.path.exists(SYNTHETIC_IR_PATH):
+            raise unittest.SkipTest(f"{SYNTHETIC_IR_PATH} not found")
+        with open(SYNTHETIC_IR_PATH) as f:
+            self.ir = json.load(f)
+        self.html = render.render_html(self.ir, title="upgrade test")
+
+    def test_every_record_carries_the_end_to_end_value_the_row_reads(self):
+        for meta in self.ir["records_meta"]:
+            self.assertIn("e2e_ns", meta)
+            self.assertIsInstance(meta["e2e_ns"], int)
+
+    def test_end_to_end_row_ships(self):
+        self.assertIn("computeE2eRow", self.html)
+        self.assertIn("weightedSummary", self.html)
+        # Pinned first and excluded from the segment column sort.
+        self.assertIn("e2e-row", self.html)
+
+    def test_two_axis_zoom_controls_ship(self):
+        for el in ("xZoomInBtn", "xZoomOutBtn", "yZoomInBtn", "yZoomOutBtn",
+                   "hScrollTrack", "hScrollThumb", "vScrollTrack", "vScrollThumb"):
+            self.assertIn(el, self.html)
+
+    def test_wheel_and_drag_gestures_ship(self):
+        # Ctrl/cmd + wheel = x zoom, shift + wheel = y zoom (bare wheel
+        # deliberately left to the page, see the gesture table).
+        self.assertIn("ctrlKey", self.html)
+        self.assertIn("metaKey", self.html)
+        self.assertIn("shiftKey", self.html)
+        self.assertIn("'wheel'", self.html)
+        # Drag pans; shift+drag box-zooms both axes.
+        self.assertIn("yLock", self.html)

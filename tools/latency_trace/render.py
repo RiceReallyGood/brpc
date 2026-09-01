@@ -161,12 +161,41 @@ HTML_TEMPLATE = r"""<!doctype html>
   .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; border: 1px solid var(--border); }
   .legend-actions { display: flex; gap: 8px; margin-bottom: 10px; }
   .legend-actions button { font-size: 12px; padding: 4px 9px; }
+  .chart-area { display: flex; align-items: flex-start; gap: 6px; }
+  .chart-col { flex: 1; min-width: 0; }
   .chart-wrap { position: relative; }
-  #chartCanvas { width: 100%; height: 440px; display: block; cursor: crosshair; touch-action: none; }
+  #chartCanvas { width: 100%; height: 440px; display: block; cursor: grab; touch-action: none; }
+  #chartCanvas.panning { cursor: grabbing; }
+  #chartCanvas.boxing { cursor: crosshair; }
   #selOverlay {
-    position: absolute; top: 0; height: 440px; background: color-mix(in srgb, var(--hue-client-send) 18%, transparent);
-    border-left: 1px solid var(--hue-client-send); border-right: 1px solid var(--hue-client-send);
+    position: absolute; background: color-mix(in srgb, var(--hue-client-send) 18%, transparent);
+    border: 1px solid var(--hue-client-send);
     pointer-events: none; display: none;
+  }
+  /* Scrollbars are drawn rather than native: a native one would need a
+     fake oversized content element behind the canvas, which fights the
+     canvas's own devicePixelRatio sizing. The thumb's LENGTH is the
+     point -- it says what fraction of the data (or of the latency
+     domain) the view currently covers, which a bare position indicator
+     would not. */
+  .lt-track { background: var(--gridline); border-radius: 5px; position: relative; touch-action: none; }
+  .lt-track.disabled { opacity: 0.35; pointer-events: none; }
+  .lt-thumb { position: absolute; background: var(--text-muted); border-radius: 5px; cursor: grab; }
+  .lt-thumb:hover { background: var(--text-secondary); }
+  .lt-thumb.dragging { background: var(--hue-client-send); cursor: grabbing; }
+  #hScrollTrack { height: 10px; margin: 6px 12px 0 68px; }
+  #hScrollThumb { top: 1px; bottom: 1px; }
+  .vscroll-col { width: 10px; height: 440px; position: relative; flex: none; }
+  #vScrollTrack { position: absolute; left: 0; right: 0; top: 12px; bottom: 26px; }
+  #vScrollThumb { left: 1px; right: 1px; }
+  .zoom-btns { display: flex; gap: 4px; }
+  .zoom-btns button { padding: 6px 9px; font-variant-numeric: tabular-nums; }
+  table.gestures { border-collapse: collapse; font-size: 12px; margin: 8px 0 12px; }
+  table.gestures td { padding: 2px 14px 2px 0; color: var(--text-secondary); vertical-align: top; }
+  table.gestures td.g { color: var(--text-primary); white-space: nowrap; }
+  kbd {
+    font: inherit; font-size: 11px; padding: 1px 5px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--page); color: var(--text-primary);
   }
   #tooltip {
     position: fixed; pointer-events: none; z-index: 50; max-width: 320px;
@@ -189,6 +218,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   table.pct td.name-cell { display: flex; align-items: center; gap: 7px; }
   table.pct td.num { font-variant-numeric: tabular-nums; }
   table.pct tbody tr:hover { background: var(--gridline); }
+  table.pct tbody tr.e2e-row { font-weight: 700; }
+  table.pct tbody tr.e2e-row td { border-bottom: 2px solid var(--border); }
   .table-head-row { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
   .table-scope { font-size: 12.5px; color: var(--text-secondary); }
   .table-wrap { max-height: 640px; overflow: auto; }
@@ -237,6 +268,20 @@ HTML_TEMPLATE = r"""<!doctype html>
         </select>
       </div>
       <div class="control">
+        <label>Zoom (rank axis)</label>
+        <div class="zoom-btns">
+          <button id="xZoomOutBtn" title="Show twice as many requests">X &minus;</button>
+          <button id="xZoomInBtn" title="Show half as many requests">X +</button>
+        </div>
+      </div>
+      <div class="control">
+        <label>Zoom (latency axis)</label>
+        <div class="zoom-btns">
+          <button id="yZoomOutBtn" title="Show twice the latency range">Y &minus;</button>
+          <button id="yZoomInBtn" title="Show half the latency range">Y +</button>
+        </div>
+      </div>
+      <div class="control">
         <label>&nbsp;</label>
         <button id="resetZoomBtn" disabled>Reset zoom</button>
       </div>
@@ -270,20 +315,42 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   <section class="card">
     <h2>Cumulative latency, virtual rank axis</h2>
-    <p class="table-scope">Drag a horizontal range on the chart to zoom into those ranks; the
-      percentile table below follows. When a pixel column covers more than one request, the
-      column shows that column's <em>slowest</em> request (by end-to-end latency) -- the
-      hover tooltip says how many requests the column stands for.</p>
-    <div class="chart-wrap">
-      <canvas id="chartCanvas"></canvas>
-      <div id="selOverlay"></div>
+    <p class="table-scope">When a pixel column covers more than one request, the column shows
+      that column's <em>slowest</em> request (by end-to-end latency) -- the hover tooltip says
+      how many requests the column stands for.</p>
+    <table class="gestures">
+      <tr><td class="g">drag</td><td>pan the rank axis; also the latency axis, once that one is zoomed</td>
+          <td class="g"><kbd>Ctrl</kbd>/<kbd>&#8984;</kbd> + wheel</td><td>zoom the rank axis, anchored at the cursor</td></tr>
+      <tr><td class="g"><kbd>Shift</kbd> + drag</td><td>box-zoom: the box sets both the rank window and the latency window</td>
+          <td class="g"><kbd>Shift</kbd> + wheel</td><td>zoom the latency axis, anchored at the cursor</td></tr>
+      <tr><td class="g">scrollbars</td><td>pan; the thumb's length is the fraction currently in view</td>
+          <td class="g">wheel alone</td><td>scrolls the page as usual -- the chart does not capture it</td></tr>
+    </table>
+    <p class="table-scope"><strong>Zooming the rank axis narrows the statistics below</strong> (while the
+      table is set to follow the zoom). <strong>Zooming the latency axis does not</strong> -- it only crops
+      what is drawn, so it is a magnifier, never a filter. Bars that run past the top or bottom of a
+      cropped latency axis are marked with a small triangle at that edge. Once the latency axis is
+      zoomed it stays on a fixed nanosecond range as you pan the rank axis, so bar heights stay
+      comparable between two different rank windows; zoom it back out fully to return it to
+      auto-fitting each window.</p>
+    <div class="chart-area">
+      <div class="chart-col">
+        <div class="chart-wrap">
+          <canvas id="chartCanvas"></canvas>
+          <div id="selOverlay"></div>
+        </div>
+        <div class="lt-track" id="hScrollTrack"><div class="lt-thumb" id="hScrollThumb"></div></div>
+      </div>
+      <div class="vscroll-col">
+        <div class="lt-track" id="vScrollTrack"><div class="lt-thumb" id="vScrollThumb"></div></div>
+      </div>
     </div>
     <div class="neg-row" id="negCallout"></div>
   </section>
 
   <section class="card">
     <div class="table-head-row">
-      <h2 style="margin:0;">Per-segment statistics</h2>
+      <h2 style="margin:0;">Latency statistics</h2>
       <div class="table-scope" id="tableScopeLabel"></div>
       <button id="scopeToggleBtn"></button>
     </div>
@@ -306,6 +373,131 @@ HTML_TEMPLATE = r"""<!doctype html>
 <script>
 'use strict';
 const IR = __LT_IR_JSON__;
+
+// ---------------------------------------------------------------------
+// Pure numeric helpers -- the weighted statistics behind the percentile
+// table, and the window arithmetic behind zooming and panning.
+//
+// This block is fenced, DOM-free, and depends on nothing but its
+// arguments, so test_render.py can lift it straight out of a rendered
+// page and run it under node. That matters because these are exactly
+// the functions whose failures are off-by-ones and clamping mistakes --
+// things asserting "the source still contains this identifier" cannot
+// see. Anything touching `document`, `state` or `IR` belongs on the
+// other side of the fence.
+// ---------------------------------------------------------------------
+// ---- LT_PURE_MATH_BEGIN ----
+// must-fix 1 (fix-round review): merge.py's downsampling keeps the slow
+// tail whole and strides the head to hit a byte budget (right for the
+// chart -- it preserves tail shape). But an UNWEIGHTED percentile over
+// that kept set treats it as if it WERE the population: on the committed
+// fixture forced through --max-mb 0.2, the row labelled P50 read 34420ns
+// (really the true population's 83rd percentile), P90 read the true
+// 96.7th, P99 the true 99.7th -- see the fix-round report for the full
+// before/after. `w` (each row's weight -- 1 for a full-fidelity row,
+// `head_stride` for a strided head row, from WEIGHTS/merge.py's
+// per-record "weight") corrects this: a value that stands for `w`
+// original records counts `w` times, not once, in both the mean and each
+// percentile. When nothing was downsampled every weight is 1 and this is
+// arithmetically identical to the old unweighted computation.
+function weightedQuantile(sortedPairs, prefixWeight, totalWeight, p) {
+  const n = sortedPairs.length;
+  if (n === 0) return null;
+  if (n === 1) return sortedPairs[0].v;
+  const h = p * (totalWeight - 1);
+  const lo = Math.floor(h), hi = Math.ceil(h);
+  const valueAtRank = (k) => {
+    // Smallest index i such that prefixWeight[i] > k -- i.e. the sample
+    // whose weighted "slot" (as if repeated w times) covers virtual
+    // position k. Binary search since prefixWeight is non-decreasing.
+    let a = 0, b = n - 1;
+    while (a < b) {
+      const mid = (a + b) >> 1;
+      if (prefixWeight[mid] > k) b = mid; else a = mid + 1;
+    }
+    return sortedPairs[a].v;
+  };
+  const vLo = valueAtRank(lo), vHi = valueAtRank(hi);
+  return lo === hi ? vLo : vLo + (vHi - vLo) * (h - lo);
+}
+
+// Mean and percentiles over `pairs` ({v, w}), plus the weight that was
+// N/A. Shared by every row of the statistics table -- the end-to-end row
+// and the 33 segment rows -- so the summary line and the breakdown
+// underneath it can never be computed two different ways.
+function weightedSummary(pairs, naWeight) {
+  const sorted = pairs.slice().sort((a, b) => a.v - b.v);
+  let totalWeight = 0;
+  const prefixWeight = new Array(sorted.length);
+  for (let i = 0; i < sorted.length; i++) { totalWeight += sorted[i].w; prefixWeight[i] = totalWeight; }
+  let mean = null;
+  if (totalWeight > 0) {
+    let acc = 0;
+    for (const o of sorted) acc += o.v * o.w;
+    mean = acc / totalWeight;
+  }
+  return {
+    // N / N-A are themselves estimates of the full accepted population's
+    // counts when downsampled (sum of weight, not row count) -- see the
+    // weighting note above weightedQuantile for why this can't just
+    // count rows either.
+    n: Math.round(totalWeight),
+    naCount: Math.round(naWeight),
+    mean,
+    p50: weightedQuantile(sorted, prefixWeight, totalWeight, 0.50),
+    p90: weightedQuantile(sorted, prefixWeight, totalWeight, 0.90),
+    p99: weightedQuantile(sorted, prefixWeight, totalWeight, 0.99),
+    p999: weightedQuantile(sorted, prefixWeight, totalWeight, 0.999),
+  };
+}
+
+// A new [lo, hi) window on the virtual rank axis, scaled by `factor`
+// (< 1 zooms in) about `anchorFrac` -- 0 = the window's left edge, 1 =
+// its right edge -- clamped to [0, n]. Clamping at one end must not eat
+// the width at the other: zooming out from a window pinned at rank 0
+// still doubles its width rather than growing only rightwards to the
+// midpoint. The floor of one request is the axis's resolution limit.
+function zoomRankWindow(lo, hi, factor, anchorFrac, n) {
+  if (n <= 0) return { lo: 0, hi: 0 };
+  const width = Math.max(1, hi - lo);
+  const anchor = lo + anchorFrac * width;
+  const w = Math.max(1, Math.min(n, width * factor));
+  let newLo = anchor - anchorFrac * w;
+  newLo = Math.max(0, Math.min(n - w, newLo));
+  const l = Math.floor(newLo);
+  return { lo: l, hi: Math.max(l + 1, Math.min(n, l + Math.round(w))) };
+}
+
+// A new latency-axis window in nanoseconds, or null meaning "hand the
+// axis back to auto-fitting". `cur` is the current lock (null while
+// auto-fitting, in which case the auto-fit domain is what gets scaled).
+//
+// Returning null rather than a range that merely happens to contain the
+// data today is the point: a frozen range would be refitted to nothing
+// when a later rank zoom moves to a slower slice, and those bars would
+// silently draw off the top.
+function zoomYRange(cur, auto, factor, anchorNs) {
+  const base = cur || auto;
+  const range = Math.max(1e-9, base.hi - base.lo);
+  const frac = (anchorNs - base.lo) / range;
+  const w = range * factor;
+  const lo = anchorNs - frac * w;
+  const hi = lo + w;
+  if (lo <= auto.lo && hi >= auto.hi) return null;
+  return { lo, hi };
+}
+
+// Slide a window by `delta` without changing its width, clamped so it
+// stays inside [min, max].
+function panWindow(lo, hi, delta, min, max) {
+  const width = hi - lo;
+  let l = lo + delta;
+  if (l + width > max) l = max - width;
+  if (l < min) l = min;
+  return { lo: l, hi: l + width };
+}
+// ---- LT_PURE_MATH_END ----
+
 
 // ---------------------------------------------------------------------
 // Constants derived from the IR's fixed schema (design doc sec.5): the 31
@@ -463,6 +655,11 @@ const state = {
   hideNeg: false,
   rankLo: 0,
   rankHi: N_TOTAL,
+  // null = the latency axis auto-fits whatever rank window is showing
+  // (the pre-zoom behaviour). Once set it is an absolute {lo, hi} in
+  // nanoseconds that survives rank zooming and panning, so bar heights
+  // stay comparable between two different rank windows.
+  yLock: null,
   hidden: new Set(),
   tableScope: 'zoom', // 'zoom' | 'all'
   tableSort: { col: 'p99', dir: 'desc' },
@@ -799,6 +996,7 @@ function drawChart() {
     // page agrees.
     updateZoomInfo(order, nVis);
     updateNegCallout();
+    updateScrollbars();
     return;
   }
 
@@ -822,11 +1020,24 @@ function drawChart() {
     }
   }
   if (maxE2e <= 0) maxE2e = 1;
-  const yDomainMin = minCumFloor, yDomainMax = maxE2e;
+  // The auto-fit domain is computed either way: even while the latency
+  // axis is locked, the zoom-out-to-auto rule and the vertical
+  // scrollbar's extent are both defined against it.
+  const autoY = { lo: minCumFloor, hi: maxE2e };
+  const yDomainMin = state.yLock ? state.yLock.lo : autoY.lo;
+  const yDomainMax = state.yLock ? state.yLock.hi : autoY.hi;
   const yRange = Math.max(1, yDomainMax - yDomainMin);
   const yScale = plotH / yRange;
   const toY = (ns) => marginT + (yDomainMax - ns) * yScale;
+  const fromY = (y) => yDomainMax - (y - marginT) / yScale;
   const baselineY = toY(0);
+  // With the axis locked away from zero the baseline can fall outside
+  // the plot; the per-bar negative marker then rides the nearer edge so
+  // "this bar has a negative segment" stays visible instead of being
+  // clipped away along with the baseline it normally sits on.
+  const zeroVisible = 0 >= yDomainMin && 0 <= yDomainMax;
+  const negTickY = Math.min(Math.max(baselineY, marginT + 1.5), marginT + plotH - 1.5);
+  let clippedBars = 0;
 
   // gridlines + y labels (clean round-ish steps)
   ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--gridline').trim();
@@ -840,8 +1051,10 @@ function drawChart() {
     ctx.beginPath(); ctx.moveTo(marginL, y); ctx.lineTo(marginL + plotW, y); ctx.lineWidth = 1; ctx.stroke();
     ctx.fillText(fmtNs(ns), marginL - 8, y);
   }
-  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--baseline').trim();
-  ctx.beginPath(); ctx.moveTo(marginL, baselineY); ctx.lineTo(marginL + plotW, baselineY); ctx.lineWidth = 1.5; ctx.stroke();
+  if (zeroVisible) {
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--baseline').trim();
+    ctx.beginPath(); ctx.moveTo(marginL, baselineY); ctx.lineTo(marginL + plotW, baselineY); ctx.lineWidth = 1.5; ctx.stroke();
+  }
 
   const mode1to1 = visibleCount <= plotW;
   let colCount = 0, colRepIdx = null, colCounts = null;
@@ -907,11 +1120,41 @@ function drawChart() {
     if (anyNeg) {
       ctx.save();
       ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--status-critical').trim();
-      ctx.fillRect(x0, baselineY - 1.5, Math.max(1, x1 - x0), 3);
+      ctx.fillRect(x0, negTickY - 1.5, Math.max(1, x1 - x0), 3);
+      ctx.restore();
+    }
+    // Overflow markers. A bar cropped by a locked latency axis is
+    // otherwise indistinguishable from one that genuinely ends at the
+    // top of the plot -- which would turn a magnifier into a source of
+    // wrong readings.
+    let barTop = 0, barBottom = 0;
+    for (const seg of segs) {
+      if (seg.isNA) continue;
+      if (seg.yHi > barTop) barTop = seg.yHi;
+      if (seg.yLo < barBottom) barBottom = seg.yLo;
+    }
+    if (barTop > yDomainMax || barBottom < yDomainMin) {
+      clippedBars++;
+      ctx.save();
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim();
+      const cx = (x0 + x1) / 2, half = Math.min(3.5, Math.max(1.5, (x1 - x0) / 2));
+      if (barTop > yDomainMax) {
+        ctx.beginPath();
+        ctx.moveTo(cx, marginT + 1); ctx.lineTo(cx - half, marginT + 6); ctx.lineTo(cx + half, marginT + 6);
+        ctx.closePath(); ctx.fill();
+      }
+      if (barBottom < yDomainMin) {
+        const yb = marginT + plotH;
+        ctx.beginPath();
+        ctx.moveTo(cx, yb - 1); ctx.lineTo(cx - half, yb - 6); ctx.lineTo(cx + half, yb - 6);
+        ctx.closePath(); ctx.fill();
+      }
       ctx.restore();
     }
   }
 
+  ctx.save();
+  ctx.beginPath(); ctx.rect(marginL, marginT, plotW, plotH); ctx.clip();
   if (mode1to1) {
     for (let r = rankLo; r < rankHi; r++) {
       const idx = order[r];
@@ -964,6 +1207,7 @@ function drawChart() {
     ctx.stroke();
     ctx.restore();
   }
+  ctx.restore();
 
   // x-axis caption
   ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
@@ -973,16 +1217,37 @@ function drawChart() {
     + '  --  showing ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankHi - 1) + ' of ' + fmtCount(nVis);
   ctx.fillText(caption, marginL, cssH - 6);
 
-  lastRender = { order, rankLo, rankHi, visibleCount, mode1to1, colCount, colRepIdx, colCounts, marginL, plotW, cssH };
+  lastRender = {
+    order, rankLo, rankHi, visibleCount, mode1to1, colCount, colRepIdx, colCounts,
+    marginL, marginT, plotW, plotH, cssH, nVis,
+    // The y mapping is cached rather than recomputed by every consumer:
+    // hover hit-testing, the wheel/box-zoom anchors and the vertical
+    // scrollbar all have to agree with what was actually painted, and a
+    // second copy of this arithmetic would drift the moment the axis
+    // could be locked.
+    yDomainMin, yDomainMax, yRange, autoY, toY, fromY, clippedBars,
+  };
   updateZoomInfo(order, nVis);
   updateNegCallout();
+  updateScrollbars();
 }
 
 function updateZoomInfo(order, nVis) {
   const el = document.getElementById('zoomInfo');
   const rankLo = state.rankLo, rankHi = state.rankHi;
   const isFull = rankLo === 0 && rankHi === nVis;
-  document.getElementById('resetZoomBtn').disabled = isFull;
+  document.getElementById('resetZoomBtn').disabled = isFull && !state.yLock;
+  // The latency axis is reported separately from the rank axis because
+  // the two mean different things to the numbers below: one narrows the
+  // statistics, the other does not.
+  let ySuffix = '';
+  if (state.yLock) {
+    ySuffix = ' | y axis: ' + fmtNs(state.yLock.lo) + '–' + fmtNs(state.yLock.hi) + ' (fixed)';
+    const clipped = lastRender ? lastRender.clippedBars : 0;
+    if (clipped > 0) {
+      ySuffix += ', ' + fmtCount(clipped) + ' drawn bar(s) run past it (▲/▼) -- statistics below are unaffected';
+    }
+  }
   // "also fix" (fix-round review): make the column-aggregation ratio
   // persistently visible (previously only discoverable via hover, one
   // column at a time) whenever the chart is aggregating -- see the
@@ -995,7 +1260,7 @@ function updateZoomInfo(order, nVis) {
         ' requests (bar: slowest per column, faint line: per-column median)';
     }
   }
-  if (isFull) { el.textContent = 'showing all ' + fmtCount(nVis) + ' requests' + aggSuffix; return; }
+  if (isFull) { el.textContent = 'showing all ' + fmtCount(nVis) + ' requests' + aggSuffix + ySuffix; return; }
   // A zero-width zoom (rankLo === rankHi, reachable when a filter such as
   // hideNeg empties out the previously-zoomed range) has no records to
   // take a min/max over -- found by hand while verifying the "also fix"
@@ -1003,7 +1268,7 @@ function updateZoomInfo(order, nVis) {
   // min/max loop below leaves minE/maxE at their +-Infinity seed values
   // and fmtNs prints the literal string "Infinity ms".
   if (rankHi <= rankLo) {
-    el.textContent = 'zoomed: ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankLo) + ' (0 requests)' + aggSuffix;
+    el.textContent = 'zoomed: ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankLo) + ' (0 requests)' + aggSuffix + ySuffix;
     return;
   }
   let minE = Infinity, maxE = -Infinity;
@@ -1012,7 +1277,7 @@ function updateZoomInfo(order, nVis) {
     if (e < minE) minE = e; if (e > maxE) maxE = e;
   }
   el.textContent = 'zoomed: ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankHi - 1) + ' (' + fmtCount(rankHi - rankLo) +
-    ' requests, ' + fmtNs(minE) + '–' + fmtNs(maxE) + ')' + aggSuffix;
+    ' requests, ' + fmtNs(minE) + '–' + fmtNs(maxE) + ')' + aggSuffix + ySuffix;
 }
 
 function updateNegCallout() {
@@ -1028,50 +1293,281 @@ function updateNegCallout() {
 }
 
 // ---------------------------------------------------------------------
-// Zoom: drag-select on the canvas (requirement 1), reset button.
+// Zoom and pan (requirement 1), on two axes.
+//
+// The rank axis and the latency axis are not symmetric, and the code
+// below keeps that asymmetry explicit: the rank window is an integer
+// [lo, hi) into the current order and narrowing it narrows the
+// statistics table with it, while the latency window is a nanosecond
+// range that crops the drawing and nothing else. `state.yLock === null`
+// means "auto-fit each rank window", which is the behaviour the chart
+// had before this axis became zoomable and is still the default.
+//
+// Bare wheel is deliberately NOT captured: this page is long, the chart
+// spans its full width, and a chart that eats the scroll wheel is a
+// chart the reader has to escape from. Ctrl/Cmd+wheel (rank) and
+// Shift+wheel (latency) both have defaults worth overriding here --
+// browser page zoom, and horizontal scrolling of a page that has none.
 // ---------------------------------------------------------------------
-let dragStartPx = null;
+let drag = null;
+let panFrame = 0;
+
+function plotFrac(xCss) {
+  const lr = lastRender;
+  return Math.max(0, Math.min(1, (xCss - lr.marginL) / lr.plotW));
+}
+
+function schedulePanDraw() {
+  // Panning redraws on every pointermove; at capture scale drawChart()
+  // walks the whole visible window, so coalesce to one draw per frame
+  // and leave the (much heavier) 33-segment table until the drag ends.
+  if (panFrame) return;
+  panFrame = requestAnimationFrame(() => { panFrame = 0; drawChart(); });
+}
+
+function setSelOverlay(x0, y0, x1, y1) {
+  const lo = Math.min(x0, x1), hi = Math.max(x0, x1);
+  const top = Math.min(y0, y1), bot = Math.max(y0, y1);
+  selOverlay.style.left = lo + 'px';
+  selOverlay.style.width = Math.max(0, hi - lo) + 'px';
+  selOverlay.style.top = top + 'px';
+  selOverlay.style.height = Math.max(0, bot - top) + 'px';
+}
+
 canvas.addEventListener('pointerdown', (e) => {
   if (!lastRender) return;
   const rect = canvas.getBoundingClientRect();
-  dragStartPx = e.clientX - rect.left;
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
   canvas.setPointerCapture(e.pointerId);
-  selOverlay.style.display = 'block';
-  selOverlay.style.left = dragStartPx + 'px';
-  selOverlay.style.width = '0px';
+  tooltip.style.display = 'none';
+  if (e.shiftKey) {
+    drag = { mode: 'box', x0: x, y0: y };
+    canvas.classList.add('boxing');
+    selOverlay.style.display = 'block';
+    setSelOverlay(x, y, x, y);
+  } else {
+    drag = {
+      mode: 'pan', x0: x, y0: y,
+      rankLo0: state.rankLo, rankHi0: state.rankHi,
+      yLock0: state.yLock ? { lo: state.yLock.lo, hi: state.yLock.hi } : null,
+      autoY0: lastRender.autoY, plotW0: lastRender.plotW, plotH0: lastRender.plotH,
+      visibleCount0: lastRender.visibleCount, nVis0: lastRender.nVis,
+    };
+    canvas.classList.add('panning');
+  }
 });
+
 canvas.addEventListener('pointermove', (e) => {
   const rect = canvas.getBoundingClientRect();
   const xCss = e.clientX - rect.left, yCss = e.clientY - rect.top;
-  if (dragStartPx !== null) {
-    const lo = Math.min(dragStartPx, xCss), hi = Math.max(dragStartPx, xCss);
-    selOverlay.style.left = lo + 'px';
-    selOverlay.style.width = Math.max(0, hi - lo) + 'px';
-    tooltip.style.display = 'none';
+  if (drag && drag.mode === 'box') { setSelOverlay(drag.x0, drag.y0, xCss, yCss); return; }
+  if (drag && drag.mode === 'pan') {
+    // Grab-and-move: dragging right shows earlier ranks, dragging down
+    // shows lower latencies -- the content follows the pointer.
+    const dRank = -(xCss - drag.x0) / drag.plotW0 * drag.visibleCount0;
+    const w = panWindow(drag.rankLo0, drag.rankHi0, Math.round(dRank), 0, drag.nVis0);
+    state.rankLo = w.lo; state.rankHi = w.hi;
+    if (drag.yLock0) {
+      const range = drag.yLock0.hi - drag.yLock0.lo;
+      const dNs = (yCss - drag.y0) / drag.plotH0 * range;
+      // Panning is bounded by the auto-fit domain united with wherever
+      // the lock already sits, so a lock that starts partly outside the
+      // data stays reachable instead of snapping on the first drag.
+      const yMin = Math.min(drag.autoY0.lo, drag.yLock0.lo);
+      const yMax = Math.max(drag.autoY0.hi, drag.yLock0.hi);
+      const v = panWindow(drag.yLock0.lo, drag.yLock0.hi, dNs, yMin, yMax);
+      state.yLock = { lo: v.lo, hi: v.hi };
+    }
+    schedulePanDraw();
     return;
   }
   hoverAt(xCss, yCss, e.clientX, e.clientY);
 });
-canvas.addEventListener('pointerleave', () => { if (dragStartPx === null) tooltip.style.display = 'none'; });
+
+canvas.addEventListener('pointerleave', () => { if (!drag) tooltip.style.display = 'none'; });
+
 canvas.addEventListener('pointerup', (e) => {
-  if (dragStartPx === null || !lastRender) return;
+  if (!drag || !lastRender) return;
+  const d = drag; drag = null;
+  canvas.classList.remove('panning', 'boxing');
   const rect = canvas.getBoundingClientRect();
-  const endPx = e.clientX - rect.left;
-  const lo = Math.min(dragStartPx, endPx), hi = Math.max(dragStartPx, endPx);
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  if (d.mode === 'pan') {
+    // A click that never moved is not a pan: recomputing the 33-segment
+    // table costs real time at capture scale, and nothing changed.
+    if (state.rankLo !== d.rankLo0 || state.rankHi !== d.rankHi0 ||
+        JSON.stringify(state.yLock) !== JSON.stringify(d.yLock0)) redrawAll();
+    return;
+  }
   selOverlay.style.display = 'none';
-  dragStartPx = null;
-  if (hi - lo < 4) return; // treat as a click, not a drag
   const lr = lastRender;
-  const frac0 = Math.max(0, Math.min(1, (lo - lr.marginL) / lr.plotW));
-  const frac1 = Math.max(0, Math.min(1, (hi - lr.marginL) / lr.plotW));
-  const newLo = lr.rankLo + Math.floor(frac0 * lr.visibleCount);
-  const newHi = lr.rankLo + Math.max(newLo - lr.rankLo + 1, Math.ceil(frac1 * lr.visibleCount));
-  state.rankLo = newLo; state.rankHi = Math.min(newHi, currentOrder().length);
+  const dx = Math.abs(x - d.x0), dy = Math.abs(y - d.y0);
+  if (dx < 4 && dy < 8) return; // a click, not a box
+  if (dx >= 4) {
+    const f0 = plotFrac(Math.min(d.x0, x)), f1 = plotFrac(Math.max(d.x0, x));
+    const newLo = lr.rankLo + Math.floor(f0 * lr.visibleCount);
+    const newHi = lr.rankLo + Math.max(newLo - lr.rankLo + 1, Math.ceil(f1 * lr.visibleCount));
+    state.rankLo = newLo; state.rankHi = Math.min(newHi, currentOrder().length);
+  }
+  // A near-horizontal drag is a rank selection, not a request for a
+  // sliver of an axis: only take the vertical extent once it is tall
+  // enough to have been meant.
+  if (dy >= 8) {
+    const hiNs = lr.fromY(Math.min(d.y0, y)), loNs = lr.fromY(Math.max(d.y0, y));
+    state.yLock = { lo: loNs, hi: hiNs };
+  }
   redrawAll();
 });
+
+canvas.addEventListener('wheel', (e) => {
+  if (!lastRender) return;
+  const zoomY = e.shiftKey;
+  const zoomX = !zoomY && (e.ctrlKey || e.metaKey);
+  if (!zoomX && !zoomY) return; // bare wheel belongs to the page
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const factor = e.deltaY < 0 ? 0.8 : 1.25;
+  const lr = lastRender;
+  if (zoomX) {
+    const w = zoomRankWindow(state.rankLo, state.rankHi, factor, plotFrac(x), lr.nVis);
+    state.rankLo = w.lo; state.rankHi = w.hi;
+  } else {
+    state.yLock = zoomYRange(state.yLock, lr.autoY, factor, lr.fromY(y));
+  }
+  redrawAll();
+}, { passive: false });
+
+function zoomX(factor) {
+  if (!lastRender) return;
+  const w = zoomRankWindow(state.rankLo, state.rankHi, factor, 0.5, lastRender.nVis);
+  state.rankLo = w.lo; state.rankHi = w.hi;
+  redrawAll();
+}
+function zoomY(factor) {
+  if (!lastRender) return;
+  const lr = lastRender;
+  const mid = (lr.yDomainMin + lr.yDomainMax) / 2;
+  state.yLock = zoomYRange(state.yLock, lr.autoY, factor, mid);
+  redrawAll();
+}
+document.getElementById('xZoomInBtn').addEventListener('click', () => zoomX(0.5));
+document.getElementById('xZoomOutBtn').addEventListener('click', () => zoomX(2));
+document.getElementById('yZoomInBtn').addEventListener('click', () => zoomY(0.5));
+document.getElementById('yZoomOutBtn').addEventListener('click', () => zoomY(2));
 document.getElementById('resetZoomBtn').addEventListener('click', () => {
-  state.rankLo = 0; state.rankHi = currentOrder().length; redrawAll();
+  state.rankLo = 0; state.rankHi = currentOrder().length; state.yLock = null; redrawAll();
 });
+
+// ---------------------------------------------------------------------
+// Scrollbars (requirement 2). Drawn, not native: a native scrollbar
+// would need a fake oversized element behind the canvas, which fights
+// the canvas's own devicePixelRatio sizing. The thumb's LENGTH carries
+// as much information as its position -- it is the fraction of the data
+// (or of the latency domain) currently in view.
+// ---------------------------------------------------------------------
+function makeScrollbar(trackId, thumbId, opts) {
+  const track = document.getElementById(trackId);
+  const thumb = document.getElementById(thumbId);
+  const vertical = opts.vertical;
+  const lenProp = vertical ? 'height' : 'width';
+  const posProp = vertical ? 'top' : 'left';
+  let dragState = null;
+
+  function trackLen() {
+    const r = track.getBoundingClientRect();
+    return vertical ? r.height : r.width;
+  }
+
+  function update() {
+    const m = opts.model();
+    if (!m || m.max - m.min <= 0 || (m.hi - m.lo) >= (m.max - m.min)) {
+      track.classList.add('disabled');
+      thumb.style[posProp] = '0px';
+      thumb.style[lenProp] = '100%';
+      return;
+    }
+    track.classList.remove('disabled');
+    const span = m.max - m.min;
+    const frac = (m.hi - m.lo) / span;
+    // On the latency axis the top of the plot is the LARGEST value, so
+    // the thumb's offset is measured from `max` downwards, not from
+    // `min` upwards.
+    const startFrac = vertical ? (m.max - m.hi) / span : (m.lo - m.min) / span;
+    thumb.style[lenProp] = Math.max(6, frac * trackLen()) + 'px';
+    thumb.style[posProp] = (startFrac * trackLen()) + 'px';
+  }
+
+  function panBy(pixels) {
+    const m = opts.model();
+    if (!m) return;
+    const span = m.max - m.min;
+    const len = trackLen() || 1;
+    const delta = pixels / len * span * (vertical ? -1 : 1);
+    const w = panWindow(m.lo, m.hi, delta, m.min, m.max);
+    opts.apply(w.lo, w.hi);
+  }
+
+  thumb.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const m = opts.model();
+    if (!m) return;
+    thumb.setPointerCapture(e.pointerId);
+    thumb.classList.add('dragging');
+    dragState = { at: vertical ? e.clientY : e.clientX, lo: m.lo, hi: m.hi, min: m.min, max: m.max };
+  });
+  thumb.addEventListener('pointermove', (e) => {
+    if (!dragState) return;
+    const now = vertical ? e.clientY : e.clientX;
+    const span = dragState.max - dragState.min;
+    const len = trackLen() || 1;
+    const delta = (now - dragState.at) / len * span * (vertical ? -1 : 1);
+    const w = panWindow(dragState.lo, dragState.hi, delta, dragState.min, dragState.max);
+    opts.apply(w.lo, w.hi);
+  });
+  const endDrag = () => { if (dragState) { dragState = null; thumb.classList.remove('dragging'); opts.commit(); } };
+  thumb.addEventListener('pointerup', endDrag);
+  thumb.addEventListener('pointercancel', endDrag);
+
+  track.addEventListener('pointerdown', (e) => {
+    // Clicking the track pages towards the click, the way a native one
+    // does.
+    if (e.target === thumb) return;
+    const r = track.getBoundingClientRect();
+    const at = vertical ? e.clientY - r.top : e.clientX - r.left;
+    const thumbR = thumb.getBoundingClientRect();
+    const tStart = vertical ? thumbR.top - r.top : thumbR.left - r.left;
+    const tLen = vertical ? thumbR.height : thumbR.width;
+    panBy(at < tStart ? -tLen : (at > tStart + tLen ? tLen : 0));
+    opts.commit();
+  });
+
+  return update;
+}
+
+const updateHScroll = makeScrollbar('hScrollTrack', 'hScrollThumb', {
+  vertical: false,
+  model: () => lastRender ? { min: 0, max: lastRender.nVis, lo: state.rankLo, hi: state.rankHi } : null,
+  apply: (lo, hi) => { state.rankLo = Math.round(lo); state.rankHi = Math.round(hi); schedulePanDraw(); },
+  commit: () => redrawAll(),
+});
+const updateVScroll = makeScrollbar('vScrollTrack', 'vScrollThumb', {
+  vertical: true,
+  model: () => {
+    if (!lastRender || !state.yLock) return null;
+    const a = lastRender.autoY, l = state.yLock;
+    return { min: Math.min(a.lo, l.lo), max: Math.max(a.hi, l.hi), lo: l.lo, hi: l.hi };
+  },
+  apply: (lo, hi) => { state.yLock = { lo, hi }; schedulePanDraw(); },
+  commit: () => drawChart(),
+});
+function updateScrollbars() {
+  updateHScroll();
+  updateVScroll();
+  // The latency scrollbar only exists while the axis is locked -- with
+  // the axis auto-fitting there is nothing off-screen to scroll to.
+  document.querySelector('.vscroll-col').style.visibility = state.yLock ? 'visible' : 'hidden';
+}
 
 // ---------------------------------------------------------------------
 // Hover (requirement 3): segment name + duration; column request count
@@ -1093,25 +1589,12 @@ function hoverAt(xCss, yCss, clientX, clientY) {
   const { segs } = computeBarSegments(idx);
   const meta = IR.records_meta[idx];
 
-  // y-domain replicated from drawChart() to invert pixel->ns for hit
-  // testing (kept in sync by construction: both read state + IR the
-  // same way; recomputing here is cheap -- one record's worth of work).
-  const cssH = lr.cssH, marginT = 12, marginB = 26;
-  const plotH = Math.max(1, cssH - marginT - marginB);
-  let maxE2e = 0;
-  const negFlags = state.linkModel === 'A' ? NEG_A.flags : NEG_B.flags;
-  let minCumFloor = 0;
-  for (let r = lr.rankLo; r < lr.rankHi; r++) {
-    const i2 = lr.order[r]; const e = IR.records_meta[i2].e2e_ns;
-    if (e > maxE2e) maxE2e = e;
-    if (negFlags[i2]) { const g = computeBarSegments(i2); for (const s of g.segs) if (!s.isNA && s.yLo < minCumFloor) minCumFloor = s.yLo; }
-  }
-  if (maxE2e <= 0) maxE2e = 1;
-  const yRange = Math.max(1, maxE2e - minCumFloor);
-  const yScale = plotH / yRange;
-  const toY = (ns) => marginT + (maxE2e - ns) * yScale;
-  const fromY = (y) => maxE2e - (y - marginT) / yScale;
-  const nsAtCursor = fromY(yCss);
+  // The y mapping comes from drawChart()'s cache, not from a second copy
+  // of the same arithmetic here: with the latency axis lockable, a
+  // recomputed domain would auto-fit while the painted one stayed
+  // locked, and every tooltip would name the wrong segment.
+  const yRange = lr.yRange;
+  const nsAtCursor = lr.fromY(yCss);
 
   // Mirrors drawOneBar()'s two-pass paint order exactly: positives (and
   // the N/A tick) paint first in pipeline order, negatives always paint
@@ -1159,44 +1642,11 @@ function hoverAt(xCss, yCss, clientX, clientY) {
 }
 
 // ---------------------------------------------------------------------
-// Percentile table (requirement 4): mean/P50/P90/P99/P99.9 per segment,
-// scoped to the current zoom by default, sortable by any column,
-// defaulting to P99 descending (design doc / task's fixed decisions).
+// Statistics table (requirement 4): mean/P50/P90/P99/P99.9, for the
+// sample's end-to-end latency and for each of the 33 segments, scoped to
+// the current rank zoom by default, sortable by any column, defaulting
+// to P99 descending (design doc / task's fixed decisions).
 // ---------------------------------------------------------------------
-// must-fix 1 (fix-round review): merge.py's downsampling keeps the slow
-// tail whole and strides the head to hit a byte budget (right for the
-// chart -- it preserves tail shape). But an UNWEIGHTED percentile over
-// that kept set treats it as if it WERE the population: on the committed
-// fixture forced through --max-mb 0.2, the row labelled P50 read 34420ns
-// (really the true population's 83rd percentile), P90 read the true
-// 96.7th, P99 the true 99.7th -- see the fix-round report for the full
-// before/after. `w` (each row's weight -- 1 for a full-fidelity row,
-// `head_stride` for a strided head row, from WEIGHTS/merge.py's
-// per-record "weight") corrects this: a value that stands for `w`
-// original records counts `w` times, not once, in both the mean and each
-// percentile. When nothing was downsampled every weight is 1 and this is
-// arithmetically identical to the old unweighted computation.
-function weightedQuantile(sortedPairs, prefixWeight, totalWeight, p) {
-  const n = sortedPairs.length;
-  if (n === 0) return null;
-  if (n === 1) return sortedPairs[0].v;
-  const h = p * (totalWeight - 1);
-  const lo = Math.floor(h), hi = Math.ceil(h);
-  const valueAtRank = (k) => {
-    // Smallest index i such that prefixWeight[i] > k -- i.e. the sample
-    // whose weighted "slot" (as if repeated w times) covers virtual
-    // position k. Binary search since prefixWeight is non-decreasing.
-    let a = 0, b = n - 1;
-    while (a < b) {
-      const mid = (a + b) >> 1;
-      if (prefixWeight[mid] > k) b = mid; else a = mid + 1;
-    }
-    return sortedPairs[a].v;
-  };
-  const vLo = valueAtRank(lo), vHi = valueAtRank(hi);
-  return lo === hi ? vLo : vLo + (vHi - vLo) * (h - lo);
-}
-
 function computeStatsRows(rankLo, rankHi, order, model) {
   const rows = [];
   for (let i33 = 0; i33 < 33; i33++) {
@@ -1209,30 +1659,36 @@ function computeStatsRows(rankLo, rankHi, order, model) {
       if (raw === NA) { naWeight += w; continue; }
       pairs.push({ v: raw, w });
     }
-    pairs.sort((a, b) => a.v - b.v);
-    let totalWeight = 0;
-    const prefixWeight = new Array(pairs.length);
-    for (let i = 0; i < pairs.length; i++) { totalWeight += pairs[i].w; prefixWeight[i] = totalWeight; }
-    const mean = totalWeight ? pairs.reduce((s, o) => s + o.v * o.w, 0) / totalWeight : null;
-    rows.push({
-      i33, name: NAMES33[i33], starred: STARRED33[i33],
-      // N/N-A are themselves estimates of the full accepted population's
-      // counts when downsampled (sum of weight, not row count) -- see the
-      // weighting note above computeStatsRows for why this can't just
-      // count rows either.
-      n: Math.round(totalWeight), naCount: Math.round(naWeight),
-      mean,
-      p50: weightedQuantile(pairs, prefixWeight, totalWeight, 0.50),
-      p90: weightedQuantile(pairs, prefixWeight, totalWeight, 0.90),
-      p99: weightedQuantile(pairs, prefixWeight, totalWeight, 0.99),
-      p999: weightedQuantile(pairs, prefixWeight, totalWeight, 0.999),
-    });
+    rows.push(Object.assign(
+      { i33, name: NAMES33[i33], starred: STARRED33[i33] },
+      weightedSummary(pairs, naWeight)));
   }
   return rows;
 }
 
+// The sample's end-to-end latency, summarised the same way and over the
+// same scope as the segment rows above.
+//
+// Three things it deliberately does NOT depend on:
+//   - the link model: e2e_ns is measured on the client, not assembled
+//     from the two link halves, so models A and B give the same number;
+//   - the legend: hiding a segment shortens the drawn bars, but the
+//     request still took as long as it took;
+//   - the latency-axis zoom, which crops the drawing only.
+// It does follow the rank zoom, the negative-segment filter, and the
+// downsampling weights, exactly as the segment rows do.
+function computeE2eRow(rankLo, rankHi, order) {
+  const pairs = [];
+  for (let r = rankLo; r < rankHi; r++) {
+    const idx = order[r];
+    pairs.push({ v: IR.records_meta[idx].e2e_ns, w: WEIGHTS[idx] });
+  }
+  return Object.assign({ i33: -1, name: 'END-TO-END', starred: true, isE2e: true },
+                       weightedSummary(pairs, 0));
+}
+
 const PCT_COLS = [
-  { key: 'name', label: 'Segment', numeric: false },
+  { key: 'name', label: 'End-to-end / segment', numeric: false },
   { key: 'n', label: 'N', numeric: true },
   { key: 'naCount', label: 'N/A', numeric: true },
   { key: 'mean', label: 'Mean', numeric: true },
@@ -1252,6 +1708,7 @@ function renderTable() {
   const rankLo = state.tableScope === 'all' ? 0 : state.rankLo;
   const rankHi = state.tableScope === 'all' ? nVis : state.rankHi;
   const rows = computeStatsRows(rankLo, rankHi, order, state.linkModel);
+  const e2eRow = computeE2eRow(rankLo, rankHi, order);
 
   const sortCol = state.tableSort.col, dir = state.tableSort.dir === 'asc' ? 1 : -1;
   rows.sort((a, b) => {
@@ -1283,20 +1740,33 @@ function renderTable() {
 
   const body = document.getElementById('pctBody');
   body.textContent = '';
-  for (const row of rows) {
+  function appendRow(row) {
     const tr = document.createElement('tr');
+    if (row.isE2e) tr.className = 'e2e-row';
     const nameTd = document.createElement('td'); nameTd.className = 'name-cell';
-    const sw = document.createElement('span'); sw.className = 'swatch'; sw.style.background = colorFor(row.i33);
-    const label = document.createElement('span'); label.textContent = (row.starred ? '★ ' : '○ ') + row.name;
-    nameTd.append(sw, label);
+    if (!row.isE2e) {
+      const sw = document.createElement('span'); sw.className = 'swatch'; sw.style.background = colorFor(row.i33);
+      nameTd.append(sw);
+    }
+    const label = document.createElement('span');
+    label.textContent = row.isE2e ? row.name : (row.starred ? '★ ' : '○ ') + row.name;
+    nameTd.append(label);
     tr.append(nameTd);
     for (const col of ['n', 'naCount', 'mean', 'p50', 'p90', 'p99', 'p999']) {
       const td = document.createElement('td'); td.className = 'num';
-      td.textContent = (col === 'n' || col === 'naCount') ? fmtCount(row[col]) : fmtNs(row[col]);
+      // The end-to-end value is a direct client-side measurement, so
+      // "how many of these were N/A" has no meaning for it -- an em dash
+      // rather than a 0, which would read as a count that was checked.
+      td.textContent = (row.isE2e && col === 'naCount') ? '—'
+        : (col === 'n' || col === 'naCount') ? fmtCount(row[col]) : fmtNs(row[col]);
       tr.append(td);
     }
     body.append(tr);
   }
+  // Pinned first and deliberately outside the sort: it is the total the
+  // 33 rows below decompose, not one more thing to rank against them.
+  appendRow(e2eRow);
+  for (const row of rows) appendRow(row);
 
   const scopeLabel = document.getElementById('tableScopeLabel');
   const scopeBtn = document.getElementById('scopeToggleBtn');
