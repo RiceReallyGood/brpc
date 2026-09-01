@@ -25,8 +25,8 @@ Reads a client-side and a server-side binary dump (each produced by
 LatencyTraceBuffer::Dump()), joins them by trace_id, applies the four
 weight-bearing assertions from sec.10.1, computes the 33-item latency
 decomposition (sec.5) under both link models (sec.6), and writes an
-intermediate representation for tools/latency_trace/render.py (not yet
-written -- Task C) to embed into a self-contained HTML file.
+intermediate representation for tools/latency_trace/render.py to embed
+into a self-contained HTML file.
 
 Python 3 standard library only. No numpy, no third-party dependencies --
 this has to run on any machine that can read the dump files, not just a
@@ -1288,7 +1288,8 @@ def main(argv=None):
     ap.add_argument("--server", required=True, help="server-side dump file")
     ap.add_argument("-o", "--output", help="write the intermediate representation (JSON) here")
     ap.add_argument("--window-ms", type=float, default=1000.0,
-                     help="model B sliding window size in ms (default 1000, per design doc sec.6.2)")
+                     help="model B bin size in ms (default 1000, per design doc sec.6.2). "
+                          "Implemented as non-overlapping TUMBLING bins, not a sliding window")
     ap.add_argument("--max-mb", type=float, default=12.0,
                      help="base64 blob size budget in MiB before downsampling kicks in (default 12)")
     ap.add_argument("--low-concurrency", action="store_true",
