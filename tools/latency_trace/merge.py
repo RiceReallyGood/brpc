@@ -1090,6 +1090,20 @@ def build_intermediate_representation(client_dump, server_dump, merge_result,
         # re-derive from `downsample.head_stride` plus positional
         # guessing about which records are "head" vs "tail".
         weight_by_id = {id(e): stride for e in head_kept}
+        # The LAST head_kept row is the partial bucket: head[::stride]
+        # takes indices 0, stride, 2*stride, ..., so the final one stands
+        # in for only `len(head) - (len(head_kept)-1)*stride` originals,
+        # which can be as low as 1. Crediting it with a full `stride`
+        # does not spread a rounding error thinly across the population --
+        # it concentrates the entire excess on ONE record, always the one
+        # at the head/tail seam (~P80 at the default tail fraction, i.e.
+        # right where P90 is read off). The global over-count stays small
+        # and reassuring (0.06% on the committed fixture) while the local
+        # over-weighting is `stride`-fold and grows without bound as
+        # downsampling gets more aggressive. Credit the true remainder so
+        # the weights sum EXACTLY to the population.
+        if head_kept:
+            weight_by_id[id(head_kept[-1])] = len(head) - (len(head_kept) - 1) * stride
         for e in tail:
             weight_by_id[id(e)] = 1
         downsample_note = {

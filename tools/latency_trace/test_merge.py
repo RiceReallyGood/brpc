@@ -742,18 +742,27 @@ class TestDownsampling(unittest.TestCase):
             self.assertEqual(by_id[f"{i:#018x}"]["weight"], 1, msg=f"tail record {i}")
         head_kept_ids = sorted(kept_ids - expected_tail_ids)
         self.assertTrue(head_kept_ids, "expected at least one head row to survive striding")
-        for tid in head_kept_ids:
+        # Every head row but the last stands in for exactly `stride`
+        # originals; the last is the partial bucket and must be credited
+        # with the true remainder, NOT a full stride. Crediting it fully
+        # concentrates the whole rounding excess on one record sitting at
+        # the head/tail seam -- right where P90 is read off -- and the
+        # distortion is stride-fold locally however small it looks
+        # globally (post-review finding; see the ledger).
+        head_n = n - tail_n
+        remainder = head_n - (len(head_kept_ids) - 1) * stride
+        for tid in head_kept_ids[:-1]:
             self.assertEqual(by_id[tid]["weight"], stride, msg=f"head record {tid}")
-        # The weights approximately cover the full original population --
-        # uniform striding means the last, partial bucket can be credited
-        # with a full stride's worth of weight even though it stands for
-        # fewer than `stride` originals, so this is a bound (within one
-        # stride's worth), not exact equality. See the fix-round report's
-        # before/after percentile numbers, computed against the real
-        # fixture, for why the weighting matters in practice.
+        self.assertEqual(by_id[head_kept_ids[-1]]["weight"], remainder,
+                         msg="last head row must carry the partial bucket's true count")
+        self.assertLessEqual(remainder, stride)
+        self.assertGreaterEqual(remainder, 1)
+        # With the remainder credited correctly the weights cover the
+        # original population EXACTLY -- an equality, not a bound. If this
+        # ever loosens back into an inequality, the percentile table has
+        # silently stopped describing the population it names.
         total_weight = sum(rm["weight"] for rm in ir["records_meta"])
-        self.assertGreaterEqual(total_weight, n)
-        self.assertLess(total_weight, n + stride)
+        self.assertEqual(total_weight, n)
 
 
 # ---------------------------------------------------------------------------
