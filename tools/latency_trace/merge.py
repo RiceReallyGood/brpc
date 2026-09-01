@@ -82,7 +82,12 @@ assert LT_FILE_MAGIC_BYTES == b"1CRTLPRB", LT_FILE_MAGIC_BYTES
 # the struct -- req_size/rsp_size/method_id/error_code sit between
 # remote_ip and remote_port). "4x" is the 4 bytes of trailing alignment
 # padding that bring the record to exactly 192 bytes.
-RECORD_FMT = "<QQQ" + "34I" + "IIIIiiHBB4x"
+# The 9 trailing scalar fields are, in struct-declaration order: socket_id
+# (u32), remote_ip (u32), req_size (u32), rsp_size (u32), method_id (u32 --
+# NOT signed; a previous version of this format string used "i" here,
+# which decoded any method_id >= 2^31 as negative), error_code (i32 --
+# this one genuinely is signed), remote_port (u16), role (u8), attempt (u8).
+RECORD_FMT = "<QQQ" + "34I" + "IIIIIiHBB4x"
 assert struct.calcsize(RECORD_FMT) == RECORD_SIZE
 
 # ts[] sentinels (latency_trace.h): 0 = never stamped, 0xFFFFFFFF = not
@@ -235,8 +240,10 @@ def decode_ts(raw):
                       record's mode (RDMA polling). offset is None.
                       MUST NOT be decremented.
       'saturated'  -- raw == 0xFFFFFFFE, real interval >= ~42.9s. offset
-                      is a lower bound (raw - 1), not an exact value.
-                      MUST NOT be decremented past this.
+                      is raw ITSELF (0xFFFFFFFE ticks), a lower bound, not
+                      an exact value. latency_trace.h is explicit that
+                      this sentinel "MUST NOT be decremented" the way an
+                      ordinary value is -- unlike 'ok', do NOT subtract 1.
       'ok'         -- offset = raw - 1, the real offset.
     """
     if raw == TS_UNSTAMPED:
@@ -244,7 +251,7 @@ def decode_ts(raw):
     if raw == TS_NOT_APPLICABLE:
         return "na", None
     if raw == TS_SATURATED:
-        return "saturated", raw - 1
+        return "saturated", raw
     return "ok", raw - 1
 
 
@@ -315,6 +322,34 @@ def compute_freq(header, path):
                   f"disagrees with CNTFRQ_EL0 ({cntfrq} Hz) by {rel * 100:.4f}%, "
                   f"over the 0.1% sanity threshold", file=sys.stderr)
     return freq_hz, scale
+
+
+def check_realtime_overlap(client_dump, server_dump):
+    """The realtime calibration pair (head_realtime_ns/tail_realtime_ns)
+    exists precisely so an offline tool can sanity-check that the client
+    and server dump handed to it actually came from overlapping capture
+    runs (design doc sec.8.1/9.1 -- "仅供跨机 sanity check"), rather than,
+    say, today's client dump paired with last week's server dump that
+    happens to share some trace_ids by pure coincidence of the sequence
+    counter wrapping. Before this function, that check was never actually
+    performed -- two dumps from unrelated runs joined "successfully" with
+    no warning at all. Returns True iff the two [head,tail] realtime
+    windows overlap; always also prints a WARNING to stderr when they
+    don't, since a caller might otherwise proceed straight to writing the
+    IR without inspecting the return value.
+    """
+    ch, sh = client_dump["header"], server_dump["header"]
+    c_lo, c_hi = ch["head_realtime_ns"], ch["tail_realtime_ns"]
+    s_lo, s_hi = sh["head_realtime_ns"], sh["tail_realtime_ns"]
+    overlap = c_lo <= s_hi and s_lo <= c_hi
+    if not overlap:
+        print(f"WARNING: {client_dump['path']} and {server_dump['path']} "
+              f"do not overlap in realtime -- client capture window is "
+              f"[{c_lo}, {c_hi}] ns since epoch, server's is [{s_lo}, {s_hi}] "
+              f"ns since epoch. A successful trace_id join does not by "
+              f"itself prove these two dumps came from the same capture "
+              f"run; this pair looks like it did not.", file=sys.stderr)
+    return overlap
 
 
 def parse_records(data, header, path):
@@ -460,6 +495,22 @@ def check_points_nonzero(points):
     return True
 
 
+def unstamped_point_names(points):
+    """The POINT_NAMES of every point in `points` that decoded as
+    'unstamped' (raw 0) -- i.e. the specific evidence behind a
+    REJECT_UNSTAMPED verdict. A raw 0 has (at least) two legitimate
+    causes design doc sec.13 names explicitly -- streaming responses
+    never stamp S15-S17 (they don't go through the ordinary sock->Write()
+    path), and a cancelled backup request's receive-side points are
+    likewise never reached -- as well as the un-instrumented-code-path
+    possibility. The runtime writes the same plain 0 for all of them, so
+    this parser genuinely cannot tell which one it is; naming exactly
+    which point(s) were zero, aggregated across a whole capture (see
+    merge_dumps' unstamped_point_histogram), is the most a reader can be
+    given without asserting a cause this data doesn't support."""
+    return [POINT_NAMES[p] for p, (kind, _) in points.items() if kind == "unstamped"]
+
+
 def check_monotonic(points, point_range):
     """sec.10.1 assertion 2: decoded offsets must be non-decreasing in
     point order. 'na' points are skipped (no offset to compare -- the
@@ -481,7 +532,8 @@ def check_monotonic(points, point_range):
     return True
 
 
-def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client):
+def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client,
+              low_concurrency=False):
     """Compute the full decomposition for one joined (client, server)
     record pair. Returns a dict with per-item ns values (as Fraction, for
     exact identity checking -- caller rounds to int for output), reject
@@ -496,16 +548,33 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
     then summed would not, in general, exactly equal a directly-computed
     C17-C01 in the last bit, even though the underlying algebra is an
     exact telescoping identity.
+
+    `low_concurrency`: sec.10.1 says the "every decomposition item
+    non-negative" check (assertion 3) is only a validity assertion at
+    outstanding=1 -- at real capture concurrency, a negative link item is
+    expected batching noise (sec.6.1) and, under model B, a legitimate
+    pollution *detector* (sec.6.2), not a defect signal. So this reason is
+    only added to the record's (enforced) `reasons` set when the caller
+    asserts the capture was actually low-concurrency. `any_negative_item`
+    is still computed and returned unconditionally, both so callers can
+    report the ratio (must-fix 3 in the fix-round review) and so
+    estimate_offsets_model_b()'s anchor-selection filter can still exclude
+    these records from being an anchor candidate even when they are not
+    being rejected outright (see that function's own comment -- this is
+    the same bad-anchor bug class, and must not reopen it).
     """
     reasons = set()
 
     cpts = decode_record_points(client_rec, CLIENT_POINTS)
     spts = decode_record_points(server_rec, SERVER_POINTS)
 
+    unstamped_points = []
     if not check_points_nonzero(cpts):
         reasons.add(REJECT_UNSTAMPED)
+        unstamped_points += unstamped_point_names(cpts)
     if not check_points_nonzero(spts):
         reasons.add(REJECT_UNSTAMPED)
+        unstamped_points += unstamped_point_names(spts)
     if not check_monotonic(cpts, CLIENT_POINTS):
         reasons.add(REJECT_NON_MONOTONIC)
     if not check_monotonic(spts, SERVER_POINTS):
@@ -525,6 +594,14 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
     c_ns = {p: ns(cpts, p, client_scale) for p in CLIENT_POINTS}
     s_ns = {p: ns(spts, p, server_scale) for p in SERVER_POINTS}
 
+    # Points whose kind is 'saturated' (design doc sec.8.1/9.1): their ns
+    # value is a lower bound, not an exact reading. Collected here so the
+    # 31 items and (further below) the RTT/S/link values that used one of
+    # these points as an endpoint can be flagged for render.py, instead of
+    # silently rendering a ~42.9s-or-more interval as if it were exact.
+    c_saturated_points = {p for p, (kind, _) in cpts.items() if kind == "saturated"}
+    s_saturated_points = {p for p, (kind, _) in spts.items() if kind == "saturated"}
+
     def item_value(start_p, end_p):
         a = c_ns[start_p] if start_p in c_ns else s_ns[start_p]
         b = c_ns[end_p] if end_p in c_ns else s_ns[end_p]
@@ -536,18 +613,48 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
     for name, sp, ep, _starred in DECOMPOSITION_ITEMS_31:
         items[name] = item_value(sp, ep)
 
+    saturated_items = [
+        name for name, sp, ep, _starred in DECOMPOSITION_ITEMS_31
+        if sp in c_saturated_points or sp in s_saturated_points
+        or ep in c_saturated_points or ep in s_saturated_points
+    ]
+
     # sec.10.1's cross-end nonneg check: C09 >= C08, purely client-side.
+    #
+    # RDMA polling mode (design doc sec.8.5) has no wake/onedge_start
+    # event at all -- C09/C10 (and S01/S02) are LT_TS_NOT_APPLICABLE, not
+    # 0. Falling back straight to "RTT/S is None" there would make
+    # link_total None for every polling-mode record, silently dropping
+    # both link items AND the identity check for the entire capture. The
+    # design doc's fix is exact, not an approximation: under polling,
+    # wake/onedge_start/readv_start are the SAME instant (those two
+    # intervals are genuinely zero), so substituting readv_start (C11 /
+    # S03 -- still a real timestamp under polling, see sec.8.5's table)
+    # for wake (C09 / S01) reproduces the same RTT/S/link_total/identity
+    # algebra as the non-polling case: cli_wake_to_onedge and
+    # cli_onedge_to_readv (srv_ likewise) are still correctly N/A (0) in
+    # `items` above, and the telescoping sum still lands on C17-C01
+    # exactly because the same substitute point is used on both sides of
+    # the identity (see the fix-round report for the worked-out algebra).
+    c09_kind, _ = cpts[C_WAKE]
+    c09 = c_ns.get(C_READV_START) if c09_kind == "na" else c_ns.get(C_WAKE)
     c08 = c_ns.get(C_WRITE_END)
-    c09 = c_ns.get(C_WAKE)
     negative_rtt = False
     rtt = None
     if c08 is not None and c09 is not None:
         rtt = c09 - c08
-        if rtt < 0:
+        # The negative-RTT write-stamp-anomaly reason is specifically
+        # about the ordinary (non-polling) C09 vs C08 relationship
+        # (design doc sec.8.4/10.1); don't fire it off the readv_start
+        # substitute, which has a different, non-anomalous relationship
+        # to C08 (readv_start is a receive-side event, not a response to
+        # this request's own write at all under polling).
+        if rtt < 0 and c09_kind != "na":
             negative_rtt = True
             reasons.add(REJECT_NEGATIVE_RTT_LATE_WRITE_STAMP)
 
-    s01 = s_ns.get(S_WAKE)
+    s01_kind, _ = spts[S_WAKE]
+    s01 = s_ns.get(S_READV_START) if s01_kind == "na" else s_ns.get(S_WAKE)
     s17 = s_ns.get(S_WRITE_END)
     srv_span = None
     if s01 is not None and s17 is not None:
@@ -571,10 +678,12 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
     # Placeholder; filled in by the caller once O is known.
 
     # sec.10.1 assertion 3: every decomposition item non-negative (valid
-    # only at outstanding=1 / low concurrency -- caller decides whether to
-    # apply this reason based on the capture's concurrency, since at
-    # higher concurrency negative items are expected batching noise, not
-    # a defect signal). N/A items (None) don't participate.
+    # only at outstanding=1 / low concurrency -- see `low_concurrency`
+    # above; at higher concurrency negative items are expected batching
+    # noise, not a defect signal). N/A items (None) don't participate.
+    # `any_negative_item` itself is ALWAYS computed (used for reporting
+    # and for the model-B anchor filter regardless of the flag); only
+    # whether it is added to the enforced `reasons` set is conditional.
     any_negative_item = False
     for name, val in items.items():
         if val is not None and val < 0:
@@ -586,7 +695,7 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
         # still counts toward the nonneg-item assertion since link_up/
         # link_down would be negative too.
         any_negative_item = True
-    if any_negative_item:
+    if any_negative_item and low_concurrency:
         reasons.add(REJECT_NEGATIVE_ITEM)
 
     e2e = None
@@ -621,6 +730,19 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
         "link_down_a_ns": link_down_a,
         "e2e_ns": e2e,
         "negative_rtt": negative_rtt,
+        "any_negative_item": any_negative_item,
+        "saturated_items": saturated_items,
+        "unstamped_points": unstamped_points,
+        # The (possibly readv_start-substituted, under RDMA polling mode --
+        # see the comment above rtt's computation) anchors actually used
+        # for rtt/srv_span/link_total. Model B's a/b/c/d (apply_model_b(),
+        # estimate_offsets_model_b()) MUST read these rather than
+        # c_ns[C_WAKE]/s_ns[S_WAKE] directly: under polling those raw dict
+        # entries are None (the real point is N/A), and indexing them
+        # would crash exactly the polling-mode records this substitution
+        # was added to stop silently under-reporting.
+        "c09_anchor_ns": c09,
+        "s01_anchor_ns": s01,
         "identity_ok": identity_ok,
         "identity_lhs": identity_lhs,
         "identity_rhs": identity_rhs,
@@ -666,32 +788,50 @@ def estimate_offsets_model_b(joined, window_ns=DEFAULT_WINDOW_NS):
         if not recs:
             continue
         t0 = recs[0]["merged"]["c_ns"][C_RPC_START]
+        # NOTE: despite design doc sec.6.2's "滑动窗口" ("sliding window")
+        # phrasing, `w` below buckets records into fixed-size,
+        # non-overlapping bins of `window_ns` since t0 -- a TUMBLING
+        # window, not a window that continuously slides along the time
+        # axis. Every record in the same bin shares one O, and O jumps at
+        # each bin boundary rather than drifting continuously; this is
+        # simpler to implement and reason about, and still tracks
+        # frequency drift at the same ~window_ns granularity sec.6.2 is
+        # actually after, but it is not literally what "sliding" would
+        # mean, and a reader translating this code back into the doc's
+        # words should not expect a continuously-moving window here.
         window_index = {}
         for j in recs:
             t = j["merged"]["c_ns"][C_RPC_START]
             w = int((t - t0) // window_ns)
             window_index.setdefault(w, []).append(j)
         for w, members in window_index.items():
-            # The anchor MUST come from records that already passed
-            # sec.10.1's four assertions. Without this filter, argmin(L)
-            # can pick a record whose negative link_total is itself one
-            # of the rejected data-quality failures (found empirically:
-            # on the real capture, the global-minimum-L record was one of
-            # the 5 negative_decomposition_item rejects) -- anchoring the
-            # whole window's offset on a record already known to be
-            # unreliable is worse than the "queueing pollution" this
-            # argmin selection is trying to avoid, and it systematically
-            # skewed nearly every other record's link_up_b negative (a
-            # single bad anchor's bias propagates to the whole window,
-            # since O is one shared value). Fall back to the full member
-            # set only if every record in the window was rejected (no
-            # clean candidate exists at all).
-            candidates = [j for j in members if not j["merged"]["reasons"]]
+            # The anchor MUST come from records that already pass ALL FOUR
+            # of sec.10.1's assertions -- including the non-negative-item
+            # one, REGARDLESS of whether the caller is running in
+            # low-concurrency mode (merge_one()'s `low_concurrency` only
+            # controls whether that assertion's failure EXCLUDES a record
+            # from the accepted/output set; it must not also loosen this
+            # filter). Without this, argmin(L) can pick a record whose
+            # negative link_total is itself one of those failures (found
+            # empirically: on the real capture, the global-minimum-L
+            # record was one of the 5 negative_decomposition_item
+            # failures) -- anchoring the whole window's offset on a
+            # record already known to be unreliable is worse than the
+            # "queueing pollution" this argmin selection is trying to
+            # avoid, and it systematically skewed nearly every other
+            # record's link_up_b negative (a single bad anchor's bias
+            # propagates to the whole window, since O is one shared
+            # value). Fall back to the full member set only if every
+            # record in the window fails (no clean candidate exists at
+            # all).
+            candidates = [j for j in members
+                          if not j["merged"]["reasons"]
+                          and not j["merged"]["any_negative_item"]]
             if not candidates:
                 candidates = members
             best = min(candidates, key=lambda j: j["merged"]["link_total_ns"])
             a = best["merged"]["c_ns"][C_WRITE_END]
-            b = best["merged"]["s_ns"][S_WAKE]
+            b = best["merged"]["s01_anchor_ns"]
             L = best["merged"]["link_total_ns"]
             O = a + L / 2 - b
             for j in members:
@@ -709,9 +849,9 @@ def apply_model_b(joined_entry):
         m["link_down_b_ns"] = None
         return
     a = m["c_ns"][C_WRITE_END]
-    b = m["s_ns"][S_WAKE]
+    b = m["s01_anchor_ns"]  # S01, or its readv_start substitute under RDMA polling
     c = m["s_ns"][S_WRITE_END]
-    d = m["c_ns"][C_WAKE]
+    d = m["c09_anchor_ns"]  # C09, or its readv_start substitute under RDMA polling
     link_up_b = (b + O) - a
     link_down_b = d - (c + O)
     m["link_up_b_ns"] = link_up_b
@@ -726,7 +866,10 @@ def apply_model_b(joined_entry):
 # Top-level merge
 # ---------------------------------------------------------------------------
 
-def merge_dumps(client_dump, server_dump, window_ns=DEFAULT_WINDOW_NS):
+def merge_dumps(client_dump, server_dump, window_ns=DEFAULT_WINDOW_NS,
+                 low_concurrency=False):
+    realtime_overlap_ok = check_realtime_overlap(client_dump, server_dump)
+
     client_recs = [r for r in client_dump["records"]]
     server_recs = [r for r in server_dump["records"]]
 
@@ -775,11 +918,14 @@ def merge_dumps(client_dump, server_dump, window_ns=DEFAULT_WINDOW_NS):
     joined = []
     reject_counts = {r: 0 for r in ALL_REJECT_REASONS}
     accepted = []
+    any_negative_item_count = 0
+    unstamped_point_histogram = {}
 
     for tid in joined_ids:
         crec = client_by_id[tid]
         srec = server_by_id[tid]
-        m = merge_one(crec, srec, client_scale, server_scale, client_dump["methods"])
+        m = merge_one(crec, srec, client_scale, server_scale, client_dump["methods"],
+                       low_concurrency=low_concurrency)
         entry = {
             "trace_id": tid,
             "client_rec": crec,
@@ -791,6 +937,10 @@ def merge_dumps(client_dump, server_dump, window_ns=DEFAULT_WINDOW_NS):
         joined.append(entry)
         for reason in m["reasons"]:
             reject_counts[reason] += 1
+        if m["any_negative_item"]:
+            any_negative_item_count += 1
+        for name in m["unstamped_points"]:
+            unstamped_point_histogram[name] = unstamped_point_histogram.get(name, 0) + 1
         if not m["reasons"]:
             accepted.append(entry)
 
@@ -807,6 +957,10 @@ def merge_dumps(client_dump, server_dump, window_ns=DEFAULT_WINDOW_NS):
         "joined": joined,
         "accepted": accepted,
         "reject_counts": reject_counts,
+        "low_concurrency": low_concurrency,
+        "any_negative_item_count": any_negative_item_count,
+        "unstamped_point_histogram": unstamped_point_histogram,
+        "realtime_overlap_ok": realtime_overlap_ok,
     }
 
 
@@ -839,29 +993,50 @@ assert INTS_PER_RECORD == 35
 
 
 def frac_to_i32(x):
+    """Returns (i32_value, clipped: bool). `clipped` is True whenever the
+    int32-ns range (+-2^31, about +-2.147s) couldn't hold the real value
+    and it had to be clamped -- previously computed as a local and thrown
+    away; a caller now has to actually be able to ask. This is not the
+    same condition as a 'saturated' ts[] sentinel (that one starts from a
+    ~42.9s ticks-side lower bound and will always also clip here since
+    2.147s < 42.9s), but an ordinary very-slow request's real ns value can
+    trip it too, so the two are tracked and reported separately."""
     if x is None:
-        return NA_SENTINEL_I32
+        return NA_SENTINEL_I32, False
     # round-half-to-even via Fraction's own rounding; values are tick-scale
     # (>= ~10ns granularity) so sub-ns rounding has no observable effect.
     v = round(x)
+    clipped = False
     if v < -(2 ** 31) + 1 or v > 2 ** 31 - 1:
         # Should be exceedingly rare (an interval > ~2.1s) but don't
-        # silently wrap -- clamp and let the metadata flag say so.
+        # silently wrap -- clamp and report it via the return value.
+        clipped = True
         v = max(-(2 ** 31) + 1, min(2 ** 31 - 1, v))
-    return int(v)
+    return int(v), clipped
 
 
 def record_to_i32_row(entry):
+    """Returns (row, clipped_item_names) -- see frac_to_i32's docstring
+    for what "clipped" means. `row` is the flat 35-int32 layout described
+    above build_intermediate_representation."""
     m = entry["merged"]
     row = []
-    clipped = False
+    clipped_items = []
     for name, _, _, _ in DECOMPOSITION_ITEMS_31:
         val = m["items_ns"].get(name)
-        i32 = frac_to_i32(val)
+        i32, was_clipped = frac_to_i32(val)
         row.append(i32)
-    for key in ("link_up_a_ns", "link_down_a_ns", "link_up_b_ns", "link_down_b_ns"):
-        row.append(frac_to_i32(m.get(key)))
-    return row
+        if was_clipped:
+            clipped_items.append(name)
+    for key, label in (("link_up_a_ns", "link_up_model_a"),
+                        ("link_down_a_ns", "link_down_model_a"),
+                        ("link_up_b_ns", "link_up_model_b"),
+                        ("link_down_b_ns", "link_down_model_b")):
+        i32, was_clipped = frac_to_i32(m.get(key))
+        row.append(i32)
+        if was_clipped:
+            clipped_items.append(label)
+    return row, clipped_items
 
 
 def build_intermediate_representation(client_dump, server_dump, merge_result,
@@ -901,6 +1076,22 @@ def build_intermediate_representation(client_dump, server_dump, merge_result,
             stride = max(1, -(-len(head) // head_budget))  # ceil div
         head_kept = head[::stride]
         selected = head_kept + tail
+        # Per-record weight: a head_kept row stands in for `stride`
+        # originals (itself plus the stride-1 records the uniform stride
+        # skipped over); a tail row stands for exactly 1 (the tail is kept
+        # at full fidelity). Without this, render.py's stats table (mean,
+        # P50/P90/P99...) has no way to tell it's looking at a
+        # non-uniformly-sampled set, and silently treats the downsampled
+        # rows as if they WERE the population -- systematically biased
+        # toward the tail, since the tail is over-represented relative to
+        # its true share (fix-round review's must-fix 1; see the
+        # before/after numbers in the fix-round report). A record's
+        # weight belongs in the IR, not something render.py has to
+        # re-derive from `downsample.head_stride` plus positional
+        # guessing about which records are "head" vs "tail".
+        weight_by_id = {id(e): stride for e in head_kept}
+        for e in tail:
+            weight_by_id[id(e)] = 1
         downsample_note = {
             "applied": True,
             "reason": f"projected base64 size {b64_size(n)} bytes exceeds "
@@ -913,16 +1104,20 @@ def build_intermediate_representation(client_dump, server_dump, merge_result,
         }
     else:
         downsample_note = {"applied": False, "original_count": n, "kept_count": n}
+        weight_by_id = {id(e): 1 for e in selected}
 
     blob = bytearray()
     records_meta = []
     for entry in selected:
-        row = record_to_i32_row(entry)
+        row, clipped_items = record_to_i32_row(entry)
         blob += struct.pack(f"<{INTS_PER_RECORD}i", *row)
         m = entry["merged"]
         crec, srec = entry["client_rec"], entry["server_rec"]
         method_id = crec["method_id"]
         method_name = client_dump["methods"].get(method_id) if method_id else None
+        e2e_i32, e2e_clipped = frac_to_i32(m["e2e_ns"])
+        if e2e_clipped and "e2e" not in clipped_items:
+            clipped_items = clipped_items + ["e2e"]
         records_meta.append({
             "trace_id": f"{entry['trace_id']:#018x}",
             "attempt": crec["attempt"],
@@ -934,19 +1129,65 @@ def build_intermediate_representation(client_dump, server_dump, merge_result,
             "socket_id_client": crec["socket_id"],
             "socket_id_server": srec["socket_id"],
             "remote_port_client": crec["remote_port"],
-            "e2e_ns": frac_to_i32(m["e2e_ns"]),
+            "e2e_ns": e2e_i32,
             "negative_rtt": m["negative_rtt"],
+            "any_negative_item": m.get("any_negative_item", False),
             "model_b_link_up_negative": m.get("model_b_link_up_negative", False),
             "link_total_negative": (m["link_total_ns"] is not None and m["link_total_ns"] < 0),
+            # must-fix 1 (fix-round review): the weight this record's row
+            # carries in any population statistic (mean, percentiles) --
+            # see the comment above weight_by_id's construction.
+            "weight": weight_by_id[id(entry)],
+            # "also fix" items from the same review: which items (if any)
+            # are a ts[]-saturation lower bound rather than an exact
+            # reading, and which items (if any) had their ns value clamped
+            # to fit int32 -- almost always the same items as saturated,
+            # but not definitionally so (see frac_to_i32's docstring).
+            "saturated_items": m.get("saturated_items", []),
+            "clipped_items": clipped_items,
         })
 
     b64 = base64.b64encode(bytes(blob)).decode("ascii")
+
+    # must-fix 3 (fix-round review): dropped_count is in every header this
+    # parser already reads (parse_header/HEADER_FIELDS) but, until now,
+    # was parsed and then never looked at again. The ring buffer stops
+    # accepting new records once full and counts what it refused in this
+    # field; if a run overflowed, join_rate_client/server above can read
+    # "100%" while most of the traffic that actually happened was never
+    # written to either dump at all -- 100% of what made it in, silently
+    # not 100% of what ran. dropped_count == 0 is normal and expected
+    # (the whole point of the ring buffer being large enough); this is
+    # surfaced unconditionally so a reader isn't left trusting a join
+    # rate that can't see what it doesn't have.
+    client_dropped = client_dump.get("header", {}).get("dropped_count", 0)
+    server_dropped = server_dump.get("header", {}).get("dropped_count", 0)
+
+    accepted_n = len(accepted)
+    # Computed over `accepted` specifically (not merge_result's
+    # joined-level count, which also includes records excluded for other
+    # reasons like an unstamped point) so the ratio below has a
+    # consistent, well-defined denominator: "of the records this page
+    # actually shows, how many have a negative segment."
+    any_negative_item_count = sum(1 for e in accepted if e["merged"].get("any_negative_item"))
+
+    item_group_sizes_31 = [
+        len(DECOMPOSITION_ITEMS_CLIENT_SEND),
+        len(DECOMPOSITION_ITEMS_SERVER),
+        len(DECOMPOSITION_ITEMS_CLIENT_RECV),
+    ]
+    assert sum(item_group_sizes_31) == 31
 
     ir = {
         "format_version": 1,
         "point_names": [POINT_NAMES[p] for p in range(POINT_COUNT)],
         "item_names_31": [name for name, _, _, _ in DECOMPOSITION_ITEMS_31],
         "item_starred_31": [starred for _, _, _, starred in DECOMPOSITION_ITEMS_31],
+        # "also fix" (fix-round review): render.py used to hardcode the
+        # 7/16/8 client-send/server/client-recv split as JS constants
+        # instead of reading it from the IR that actually defines the
+        # ordering (DECOMPOSITION_ITEMS_31's three source lists, here).
+        "item_group_sizes_31": item_group_sizes_31,
         "na_under_polling": sorted(NA_UNDER_POLLING),
         "ints_per_record": INTS_PER_RECORD,
         "na_sentinel_i32": NA_SENTINEL_I32,
@@ -965,6 +1206,10 @@ def build_intermediate_representation(client_dump, server_dump, merge_result,
             "server_record_count": len(server_dump["records"]),
             "client_freq_hz": client_dump["freq_hz"],
             "server_freq_hz": server_dump["freq_hz"],
+            "client_dropped_count": client_dropped,
+            "server_dropped_count": server_dropped,
+            "realtime_overlap_ok": merge_result.get("realtime_overlap_ok", True),
+            "low_concurrency_mode": merge_result.get("low_concurrency", False),
             "join": {
                 "client_ids": len(merge_result["client_ids"]),
                 "server_ids": len(merge_result["server_ids"]),
@@ -976,6 +1221,10 @@ def build_intermediate_representation(client_dump, server_dump, merge_result,
                 # These coincide (both 100%) only when the two sides'
                 # trace_id sets are identical; either can differ from the
                 # other when one side dropped records the other kept.
+                # Neither denominator accounts for client_dropped_count /
+                # server_dropped_count above -- a 100% rate here says
+                # nothing about what the ring buffer refused before this
+                # dump was ever written.
                 "join_rate_client": (
                     len(merge_result["joined_ids"]) / len(merge_result["client_ids"])
                     if merge_result["client_ids"] else 0.0
@@ -986,8 +1235,25 @@ def build_intermediate_representation(client_dump, server_dump, merge_result,
                 ),
             },
             "reject_counts": dict(merge_result["reject_counts"]),
-            "accepted_count": len(accepted),
+            "unstamped_point_histogram": dict(merge_result.get("unstamped_point_histogram", {})),
+            "accepted_count": accepted_n,
             "output_record_count": len(selected),
+            # must-fix 2 (fix-round review): whether/how many accepted,
+            # joined records contain a negative decomposition item.
+            # sec.10.1's own text makes the non-negativity assertion
+            # conditional on low concurrency (outstanding=1); at real
+            # capture concurrency this is expected batching noise
+            # (sec.6.1) and, under model B, a genuine pollution detector
+            # (sec.6.2) -- not, by itself, evidence of a defect. When
+            # low_concurrency_mode is False (the default), these records
+            # are NOT excluded from accepted_count/output_record_count;
+            # this block reports how many there are instead of silently
+            # dropping exactly the requests sec.9.3 was written to make
+            # visible.
+            "negative_items": {
+                "count": any_negative_item_count,
+                "ratio": (any_negative_item_count / accepted_n) if accepted_n else 0.0,
+            },
         },
     }
     return ir, {
@@ -1011,13 +1277,22 @@ def main(argv=None):
                      help="model B sliding window size in ms (default 1000, per design doc sec.6.2)")
     ap.add_argument("--max-mb", type=float, default=12.0,
                      help="base64 blob size budget in MiB before downsampling kicks in (default 12)")
+    ap.add_argument("--low-concurrency", action="store_true",
+                     help="assert design doc sec.10.1's non-negative-decomposition-item check "
+                          "(valid only at outstanding=1) and EXCLUDE any record that fails it "
+                          "from the accepted/output set. Default off: at real capture "
+                          "concurrency a negative item is expected batching noise (sec.6.1) "
+                          "and, under model B, a pollution detector (sec.6.2) -- those records "
+                          "are kept and counted/reported instead of silently dropped. Only pass "
+                          "this for a capture you know was actually run at outstanding=1.")
     ap.add_argument("--stats-only", action="store_true",
                      help="print the report and exit without writing an IR file")
     args = ap.parse_args(argv)
 
     client_dump = parse_dump(args.client)
     server_dump = parse_dump(args.server)
-    result = merge_dumps(client_dump, server_dump, window_ns=int(args.window_ms * 1e6))
+    result = merge_dumps(client_dump, server_dump, window_ns=int(args.window_ms * 1e6),
+                          low_concurrency=args.low_concurrency)
 
     ir, size_info = build_intermediate_representation(
         client_dump, server_dump, result,
@@ -1029,6 +1304,18 @@ def main(argv=None):
           f"(freq={stats['client_freq_hz']:.3f} Hz)")
     print(f"server records: {stats['server_record_count']} "
           f"(freq={stats['server_freq_hz']:.3f} Hz)")
+    if stats["client_dropped_count"] or stats["server_dropped_count"]:
+        print(f"WARNING: ring buffer overflow -- client dropped_count="
+              f"{stats['client_dropped_count']}, server dropped_count="
+              f"{stats['server_dropped_count']} (records the runtime refused "
+              f"because the buffer was full; NOT reflected in the join rate "
+              f"below, which only ever sees what made it into the dump)",
+              file=sys.stderr)
+    if not stats["realtime_overlap_ok"]:
+        print("WARNING: client/server realtime calibration windows do not "
+              "overlap -- see the earlier warning for the exact windows; "
+              "these two dumps may not be from the same capture run",
+              file=sys.stderr)
     print(f"join: {j['joined']} joined; client ids={j['client_ids']} "
           f"(rate={j['join_rate_client']*100:.4f}%), "
           f"server ids={j['server_ids']} (rate={j['join_rate_server']*100:.4f}%), "
@@ -1037,7 +1324,20 @@ def main(argv=None):
           "may appear under more than one reason):")
     for reason, count in stats["reject_counts"].items():
         print(f"  {reason}: {count}")
+    if stats["unstamped_point_histogram"]:
+        print("  unstamped_point breakdown (which point(s) were zero -- streaming "
+              "responses' S15-S17, a cancelled backup's receive side, and an "
+              "un-instrumented code path all write plain 0, so this cannot say "
+              "which):")
+        for name, count in sorted(stats["unstamped_point_histogram"].items(),
+                                   key=lambda kv: -kv[1]):
+            print(f"    {name}: {count}")
     print(f"accepted: {stats['accepted_count']}")
+    if not stats["low_concurrency_mode"]:
+        ni = stats["negative_items"]
+        print(f"negative-item records (NOT excluded -- see --low-concurrency): "
+              f"{ni['count']} of {stats['accepted_count']} accepted "
+              f"({ni['ratio']*100:.4f}%)")
     print(f"output records after downsampling: {stats['output_record_count']}")
     if ir["downsample"]["applied"]:
         print(f"downsampling APPLIED: {ir['downsample']}")

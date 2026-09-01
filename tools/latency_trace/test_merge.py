@@ -181,7 +181,17 @@ class TestRealSample(unittest.TestCase):
                 f"them, or see capture-notes.md")
         cls.client_dump = merge.parse_dump(CLIENT_DUMP)
         cls.server_dump = merge.parse_dump(SERVER_DUMP)
-        cls.result = merge.merge_dumps(cls.client_dump, cls.server_dump)
+        # capture.sh captured this exact fixture at outstanding=1 (see its
+        # own comment: "the only condition sec.10.1's end-to-end row calls
+        # 'low concurrency'"), so asserting the non-negative-decomposition-
+        # item check here is actually warranted, not just convenient for
+        # keeping the numbers below pinned -- see merge_one()'s
+        # `low_concurrency` docstring for why this defaults to off
+        # elsewhere (fix-round review's must-fix 2).
+        cls.result = merge.merge_dumps(cls.client_dump, cls.server_dump, low_concurrency=True)
+        # And the default-off behavior, on the same fixture, for the tests
+        # further down that specifically exercise it.
+        cls.result_high_concurrency = merge.merge_dumps(cls.client_dump, cls.server_dump)
 
     def test_header_fields(self):
         ch, sh = self.client_dump["header"], self.server_dump["header"]
@@ -224,6 +234,40 @@ class TestRealSample(unittest.TestCase):
             merge.REJECT_NEGATIVE_RTT_LATE_WRITE_STAMP: 0,
         })
         self.assertEqual(len(self.result["accepted"]), 3217)
+
+    def test_default_high_concurrency_mode_keeps_the_5_negative_item_records(self):
+        # fix-round review's must-fix 2: without --low-concurrency, the
+        # same 5 records that test_reject_counts_match_capture_notes shows
+        # get excluded under low_concurrency=True must instead survive
+        # into `accepted` (so the renderer's hatch/red-tick/hide-negative
+        # machinery has something real to draw from a plain dump run, not
+        # only from a hand-edited page) -- while still being flagged and
+        # counted, not silently indistinguishable from a clean record.
+        r = self.result_high_concurrency
+        self.assertEqual(r["reject_counts"][merge.REJECT_NEGATIVE_ITEM], 0)
+        self.assertEqual(len(r["accepted"]), 3222)
+        flagged = [e for e in r["accepted"] if e["merged"]["any_negative_item"]]
+        self.assertEqual(len(flagged), 5)
+        ir, _ = merge.build_intermediate_representation(self.client_dump, self.server_dump, r)
+        self.assertEqual(ir["stats"]["negative_items"]["count"], 5)
+        self.assertAlmostEqual(ir["stats"]["negative_items"]["ratio"], 5 / 3222)
+        self.assertFalse(ir["stats"]["low_concurrency_mode"])
+        # And every one of those 5 records' negative segment is actually
+        # present in the emitted int32 blob (not clamped to 0 or dropped),
+        # which is what makes the renderer's hatch path reachable at all.
+        import struct as _struct
+        import base64 as _base64
+        blob = _base64.b64decode(ir["items_blob_b64"])
+        ints_per_record = ir["ints_per_record"]
+        flagged_trace_ids = {f"{e['trace_id']:#018x}" for e in flagged}
+        found_negative_in_blob = 0
+        for i, meta in enumerate(ir["records_meta"]):
+            if meta["trace_id"] not in flagged_trace_ids:
+                continue
+            row = _struct.unpack_from(f"<{ints_per_record}i", blob, i * ints_per_record * 4)
+            if any(v < 0 for v in row if v != ir["na_sentinel_i32"]):
+                found_negative_in_blob += 1
+        self.assertEqual(found_negative_in_blob, 5)
 
     def test_sum_identity_holds_exactly_for_every_accepted_record(self):
         # Zero tolerance, per design doc sec.9.1 -- see merge_one()'s
@@ -308,10 +352,16 @@ class TestDecodeTs(unittest.TestCase):
     def test_not_applicable_not_decremented(self):
         self.assertEqual(merge.decode_ts(0xFFFFFFFF), ("na", None))
 
-    def test_saturated_not_decremented_to_0xfffffffd_minus_1(self):
+    def test_saturated_is_not_decremented(self):
+        # latency_trace.h is explicit: 0xFFFFFFFE "MUST NOT be
+        # decremented" the way an ordinary value is. This used to assert
+        # val == 0xFFFFFFFD (raw - 1) -- the wrong behavior, locked in by
+        # a test whose own name called it "not decremented" while its
+        # assertion checked the decremented value. offset must be raw
+        # itself.
         kind, val = merge.decode_ts(0xFFFFFFFE)
         self.assertEqual(kind, "saturated")
-        self.assertEqual(val, 0xFFFFFFFD)  # raw - 1, the lower bound
+        self.assertEqual(val, 0xFFFFFFFE)
 
     def test_ordinary_value_decrements(self):
         self.assertEqual(merge.decode_ts(1), ("ok", 0))
@@ -411,7 +461,8 @@ class TestFileFormatEdges(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestAssertionsAndSentinels(unittest.TestCase):
-    def _joined_pair(self, client_ts, server_ts, trace_id=42, base_counter=0):
+    def _joined_pair(self, client_ts, server_ts, trace_id=42, base_counter=0,
+                      low_concurrency=False):
         crec_bytes = make_record_bytes(trace_id, merge.LT_ROLE_CLIENT, client_ts,
                                         base_counter=base_counter)
         srec_bytes = make_record_bytes(trace_id, merge.LT_ROLE_SERVER, server_ts,
@@ -422,7 +473,7 @@ class TestAssertionsAndSentinels(unittest.TestCase):
         spath = self._tmp("s", server_data)
         cdump = merge.parse_dump(cpath)
         sdump = merge.parse_dump(spath)
-        result = merge.merge_dumps(cdump, sdump)
+        result = merge.merge_dumps(cdump, sdump, low_concurrency=low_concurrency)
         self.assertEqual(len(result["joined"]), 1)
         return result["joined"][0]
 
@@ -470,7 +521,21 @@ class TestAssertionsAndSentinels(unittest.TestCase):
         # defect on either individual side.
         client_ts = sequential_client_ts(step=100, wake_gap=200)  # RTT = 200 ticks = 2000ns
         server_ts_wide = sequential_server_ts(step=2000)  # span = 16*2000 = 32000 ticks
-        j = self._joined_pair(client_ts, server_ts_wide)
+
+        # Default (high concurrency, fix-round review's must-fix 2): the
+        # assertion is computed (any_negative_item) but NOT enforced as a
+        # reject reason -- the record stays accepted.
+        j_default = self._joined_pair(client_ts, server_ts_wide)
+        m_default = j_default["merged"]
+        self.assertIsNotNone(m_default["link_total_ns"])
+        self.assertLess(m_default["link_total_ns"], 0)
+        self.assertTrue(m_default["any_negative_item"])
+        self.assertNotIn(merge.REJECT_NEGATIVE_ITEM, m_default["reasons"])
+        self.assertEqual(m_default["reasons"], set())
+
+        # --low-concurrency (or a caller that knows this capture really was
+        # outstanding=1): same record, now excluded via REJECT_NEGATIVE_ITEM.
+        j = self._joined_pair(client_ts, server_ts_wide, low_concurrency=True)
         m = j["merged"]
         self.assertIsNotNone(m["link_total_ns"])
         self.assertLess(m["link_total_ns"], 0)
@@ -516,13 +581,52 @@ class TestAssertionsAndSentinels(unittest.TestCase):
             if name in ("cli_wake_to_onedge", "cli_onedge_to_readv"):
                 continue
             self.assertIsNotNone(val, msg=name)
-        # Known, documented scope boundary (see task report): with wake
-        # itself N/A, RTT/link_total/the sum identity cannot be computed
-        # for this record at all -- identity_ok is None (skipped), not
-        # asserted true or false. Pinned here so a future change to this
-        # behavior is a deliberate decision, not a silent drift.
-        self.assertIsNone(m["link_total_ns"])
-        self.assertIsNone(m["identity_ok"])
+        # fix-round review's RDMA-polling fix: wake (C09) being N/A used
+        # to mean RTT/link_total/the sum identity could not be computed
+        # AT ALL for this record -- link_total_ns and identity_ok were
+        # both None, which meant BOTH link items went N/A and every bar
+        # under-reported by the whole network time, silently, while the
+        # page still claimed the bar top was always exactly the
+        # end-to-end latency. Design doc sec.8.5 is explicit that this is
+        # fixable, not a fundamental gap: under polling, wake,
+        # onedge_start and readv_start are literally the same instant
+        # (those two intervals are genuinely zero), so RTT falls back to
+        # C11 (readv_start) - C08 -- still a real timestamp under polling
+        # -- and the identity keeps holding exactly, because
+        # cli_wake_to_onedge/cli_onedge_to_readv are still correctly
+        # counted as 0 (via being N/A) in the item sum. Confirmed exactly,
+        # not just "not None", so a regression that produces some other
+        # value doesn't slip through as "good enough":
+        self.assertEqual(m["rtt_ns"], m["c_ns"][merge.C_READV_START] - m["c_ns"][merge.C_WRITE_END])
+        self.assertIsNotNone(m["link_total_ns"])
+        self.assertIsNotNone(m["identity_ok"])
+        self.assertTrue(m["identity_ok"],
+                         msg=f"lhs vs rhs mismatch: {m['identity_lhs']} != {m['identity_rhs']}")
+
+    def test_na_sentinel_on_both_sides_does_not_crash_model_b(self):
+        # Both client AND server running RDMA polling mode (design doc
+        # sec.8.5 -- each side's flag is independent). Regression guard:
+        # apply_model_b()/estimate_offsets_model_b() used to read
+        # m["s_ns"][S_WAKE] / m["c_ns"][C_WAKE] directly, which are None
+        # under polling (the real point is N/A) -- `b + O` would raise
+        # TypeError the moment link_total_ns stopped being unconditionally
+        # None for a polling record, which the RTT/S fallback above makes
+        # it. The fix routes model B through the same c09_anchor_ns/
+        # s01_anchor_ns substitutes merge_one() already computes for
+        # RTT/S, so this must not crash and must produce a real split.
+        ts_c = sequential_client_ts(step=1000)
+        ts_c[merge.C_WAKE] = merge.TS_NOT_APPLICABLE
+        ts_c[merge.C_ONEDGE_START] = merge.TS_NOT_APPLICABLE
+        ts_s = sequential_server_ts(step=1000)
+        ts_s[merge.S_WAKE] = merge.TS_NOT_APPLICABLE
+        ts_s[merge.S_ONEDGE_START] = merge.TS_NOT_APPLICABLE
+        j = self._joined_pair(ts_c, ts_s)
+        m = j["merged"]
+        self.assertIsNotNone(m["link_total_ns"])
+        self.assertTrue(m["identity_ok"])
+        self.assertIsNotNone(m["link_up_b_ns"])
+        self.assertIsNotNone(m["link_down_b_ns"])
+        self.assertEqual(m["link_up_b_ns"] + m["link_down_b_ns"], m["link_total_ns"])
 
     def test_saturated_sentinel_does_not_crash_and_is_marked_lower_bound(self):
         ts = sequential_client_ts(step=1000)
@@ -587,6 +691,9 @@ class TestDownsampling(unittest.TestCase):
             client_dump, server_dump, fake_result, max_b64_bytes=12 * 1024 * 1024)
         self.assertFalse(ir["downsample"]["applied"])
         self.assertEqual(ir["stats"]["output_record_count"], 100)
+        # must-fix 1: every row's weight is 1 when nothing was downsampled --
+        # unweighted and weighted stats must coincide in this case.
+        self.assertTrue(all(rm["weight"] == 1 for rm in ir["records_meta"]))
 
     def test_downsample_keeps_tail_full_and_strides_the_head(self):
         client_dump = {"path": "c", "methods": {1: "x"}}
@@ -623,6 +730,160 @@ class TestDownsampling(unittest.TestCase):
         tail_n = ir["downsample"]["tail_kept_full"]
         expected_tail_ids = {f"{i:#018x}" for i in range(n - tail_n, n)}
         self.assertTrue(expected_tail_ids.issubset(kept_ids))
+
+        # must-fix 1 (fix-round review): tail rows carry weight 1 (kept at
+        # full fidelity, one row == one original record); head rows carry
+        # weight == head_stride (each stands in for `stride` originals).
+        # Getting this backwards, or uniformly 1, is exactly the bug that
+        # made the stats table quietly report the wrong percentile.
+        stride = ir["downsample"]["head_stride"]
+        by_id = {rm["trace_id"]: rm for rm in ir["records_meta"]}
+        for i in range(n - tail_n, n):
+            self.assertEqual(by_id[f"{i:#018x}"]["weight"], 1, msg=f"tail record {i}")
+        head_kept_ids = sorted(kept_ids - expected_tail_ids)
+        self.assertTrue(head_kept_ids, "expected at least one head row to survive striding")
+        for tid in head_kept_ids:
+            self.assertEqual(by_id[tid]["weight"], stride, msg=f"head record {tid}")
+        # The weights approximately cover the full original population --
+        # uniform striding means the last, partial bucket can be credited
+        # with a full stride's worth of weight even though it stands for
+        # fewer than `stride` originals, so this is a bound (within one
+        # stride's worth), not exact equality. See the fix-round report's
+        # before/after percentile numbers, computed against the real
+        # fixture, for why the weighting matters in practice.
+        total_weight = sum(rm["weight"] for rm in ir["records_meta"])
+        self.assertGreaterEqual(total_weight, n)
+        self.assertLess(total_weight, n + stride)
+
+
+# ---------------------------------------------------------------------------
+# Remaining "also fix" items from the fix-round review that were not
+# already covered as part of one of the three must-fix tests above.
+# ---------------------------------------------------------------------------
+
+class TestFixRoundAlsoFixItems(unittest.TestCase):
+    def setUp(self):
+        self.tmpfiles = []
+
+    def tearDown(self):
+        for p in self.tmpfiles:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _tmp(self, name, data):
+        path = os.path.join(THIS_DIR, f"_test_tmp_{name}_{id(self)}_{os.getpid()}.dump")
+        write_temp(path, data)
+        self.tmpfiles.append(path)
+        return path
+
+    def test_method_id_decodes_unsigned(self):
+        # RECORD_FMT used to spell method_id as "i" (signed) instead of
+        # "I" -- any method_id >= 2^31 decoded as a negative number. That
+        # range is reachable in practice (method ids are assigned
+        # sequentially from 1 in registration order -- see
+        # parse_method_table -- so this needs a LOT of distinct methods,
+        # but the encoding itself doesn't care why the value is large).
+        big_method_id = 0x80000001  # > 2^31, would be negative if signed
+        rec = make_record_bytes(1, merge.LT_ROLE_CLIENT, sequential_client_ts(),
+                                 method_id=big_method_id)
+        header = make_header_bytes(1, method_table_offset=merge.HEADER_SIZE)
+        path = self._tmp("bigmethod", header + rec)
+        d = merge.parse_dump(path)
+        self.assertEqual(d["records"][0]["method_id"], big_method_id)
+        self.assertGreater(d["records"][0]["method_id"], 0)
+
+    def test_dropped_count_reaches_ir_stats(self):
+        rec = make_record_bytes(1, merge.LT_ROLE_CLIENT, sequential_client_ts())
+        srec = make_record_bytes(1, merge.LT_ROLE_SERVER, sequential_server_ts())
+        cdata = make_dump([rec], dropped_count=42)
+        sdata = make_dump([srec], dropped_count=7)
+        cpath, spath = self._tmp("c", cdata), self._tmp("s", sdata)
+        cdump, sdump = merge.parse_dump(cpath), merge.parse_dump(spath)
+        self.assertEqual(cdump["header"]["dropped_count"], 42)
+        self.assertEqual(sdump["header"]["dropped_count"], 7)
+        result = merge.merge_dumps(cdump, sdump)
+        ir, _ = merge.build_intermediate_representation(cdump, sdump, result)
+        self.assertEqual(ir["stats"]["client_dropped_count"], 42)
+        self.assertEqual(ir["stats"]["server_dropped_count"], 7)
+
+    def test_realtime_windows_that_do_not_overlap_are_flagged(self):
+        rec = make_record_bytes(1, merge.LT_ROLE_CLIENT, sequential_client_ts())
+        srec = make_record_bytes(1, merge.LT_ROLE_SERVER, sequential_server_ts())
+        # Two dumps whose calibration ran a day apart -- e.g. today's
+        # client paired with yesterday's server dump by mistake.
+        cdata = make_dump([rec])
+        sdata_bytes = bytearray(make_dump([srec]))
+        # head_realtime_ns / tail_realtime_ns sit right after
+        # counter_freq_hz in HEADER_FMT ("<QIIQqQqqqdQQQQQ"); patch them
+        # directly rather than re-deriving byte offsets by hand.
+        import struct as _struct
+        # HEADER_FIELDS: magic, record_size, point_count, head_counter,
+        # head_monotonic_ns, tail_counter, tail_monotonic_ns,
+        # head_realtime_ns, tail_realtime_ns, ... -- "<QIIQqQq" covers the
+        # first 7 fields (through tail_monotonic_ns), so its calcsize is
+        # exactly the byte offset where head_realtime_ns starts.
+        off = _struct.calcsize("<QIIQqQq")
+        one_day_ns = 24 * 3600 * 1_000_000_000
+        head_rt, tail_rt = _struct.unpack_from("<qq", sdata_bytes, off)
+        _struct.pack_into("<qq", sdata_bytes, off, head_rt + one_day_ns, tail_rt + one_day_ns)
+        cpath, spath = self._tmp("c", cdata), self._tmp("s", bytes(sdata_bytes))
+        cdump, sdump = merge.parse_dump(cpath), merge.parse_dump(spath)
+        self.assertFalse(merge.check_realtime_overlap(cdump, sdump))
+        result = merge.merge_dumps(cdump, sdump)
+        self.assertFalse(result["realtime_overlap_ok"])
+        ir, _ = merge.build_intermediate_representation(cdump, sdump, result)
+        self.assertFalse(ir["stats"]["realtime_overlap_ok"])
+
+    def test_realtime_windows_that_do_overlap_are_not_flagged(self):
+        rec = make_record_bytes(1, merge.LT_ROLE_CLIENT, sequential_client_ts())
+        srec = make_record_bytes(1, merge.LT_ROLE_SERVER, sequential_server_ts())
+        cpath = self._tmp("c", make_dump([rec]))
+        spath = self._tmp("s", make_dump([srec]))
+        cdump, sdump = merge.parse_dump(cpath), merge.parse_dump(spath)
+        self.assertTrue(merge.check_realtime_overlap(cdump, sdump))
+
+    def test_item_group_sizes_31_matches_the_31_names_and_merge_pys_own_lists(self):
+        # "also fix": render.py used to hardcode 7/16/8 as JS constants
+        # instead of reading the split from the IR. Pin that the IR
+        # actually carries a split that (a) sums to 31 and (b) matches
+        # merge.py's own source-of-truth lists, so a future change to the
+        # item lists is caught here rather than only in render.py at
+        # runtime.
+        client_dump = {"path": "c", "methods": {1: "x"}, "freq_hz": 1e8, "records": []}
+        server_dump = {"path": "s", "freq_hz": 1e8, "records": []}
+        fake_result = {
+            "client_ids": set(), "server_ids": set(), "joined_ids": set(),
+            "only_client": set(), "only_server": set(),
+            "reject_counts": {r: 0 for r in merge.ALL_REJECT_REASONS},
+            "accepted": [],
+        }
+        ir, _ = merge.build_intermediate_representation(client_dump, server_dump, fake_result)
+        self.assertEqual(ir["item_group_sizes_31"],
+                          [len(merge.DECOMPOSITION_ITEMS_CLIENT_SEND),
+                           len(merge.DECOMPOSITION_ITEMS_SERVER),
+                           len(merge.DECOMPOSITION_ITEMS_CLIENT_RECV)])
+        self.assertEqual(sum(ir["item_group_sizes_31"]), 31)
+        self.assertEqual(sum(ir["item_group_sizes_31"]), len(ir["item_names_31"]))
+
+    def test_saturated_point_marks_the_items_it_touches_and_is_clipped(self):
+        ts = sequential_client_ts(step=1000)
+        ts[merge.C_RPC_END] = merge.TS_SATURATED  # >= ~42.9s lower bound
+        crec_bytes = make_record_bytes(1, merge.LT_ROLE_CLIENT, ts)
+        srec_bytes = make_record_bytes(1, merge.LT_ROLE_SERVER, sequential_server_ts(step=1000))
+        cpath = self._tmp("c", make_dump([crec_bytes]))
+        spath = self._tmp("s", make_dump([srec_bytes]))
+        cdump, sdump = merge.parse_dump(cpath), merge.parse_dump(spath)
+        result = merge.merge_dumps(cdump, sdump)
+        j = result["joined"][0]
+        self.assertIn("cli_post_deser", j["merged"]["saturated_items"])
+        ir, _ = merge.build_intermediate_representation(cdump, sdump, result)
+        meta = ir["records_meta"][0]
+        self.assertIn("cli_post_deser", meta["saturated_items"])
+        # The ~42.9s ticks-side lower bound cannot fit int32 ns (+-2.147s),
+        # so frac_to_i32 must have clamped it -- and said so.
+        self.assertIn("cli_post_deser", meta["clipped_items"])
 
 
 if __name__ == "__main__":

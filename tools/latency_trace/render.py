@@ -202,13 +202,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     <h1>__LT_TITLE__</h1>
     <p class="subtitle">Per-request end-to-end RPC latency, decomposed into 33 named segments
       (design doc sec.5). The bar for each request is a waterfall: segments stack in
-      pipeline order and the bar's top is always exactly that request's end-to-end
-      latency, whether every segment is positive or not.</p>
+      pipeline order and the bar's top is, by construction, exactly that request's
+      end-to-end latency under model A, whether every segment is positive or not.
+      Under model B the two link segments are each rounded to whole nanoseconds
+      independently, so on rare records the bar top can be off by &plusmn;1ns from the
+      true end-to-end value -- an artifact of that rounding, not a data error.</p>
   </header>
 
   <section class="card" id="qualityBanner">
     <h2>Data quality</h2>
     <div class="banner-grid" id="bannerStats"></div>
+    <div id="droppedSection"></div>
+    <div id="overlapSection"></div>
     <div id="rejectSection"></div>
     <div id="downsampleSection"></div>
     <div id="negativeSection"></div>
@@ -252,6 +257,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       color); <strong>&#9675;</strong> segments are gap/bookkeeping intervals this design added
       between them (shown in muted gray, deliberately receding). <code>link_up</code> /
       <code>link_down</code> are derived, not directly measured -- see the model selector above.
+      A segment outlined with a dashed border is a <strong>lower bound</strong>, not an exact
+      reading: its underlying timestamp saturated (the real interval was too long, roughly
+      42.9 seconds or more, for the on-disk encoding to hold exactly).
     </div>
     <div class="legend-actions">
       <button id="legendAllBtn">show all</button>
@@ -301,14 +309,26 @@ const IR = __LT_IR_JSON__;
 
 // ---------------------------------------------------------------------
 // Constants derived from the IR's fixed schema (design doc sec.5): the 31
-// shared items are always 7 client-send + 16 server + 8 client-recv, in
-// that order (DECOMPOSITION_ITEMS_31 in merge.py). link_up/link_down are
-// spliced in at positions 7 and 24 of the canonical 33-item order
-// (ITEM_ORDER_33), matching sec.5's presentation order.
+// shared items are always client-send + server + client-recv, in that
+// order (DECOMPOSITION_ITEMS_31 in merge.py). link_up/link_down are
+// spliced in at positions SEND_N and SEND_N+1+SERVER_N of the canonical
+// 33-item order (ITEM_ORDER_33), matching sec.5's presentation order.
+//
+// "also fix" (fix-round review): the split sizes (7/16/8) used to be
+// hardcoded JS literals instead of being read from the IR that actually
+// defines them (merge.py's DECOMPOSITION_ITEMS_CLIENT_SEND/_SERVER/
+// _CLIENT_RECV) -- a change to those lists on the merge.py side wouldn't
+// have been caught here until the split silently misaligned. Read from
+// IR.item_group_sizes_31 instead, with a fallback to the previously-
+// hardcoded values only for an older IR file that predates this field.
 // ---------------------------------------------------------------------
-const SEND_N = 7, SERVER_N = 16, RECV_N = 8;
 const NAMES31 = IR.item_names_31;
 const STARRED31 = IR.item_starred_31;
+const GROUP_SIZES = IR.item_group_sizes_31 || [7, 16, 8];
+if (GROUP_SIZES.length !== 3) {
+  throw new Error('unexpected item_group_sizes_31 -- schema drift from what render.py was written against');
+}
+const [SEND_N, SERVER_N, RECV_N] = GROUP_SIZES;
 if (NAMES31.length !== 31 || SEND_N + SERVER_N + RECV_N !== 31) {
   throw new Error('unexpected item_names_31 length -- schema drift from what render.py was written against');
 }
@@ -340,6 +360,18 @@ for (let i = 0; i < 33; i++) ROW_MAP.push(i33ToRow31Index(i));
 const NA = IR.na_sentinel_i32;
 const INTS = IR.ints_per_record;
 const N_TOTAL = IR.records_meta.length;
+// must-fix 1 (fix-round review): each record's weight -- 1 for a
+// full-fidelity row, `head_stride` for a downsample-strided row -- is how
+// many original accepted records this one row stands in for. Defaults to
+// 1 for an older IR file that predates this field, which degrades to the
+// old (correct-when-undownsampled, biased-when-downsampled) behavior
+// rather than throwing.
+const WEIGHTS = new Float64Array(N_TOTAL);
+for (let i = 0; i < N_TOTAL; i++) {
+  const w = IR.records_meta[i].weight;
+  WEIGHTS[i] = (typeof w === 'number' && w > 0) ? w : 1;
+}
+const IS_DOWNSAMPLED = !!(IR.downsample && IR.downsample.applied);
 
 function decodeBlobB64(b64) {
   const bin = atob(b64);
@@ -475,10 +507,52 @@ function renderBanner() {
     row.append(kEl, vEl); grid.append(row);
   }
 
+  // must-fix 3 (fix-round review): dropped_count was parsed out of both
+  // headers and then never looked at again. The ring buffer stops
+  // accepting new records once full and counts what it refused there --
+  // if a run overflowed, the "Joined by trace_id" row above can read
+  // 100% while most of what actually ran was never written to either
+  // dump at all. Surfaced prominently (not just another quiet stat row)
+  // whenever either side is non-zero; also warned on stderr by merge.py's
+  // own CLI (main()), since this page might not even be the first thing
+  // whoever ran the capture looks at.
+  const dropSec = document.getElementById('droppedSection');
+  dropSec.textContent = '';
+  if (s.client_dropped_count || s.server_dropped_count) {
+    const dropNote = document.createElement('div');
+    dropNote.className = 'downsample-note'; // reuse the warn-bg/warn-border styling
+    dropNote.textContent = 'RING BUFFER OVERFLOW: the client dropped ' + fmtCount(s.client_dropped_count) +
+      ' record(s) and the server dropped ' + fmtCount(s.server_dropped_count) + ' record(s) because their ' +
+      'buffers were full before this capture ended. The "Joined by trace_id" rate above is computed only over ' +
+      'what actually made it into these two dump files -- it says nothing about the requests dropped before ' +
+      'that, and a 100% join rate here does NOT mean 100% of the traffic that ran was captured.';
+    dropSec.append(dropNote);
+  }
+
+  // "also fix": the realtime calibration pair exists so this tool can
+  // sanity-check the two dumps came from overlapping capture runs
+  // (design doc sec.8.1/9.1) -- previously computed and then never
+  // actually checked, so two dumps from unrelated runs joined "happily".
+  const overlapSec = document.getElementById('overlapSection');
+  overlapSec.textContent = '';
+  if (s.realtime_overlap_ok === false) {
+    const overlapNote = document.createElement('div');
+    overlapNote.className = 'downsample-note';
+    overlapNote.textContent = 'CLIENT/SERVER CLOCKS DO NOT OVERLAP: the two dumps’ realtime calibration ' +
+      'windows do not overlap at all (see merge.py’s stderr warning for the exact windows). A successful ' +
+      'trace_id join does not by itself prove these two dumps came from the same capture run -- this pair ' +
+      'looks like it did not, and every number on this page should be treated with that in mind.';
+    overlapSec.append(overlapNote);
+  }
+
   const REASON_LABEL = {
-    unstamped_point: 'a checkpoint was never stamped (raw 0) on at least one side -- likely an un-instrumented code path',
+    unstamped_point: 'a checkpoint decoded as raw 0 (never stamped) on at least one side. This has more than ' +
+      'one legitimate cause the runtime cannot distinguish after the fact: an un-instrumented code path, but ' +
+      'also two IN-SCOPE, EXPECTED sources of a genuine zero -- a streaming response’s S15-S17 (design doc ' +
+      'sec.13: streaming does not go through the ordinary write path) and a cancelled backup request’s ' +
+      'receive-side points. See the breakdown below this table for which specific point(s) were zero.',
     non_monotonic: "one side's decoded offsets went backwards within its own checkpoint sequence",
-    negative_decomposition_item: 'at least one of the 31 shared segments, or the total link time, came out negative',
+    negative_decomposition_item: 'at least one of the 31 shared segments, or the total link time, came out negative (only enforced as an exclusion in --low-concurrency mode -- see the note below the table)',
     negative_rtt_late_write_end_stamp: 'client wake (C09) preceded client write_end (C08) -- a known scheduling-delay tail (design doc sec.10.1), not necessarily a bug',
   };
   const rc = s.reject_counts;
@@ -508,6 +582,36 @@ function renderBanner() {
     tr.append(c1, c2, c3); tbody.append(tr);
   }
   table.append(tbody); rejSec.append(table);
+
+  // "also fix": name which specific point(s) were found zero among the
+  // unstamped_point rejects, instead of only asserting a cause.
+  const hist = s.unstamped_point_histogram || {};
+  const histEntries = Object.entries(hist).sort((a, b) => b[1] - a[1]);
+  if (histEntries.length) {
+    const histNote = document.createElement('div');
+    histNote.style.marginTop = '8px'; histNote.style.fontSize = '12.5px'; histNote.style.color = 'var(--text-secondary)';
+    histNote.textContent = 'Which point(s) were zero, across the ' + fmtCount(rc.unstamped_point || 0) +
+      ' unstamped_point reject(s) above (a record can contribute more than one point): ' +
+      histEntries.map(([name, count]) => name + ' (' + fmtCount(count) + ')').join(', ') + '.';
+    rejSec.append(histNote);
+  }
+
+  // must-fix 2 (fix-round review): whether the non-negative-item check
+  // (sec.10.1 assertion 3) is being enforced as an exclusion at all.
+  const modeNote = document.createElement('div');
+  modeNote.style.marginTop = '10px'; modeNote.style.fontSize = '13px'; modeNote.style.color = 'var(--text-secondary)';
+  if (s.low_concurrency_mode) {
+    modeNote.textContent = '--low-concurrency was set: records with a negative segment were EXCLUDED above ' +
+      '(counted under negative_decomposition_item), not shown on this page at all.';
+  } else {
+    const ni = s.negative_items || { count: 0, ratio: 0 };
+    modeNote.textContent = 'Default mode (not --low-concurrency): records with a negative segment are kept, ' +
+      'not excluded -- ' + fmtCount(ni.count) + ' of ' + fmtCount(s.accepted_count) + ' accepted records (' +
+      fmtPct(ni.ratio) + ') have one. Design doc sec.6.1/6.2/9.3: at real capture concurrency this is expected ' +
+      'batching noise, and under model B a genuine pollution detector, not by itself evidence of a defect. See ' +
+      'the negative-segment callout below the chart.';
+  }
+  rejSec.append(modeNote);
 
   const dsSec = document.getElementById('downsampleSection');
   dsSec.textContent = '';
@@ -608,6 +712,13 @@ document.getElementById('legendNoneBtn').addEventListener('click', () => {
 // ---------------------------------------------------------------------
 function computeBarSegments(idx) {
   const row = rowOf(idx);
+  // "also fix" (fix-round review): which of this record's items are a
+  // ts[]-saturation lower bound (~42.9s+) rather than an exact reading
+  // (latency_trace.h's 0xFFFFFFFE sentinel) -- drawn/tooltipped as a
+  // floor, not a precise value. Falls back to an empty set for an older
+  // IR file that predates this field.
+  const satNames = IR.records_meta[idx].saturated_items;
+  const satSet = satNames && satNames.length ? new Set(satNames) : null;
   let cum = 0;
   const segs = [];
   for (let i33 = 0; i33 < 33; i33++) {
@@ -620,6 +731,7 @@ function computeBarSegments(idx) {
     segs.push({
       i33, name, starred: STARRED33[i33], isNA: false, valueNs: raw,
       yLo: Math.min(before, after), yHi: Math.max(before, after), negative: raw < 0,
+      saturated: satSet ? satSet.has(name) : false,
     });
   }
   return { segs, finalCum: cum };
@@ -679,6 +791,14 @@ function drawChart() {
     ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim();
     ctx.font = '13px system-ui, sans-serif';
     ctx.fillText('No requests in the current filter/zoom.', marginL, marginT + 20);
+    // "also fix" (fix-round review): this early return used to skip both
+    // updaters below, leaving the zoom-info line and the negative-segment
+    // callout stuck on stale text from before the filter/zoom emptied out
+    // (e.g. "showing all N requests" and "N of N shown requests" while the
+    // chart itself says "No requests"). Call them here too so the whole
+    // page agrees.
+    updateZoomInfo(order, nVis);
+    updateNegCallout();
     return;
   }
 
@@ -768,6 +888,22 @@ function drawChart() {
       ctx.strokeRect(x0 + 0.7, pxTop + 0.7, Math.max(0, (x1 - x0) - 1.4), Math.max(0, (pxBottom - pxTop) - 1.4));
       ctx.restore();
     }
+    // "also fix" (fix-round review): a ts[]-saturation lower bound
+    // (~42.9s+, latency_trace.h's 0xFFFFFFFE) used to render as an exact
+    // bar with no visual difference from a real reading -- specifically,
+    // frac_to_i32's int32-ns clamp turns a 42.9s lower bound into an
+    // exact-LOOKING 2.147s segment, which is actively misleading, not
+    // just imprecise. A dashed white/dark outline marks it as a floor;
+    // the tooltip (hoverAt) spells out why.
+    for (const seg of segs) {
+      if (seg.isNA || seg.negative || !seg.saturated) continue;
+      const pxTop = toY(seg.yHi), pxBottom = toY(seg.yLo);
+      ctx.save();
+      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim();
+      ctx.lineWidth = 1.6; ctx.setLineDash([3, 2]);
+      ctx.strokeRect(x0 + 1, pxTop + 1, Math.max(0, (x1 - x0) - 2), Math.max(0, (pxBottom - pxTop) - 2));
+      ctx.restore();
+    }
     if (anyNeg) {
       ctx.save();
       ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--status-critical').trim();
@@ -788,11 +924,13 @@ function drawChart() {
     const colMaxE2e = new Float64Array(colCount).fill(-1);
     colRepIdx = new Int32Array(colCount).fill(-1);
     colCounts = new Int32Array(colCount);
+    const colVals = Array.from({ length: colCount }, () => []);
     for (let r = rankLo; r < rankHi; r++) {
       const col = Math.min(colCount - 1, Math.floor((r - rankLo) / visibleCount * colCount));
       colCounts[col]++;
       const idx = order[r];
       const e = IR.records_meta[idx].e2e_ns;
+      colVals[col].push(e);
       if (e > colMaxE2e[col]) { colMaxE2e[col] = e; colRepIdx[col] = idx; }
     }
     for (let c = 0; c < colCount; c++) {
@@ -800,6 +938,31 @@ function drawChart() {
       const x0 = marginL + c / colCount * plotW, x1 = marginL + (c + 1) / colCount * plotW;
       drawOneBar(colRepIdx[c], x0, x1);
     }
+    // "also fix" (fix-round review): the drawn envelope is deliberately
+    // each column's SLOWEST request (tail-latency-first). At real capture
+    // scale under trace_id order, a column can aggregate dozens of
+    // requests, so the drawn curve sits near each column's high
+    // percentile while the stats table beside it reports P50 -- an order
+    // of magnitude apart, with nothing on the page explaining why. This
+    // faint per-column MEDIAN line makes the gap between "drawn" and
+    // "table" read as an envelope rather than a silent discrepancy; the
+    // aggregation ratio itself is surfaced in the persistent zoom-info
+    // line (updateZoomInfo, below).
+    ctx.save();
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim();
+    ctx.globalAlpha = 0.4;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    let medStarted = false;
+    for (let c = 0; c < colCount; c++) {
+      if (!colVals[c].length) continue;
+      const arr = colVals[c].sort((a, b) => a - b);
+      const med = arr[Math.floor((arr.length - 1) / 2)];
+      const x = marginL + (c + 0.5) / colCount * plotW, y = toY(med);
+      if (!medStarted) { ctx.moveTo(x, y); medStarted = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.restore();
   }
 
   // x-axis caption
@@ -820,14 +983,36 @@ function updateZoomInfo(order, nVis) {
   const rankLo = state.rankLo, rankHi = state.rankHi;
   const isFull = rankLo === 0 && rankHi === nVis;
   document.getElementById('resetZoomBtn').disabled = isFull;
-  if (isFull) { el.textContent = 'showing all ' + fmtCount(nVis) + ' requests'; return; }
+  // "also fix" (fix-round review): make the column-aggregation ratio
+  // persistently visible (previously only discoverable via hover, one
+  // column at a time) whenever the chart is aggregating -- see the
+  // median-line comment in drawChart() for why this matters.
+  let aggSuffix = '';
+  if (lastRender && !lastRender.mode1to1 && lastRender.colCount > 0) {
+    const ratio = lastRender.visibleCount / lastRender.colCount;
+    if (ratio > 1.05) {
+      aggSuffix = ' -- each chart column aggregates ~' + ratio.toFixed(1) +
+        ' requests (bar: slowest per column, faint line: per-column median)';
+    }
+  }
+  if (isFull) { el.textContent = 'showing all ' + fmtCount(nVis) + ' requests' + aggSuffix; return; }
+  // A zero-width zoom (rankLo === rankHi, reachable when a filter such as
+  // hideNeg empties out the previously-zoomed range) has no records to
+  // take a min/max over -- found by hand while verifying the "also fix"
+  // empty-visible-set update in a real browser: without this branch the
+  // min/max loop below leaves minE/maxE at their +-Infinity seed values
+  // and fmtNs prints the literal string "Infinity ms".
+  if (rankHi <= rankLo) {
+    el.textContent = 'zoomed: ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankLo) + ' (0 requests)' + aggSuffix;
+    return;
+  }
   let minE = Infinity, maxE = -Infinity;
   for (let r = rankLo; r < rankHi; r++) {
     const e = IR.records_meta[order[r]].e2e_ns;
     if (e < minE) minE = e; if (e > maxE) maxE = e;
   }
   el.textContent = 'zoomed: ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankHi - 1) + ' (' + fmtCount(rankHi - rankLo) +
-    ' requests, ' + fmtNs(minE) + '–' + fmtNs(maxE) + ')';
+    ' requests, ' + fmtNs(minE) + '–' + fmtNs(maxE) + ')' + aggSuffix;
 }
 
 function updateNegCallout() {
@@ -949,7 +1134,9 @@ function hoverAt(xCss, yCss, clientX, clientY) {
     const row = document.createElement('div'); row.className = 'tt-row';
     const kEl = document.createElement('span'); kEl.className = 'tt-muted'; kEl.textContent = 'duration';
     const vEl = document.createElement('span'); vEl.className = 'tt-value';
-    vEl.textContent = hit.isNA ? 'N/A (not applicable in this record\'s mode)' : fmtNs(hit.valueNs) + (hit.negative ? '  (negative -- steps back)' : '');
+    vEl.textContent = hit.isNA ? 'N/A (not applicable in this record\'s mode)'
+      : hit.saturated ? '≥ ' + fmtNs(hit.valueNs) + '  (lower bound -- ts[] saturated at ~42.9s, not an exact reading)'
+      : fmtNs(hit.valueNs) + (hit.negative ? '  (negative -- steps back)' : '');
     row.append(kEl, vEl); tooltip.append(row);
   }
   const addRow = (k, v) => {
@@ -976,34 +1163,69 @@ function hoverAt(xCss, yCss, clientX, clientY) {
 // scoped to the current zoom by default, sortable by any column,
 // defaulting to P99 descending (design doc / task's fixed decisions).
 // ---------------------------------------------------------------------
-function linearPercentile(sortedAsc, p) {
-  const n = sortedAsc.length;
+// must-fix 1 (fix-round review): merge.py's downsampling keeps the slow
+// tail whole and strides the head to hit a byte budget (right for the
+// chart -- it preserves tail shape). But an UNWEIGHTED percentile over
+// that kept set treats it as if it WERE the population: on the committed
+// fixture forced through --max-mb 0.2, the row labelled P50 read 34420ns
+// (really the true population's 83rd percentile), P90 read the true
+// 96.7th, P99 the true 99.7th -- see the fix-round report for the full
+// before/after. `w` (each row's weight -- 1 for a full-fidelity row,
+// `head_stride` for a strided head row, from WEIGHTS/merge.py's
+// per-record "weight") corrects this: a value that stands for `w`
+// original records counts `w` times, not once, in both the mean and each
+// percentile. When nothing was downsampled every weight is 1 and this is
+// arithmetically identical to the old unweighted computation.
+function weightedQuantile(sortedPairs, prefixWeight, totalWeight, p) {
+  const n = sortedPairs.length;
   if (n === 0) return null;
-  if (n === 1) return sortedAsc[0];
-  const h = (n - 1) * p;
+  if (n === 1) return sortedPairs[0].v;
+  const h = p * (totalWeight - 1);
   const lo = Math.floor(h), hi = Math.ceil(h);
-  if (lo === hi) return sortedAsc[lo];
-  return sortedAsc[lo] + (sortedAsc[hi] - sortedAsc[lo]) * (h - lo);
+  const valueAtRank = (k) => {
+    // Smallest index i such that prefixWeight[i] > k -- i.e. the sample
+    // whose weighted "slot" (as if repeated w times) covers virtual
+    // position k. Binary search since prefixWeight is non-decreasing.
+    let a = 0, b = n - 1;
+    while (a < b) {
+      const mid = (a + b) >> 1;
+      if (prefixWeight[mid] > k) b = mid; else a = mid + 1;
+    }
+    return sortedPairs[a].v;
+  };
+  const vLo = valueAtRank(lo), vHi = valueAtRank(hi);
+  return lo === hi ? vLo : vLo + (vHi - vLo) * (h - lo);
 }
 
 function computeStatsRows(rankLo, rankHi, order, model) {
   const rows = [];
   for (let i33 = 0; i33 < 33; i33++) {
-    const vals = [];
-    let naCount = 0;
+    const pairs = [];
+    let naWeight = 0;
     for (let r = rankLo; r < rankHi; r++) {
       const idx = order[r];
       const raw = get33Raw(rowOf(idx), i33, model);
-      if (raw === NA) { naCount++; continue; }
-      vals.push(raw);
+      const w = WEIGHTS[idx];
+      if (raw === NA) { naWeight += w; continue; }
+      pairs.push({ v: raw, w });
     }
-    vals.sort((a, b) => a - b);
-    const n = vals.length;
-    const mean = n ? vals.reduce((s, v) => s + v, 0) / n : null;
+    pairs.sort((a, b) => a.v - b.v);
+    let totalWeight = 0;
+    const prefixWeight = new Array(pairs.length);
+    for (let i = 0; i < pairs.length; i++) { totalWeight += pairs[i].w; prefixWeight[i] = totalWeight; }
+    const mean = totalWeight ? pairs.reduce((s, o) => s + o.v * o.w, 0) / totalWeight : null;
     rows.push({
-      i33, name: NAMES33[i33], starred: STARRED33[i33], n, naCount,
-      mean, p50: linearPercentile(vals, 0.50), p90: linearPercentile(vals, 0.90),
-      p99: linearPercentile(vals, 0.99), p999: linearPercentile(vals, 0.999),
+      i33, name: NAMES33[i33], starred: STARRED33[i33],
+      // N/N-A are themselves estimates of the full accepted population's
+      // counts when downsampled (sum of weight, not row count) -- see the
+      // weighting note above computeStatsRows for why this can't just
+      // count rows either.
+      n: Math.round(totalWeight), naCount: Math.round(naWeight),
+      mean,
+      p50: weightedQuantile(pairs, prefixWeight, totalWeight, 0.50),
+      p90: weightedQuantile(pairs, prefixWeight, totalWeight, 0.90),
+      p99: weightedQuantile(pairs, prefixWeight, totalWeight, 0.99),
+      p999: weightedQuantile(pairs, prefixWeight, totalWeight, 0.999),
     });
   }
   return rows;
@@ -1022,7 +1244,11 @@ const PCT_COLS = [
 
 function renderTable() {
   const nVis = currentOrder().length;
-  const order = state.tableScope === 'all' ? currentOrder() : currentOrder();
+  // "also fix" (fix-round review): this used to be a no-op ternary
+  // (`state.tableScope === 'all' ? currentOrder() : currentOrder()`) --
+  // both branches called the same function, so the condition did
+  // nothing; tableScope only actually changes rankLo/rankHi below.
+  const order = currentOrder();
   const rankLo = state.tableScope === 'all' ? 0 : state.rankLo;
   const rankHi = state.tableScope === 'all' ? nVis : state.rankHi;
   const rows = computeStatsRows(rankLo, rankHi, order, state.linkModel);
@@ -1074,14 +1300,30 @@ function renderTable() {
 
   const scopeLabel = document.getElementById('tableScopeLabel');
   const scopeBtn = document.getElementById('scopeToggleBtn');
+  // "also fix" (fix-round review): "whole dataset" on its own reads as
+  // "every accepted request" -- when the negative-segment filter is on,
+  // it's actually "every accepted request except those", which is a
+  // materially different population for anyone reading the stats table.
+  const hideNegSuffix = state.hideNeg ? ' (negative-segment requests hidden)' : '';
+  // must-fix 1: state what the numbers describe. Percentiles/mean are
+  // always weighted (computeStatsRows), which is a no-op when nothing
+  // was downsampled (every weight is 1) but is NOT a no-op once
+  // downsampling kicked in -- say so explicitly rather than leaving a
+  // reader to assume "P50" means "the 50th of the rows on this page."
+  const weightedSuffix = IS_DOWNSAMPLED
+    ? ' -- weighted to estimate the full accepted population, not just the ' +
+      fmtCount(N_TOTAL) + ' request(s) shown on this page (see the downsampling note above)'
+    : '';
   if (state.tableScope === 'zoom') {
     const isFull = rankLo === 0 && rankHi === nVis;
-    scopeLabel.textContent = isFull
-      ? 'scope: whole dataset (' + fmtCount(nVis) + ' requests)'
-      : 'scope: current zoom, ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankHi - 1) + ' (' + fmtCount(rankHi - rankLo) + ' requests)';
+    scopeLabel.textContent = (isFull
+      ? 'scope: whole dataset (' + fmtCount(nVis) + ' requests)' + hideNegSuffix
+      : 'scope: current zoom, ranks ' + fmtCount(rankLo) + '–' + fmtCount(rankHi - 1) + ' (' + fmtCount(rankHi - rankLo) + ' requests)' + hideNegSuffix)
+      + weightedSuffix;
     scopeBtn.textContent = 'pin to whole-dataset stats';
   } else {
-    scopeLabel.textContent = 'scope: whole dataset (' + fmtCount(nVis) + ' requests), ignoring current zoom';
+    scopeLabel.textContent = 'scope: whole dataset (' + fmtCount(nVis) + ' requests), ignoring current zoom' +
+      hideNegSuffix + weightedSuffix;
     scopeBtn.textContent = 'follow zoom again';
   }
 }
