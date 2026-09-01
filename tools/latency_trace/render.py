@@ -168,8 +168,9 @@ HTML_TEMPLATE = r"""<!doctype html>
   #chartCanvas.panning { cursor: grabbing; }
   #chartCanvas.boxing { cursor: crosshair; }
   #selOverlay {
-    position: absolute; background: color-mix(in srgb, var(--hue-client-send) 18%, transparent);
-    border: 1px solid var(--hue-client-send);
+    position: absolute; top: 0; height: 440px;
+    background: color-mix(in srgb, var(--hue-client-send) 18%, transparent);
+    border-left: 1px solid var(--hue-client-send); border-right: 1px solid var(--hue-client-send);
     pointer-events: none; display: none;
   }
   /* Scrollbars are drawn rather than native: a native one would need a
@@ -319,20 +320,26 @@ HTML_TEMPLATE = r"""<!doctype html>
       that column's <em>slowest</em> request (by end-to-end latency) -- the hover tooltip says
       how many requests the column stands for.</p>
     <table class="gestures">
-      <tr><td class="g">drag</td><td>pan the rank axis; also the latency axis, once that one is zoomed</td>
+      <tr><td class="g">drag</td><td>pan both axes</td>
           <td class="g"><kbd>Ctrl</kbd>/<kbd>&#8984;</kbd> + wheel</td><td>zoom the rank axis, anchored at the cursor</td></tr>
-      <tr><td class="g"><kbd>Shift</kbd> + drag</td><td>box-zoom: the box sets both the rank window and the latency window</td>
+      <tr><td class="g"><kbd>Shift</kbd> + drag</td><td>select a rank range to zoom into (the latency scale is left alone)</td>
           <td class="g"><kbd>Shift</kbd> + wheel</td><td>zoom the latency axis, anchored at the cursor</td></tr>
       <tr><td class="g">scrollbars</td><td>pan; the thumb's length is the fraction currently in view</td>
           <td class="g">wheel alone</td><td>scrolls the page as usual -- the chart does not capture it</td></tr>
     </table>
-    <p class="table-scope"><strong>Zooming the rank axis narrows the statistics below</strong> (while the
-      table is set to follow the zoom). <strong>Zooming the latency axis does not</strong> -- it only crops
-      what is drawn, so it is a magnifier, never a filter. Bars that run past the top or bottom of a
-      cropped latency axis are marked with a small triangle at that edge. Once the latency axis is
-      zoomed it stays on a fixed nanosecond range as you pan the rank axis, so bar heights stay
-      comparable between two different rank windows; zoom it back out fully to return it to
-      auto-fitting each window.</p>
+    <p class="table-scope"><strong>The latency axis is a fixed ruler.</strong> It is set once from the whole
+      sample and only ever moves when you move it -- panning or zooming the rank axis never
+      rescales it -- so a bar's height means the same thing in every window, and two bars far
+      apart on the rank axis can be compared directly by eye.
+      Its default range is the whole sample cropped at its <strong>P99.9</strong>, not at its maximum: a
+      single multi-millisecond outlier over a body of microsecond requests would otherwise
+      squash every bar on the page into the bottom pixel row. The requests above that crop are
+      still drawn, marked with a small triangle at the edge they run past, and
+      <code>Y &minus;</code> zooms out to them -- zooming out stops at the true maximum, so nothing
+      is out of reach. They are also already counted in every statistic below, which the latency
+      axis never affects: <strong>zooming the rank axis narrows the statistics</strong> (while the table
+      follows the zoom), <strong>zooming the latency axis does not</strong>. It is a magnifier, never a
+      filter.</p>
     <div class="chart-area">
       <div class="chart-col">
         <div class="chart-wrap">
@@ -468,22 +475,20 @@ function zoomRankWindow(lo, hi, factor, anchorFrac, n) {
   return { lo: l, hi: Math.max(l + 1, Math.min(n, l + Math.round(w))) };
 }
 
-// A new latency-axis window in nanoseconds, or null meaning "hand the
-// axis back to auto-fitting". `cur` is the current lock (null while
-// auto-fitting, in which case the auto-fit domain is what gets scaled).
-//
-// Returning null rather than a range that merely happens to contain the
-// data today is the point: a frozen range would be refitted to nothing
-// when a later rank zoom moves to a slower slice, and those bars would
-// silently draw off the top.
-function zoomYRange(cur, auto, factor, anchorNs) {
-  const base = cur || auto;
-  const range = Math.max(1e-9, base.hi - base.lo);
-  const frac = (anchorNs - base.lo) / range;
-  const w = range * factor;
-  const lo = anchorNs - frac * w;
-  const hi = lo + w;
-  if (lo <= auto.lo && hi >= auto.hi) return null;
+// A new latency-axis window in nanoseconds, scaled by `factor` about
+// `anchorNs` and clamped inside `bounds` (the whole sample's full
+// extent). There is no "auto" state to fall back to: the axis is always
+// an explicit range, so that panning the rank axis cannot rescale it.
+// Zooming out stops when the window is the full extent -- every request
+// is then on screen and there is nothing further to reveal.
+function zoomYRange(cur, bounds, factor, anchorNs) {
+  const range = Math.max(1e-9, cur.hi - cur.lo);
+  const frac = (anchorNs - cur.lo) / range;
+  const w = Math.min(bounds.hi - bounds.lo, range * factor);
+  let lo = anchorNs - frac * w;
+  let hi = lo + w;
+  if (hi > bounds.hi) { hi = bounds.hi; lo = hi - w; }
+  if (lo < bounds.lo) { lo = bounds.lo; hi = Math.min(bounds.hi, lo + w); }
   return { lo, hi };
 }
 
@@ -588,19 +593,65 @@ function get33Raw(row, i33, model) {
 function computeNegativeFlags(model) {
   const flags = new Uint8Array(N_TOTAL);
   let count = 0;
+  // The lowest point any record's running cumulative reaches, over the
+  // WHOLE sample -- the floor of the latency axis. Taken here rather
+  // than per visible window (and with no segment hidden) because the
+  // axis is a fixed reference now: it must not move when the rank
+  // window moves. Negative only when some record steps back below zero.
+  let floor = 0;
   for (let idx = 0; idx < N_TOTAL; idx++) {
     const row = rowOf(idx);
-    let neg = false;
+    let neg = false, cum = 0;
     for (let i33 = 0; i33 < 33; i33++) {
       const v = get33Raw(row, i33, model);
-      if (v !== NA && v < 0) { neg = true; break; }
+      if (v === NA) continue;
+      if (v < 0) neg = true;
+      cum += v;
+      if (cum < floor) floor = cum;
     }
     if (neg) { flags[idx] = 1; count++; }
   }
-  return { flags, count };
+  return { flags, count, floor };
 }
 const NEG_A = computeNegativeFlags('A');
 const NEG_B = computeNegativeFlags('B');
+
+// ---------------------------------------------------------------------
+// The latency axis is a fixed reference, computed once over the whole
+// sample. It does not follow the rank window, the negative-segment
+// filter, or the legend -- that is the entire point: two different rank
+// windows, and two different renders of comparable data, can be read
+// against the same ruler, and panning left/right never rescales the
+// bars under the cursor.
+//
+// The default top is the whole sample's P99.9 rather than its maximum:
+// on real captures a single multi-millisecond outlier over a body of
+// microsecond requests flattens every bar on the page into the bottom
+// pixel row. The handful of requests above it are drawn cropped, with a
+// marker at the edge they run past, and Y- reaches them -- zooming out
+// stops at the true maximum, so nothing is ever unreachable.
+// ---------------------------------------------------------------------
+const Y_REF = (() => {
+  const pairs = [];
+  let maxE2e = 0;
+  for (let i = 0; i < N_TOTAL; i++) {
+    const e = IR.records_meta[i].e2e_ns;
+    pairs.push({ v: e, w: WEIGHTS[i] });
+    if (e > maxE2e) maxE2e = e;
+  }
+  const p999 = N_TOTAL ? weightedSummary(pairs, 0).p999 : null;
+  const top = Math.max(1, p999 === null ? maxE2e : p999);
+  const ref = {};
+  for (const [model, neg] of [['A', NEG_A], ['B', NEG_B]]) {
+    const lo = Math.min(0, neg.floor);
+    ref[model] = {
+      base: { lo, hi: top },
+      bounds: { lo, hi: Math.max(top, maxE2e, 1) },
+    };
+  }
+  return ref;
+})();
+function yRefFor(model) { return Y_REF[model]; }
 
 // ---------------------------------------------------------------------
 // Sort orders over the virtual rank axis (design doc sec.9.2/9.3's
@@ -655,15 +706,17 @@ const state = {
   hideNeg: false,
   rankLo: 0,
   rankHi: N_TOTAL,
-  // null = the latency axis auto-fits whatever rank window is showing
-  // (the pre-zoom behaviour). Once set it is an absolute {lo, hi} in
-  // nanoseconds that survives rank zooming and panning, so bar heights
-  // stay comparable between two different rank windows.
-  yLock: null,
+  // The latency axis, always an explicit {lo, hi} in nanoseconds -- it
+  // never auto-fits the visible window, so bar heights are comparable
+  // between any two rank windows and panning left/right does not
+  // rescale anything. Starts at, and Reset returns to, Y_REF's base.
+  yView: null, // filled in below, once the link model is known
   hidden: new Set(),
   tableScope: 'zoom', // 'zoom' | 'all'
   tableSort: { col: 'p99', dir: 'desc' },
 };
+
+state.yView = { lo: yRefFor(state.linkModel).base.lo, hi: yRefFor(state.linkModel).base.hi };
 
 function currentOrder() {
   const base = state.sortMode === 'latency' ? ORDER_LATENCY : ORDER_TRACE;
@@ -1000,32 +1053,13 @@ function drawChart() {
     return;
   }
 
-  // y-domain: 0..maxE2e normally; extend below 0 only if the visible
-  // window actually contains a record whose running cumulative dips
-  // negative (rare -- see the negative-segment banner), so the axis
-  // doesn't waste headroom on the common case.
-  let maxE2e = 0;
+  // The latency axis does NOT come from the visible window: it is
+  // state.yView, a fixed reference the user moves explicitly (Y_REF
+  // above says why). Nothing computed inside this loop over the visible
+  // records may feed back into the axis, or panning would rescale it.
   const model = state.linkModel;
-  const negFlags = model === 'A' ? NEG_A.flags : NEG_B.flags;
-  let minCumFloor = 0;
-  for (let r = rankLo; r < rankHi; r++) {
-    const idx = order[r];
-    const e = IR.records_meta[idx].e2e_ns;
-    if (e > maxE2e) maxE2e = e;
-    if (negFlags[idx]) {
-      const { segs } = computeBarSegments(idx);
-      let mn = 0;
-      for (const s of segs) if (!s.isNA && s.yLo < mn) mn = s.yLo;
-      if (mn < minCumFloor) minCumFloor = mn;
-    }
-  }
-  if (maxE2e <= 0) maxE2e = 1;
-  // The auto-fit domain is computed either way: even while the latency
-  // axis is locked, the zoom-out-to-auto rule and the vertical
-  // scrollbar's extent are both defined against it.
-  const autoY = { lo: minCumFloor, hi: maxE2e };
-  const yDomainMin = state.yLock ? state.yLock.lo : autoY.lo;
-  const yDomainMax = state.yLock ? state.yLock.hi : autoY.hi;
+  const yRef = yRefFor(model);
+  const yDomainMin = state.yView.lo, yDomainMax = state.yView.hi;
   const yRange = Math.max(1, yDomainMax - yDomainMin);
   const yScale = plotH / yRange;
   const toY = (ns) => marginT + (yDomainMax - ns) * yScale;
@@ -1225,7 +1259,8 @@ function drawChart() {
     // scrollbar all have to agree with what was actually painted, and a
     // second copy of this arithmetic would drift the moment the axis
     // could be locked.
-    yDomainMin, yDomainMax, yRange, autoY, toY, fromY, clippedBars,
+    yDomainMin, yDomainMax, yRange, yBase: yRef.base, yBounds: yRef.bounds,
+    toY, fromY, clippedBars,
   };
   updateZoomInfo(order, nVis);
   updateNegCallout();
@@ -1236,17 +1271,18 @@ function updateZoomInfo(order, nVis) {
   const el = document.getElementById('zoomInfo');
   const rankLo = state.rankLo, rankHi = state.rankHi;
   const isFull = rankLo === 0 && rankHi === nVis;
-  document.getElementById('resetZoomBtn').disabled = isFull && !state.yLock;
+  const yRef = yRefFor(state.linkModel);
+  const atBase = state.yView.lo === yRef.base.lo && state.yView.hi === yRef.base.hi;
+  document.getElementById('resetZoomBtn').disabled = isFull && atBase;
   // The latency axis is reported separately from the rank axis because
   // the two mean different things to the numbers below: one narrows the
   // statistics, the other does not.
-  let ySuffix = '';
-  if (state.yLock) {
-    ySuffix = ' | y axis: ' + fmtNs(state.yLock.lo) + '–' + fmtNs(state.yLock.hi) + ' (fixed)';
-    const clipped = lastRender ? lastRender.clippedBars : 0;
-    if (clipped > 0) {
-      ySuffix += ', ' + fmtCount(clipped) + ' drawn bar(s) run past it (▲/▼) -- statistics below are unaffected';
-    }
+  let ySuffix = ' | y axis: ' + fmtNs(state.yView.lo) + '–' + fmtNs(state.yView.hi) +
+    (atBase ? ' (default: the whole sample, cropped at its P99.9)' : ' (fixed)');
+  const clipped = lastRender ? lastRender.clippedBars : 0;
+  if (clipped > 0) {
+    ySuffix += ', ' + fmtCount(clipped) + ' drawn bar(s) run past it (▲/▼) -- ' +
+      'zoom the latency axis out to reach them; the statistics below already include them';
   }
   // "also fix" (fix-round review): make the column-aggregation ratio
   // persistently visible (previously only discoverable via hover, one
@@ -1299,9 +1335,9 @@ function updateNegCallout() {
 // below keeps that asymmetry explicit: the rank window is an integer
 // [lo, hi) into the current order and narrowing it narrows the
 // statistics table with it, while the latency window is a nanosecond
-// range that crops the drawing and nothing else. `state.yLock === null`
-// means "auto-fit each rank window", which is the behaviour the chart
-// had before this axis became zoomable and is still the default.
+// range that crops the drawing and nothing else. The latency axis is
+// never derived from the visible records -- only the user moves it --
+// so panning the rank axis leaves every bar at the height it had.
 //
 // Bare wheel is deliberately NOT captured: this page is long, the chart
 // spans its full width, and a chart that eats the scroll wheel is a
@@ -1325,13 +1361,13 @@ function schedulePanDraw() {
   panFrame = requestAnimationFrame(() => { panFrame = 0; drawChart(); });
 }
 
-function setSelOverlay(x0, y0, x1, y1) {
+// A full-height band, not a box: the selection takes the rank range and
+// deliberately ignores its own vertical extent, and the shape says so
+// before the button comes up.
+function setSelOverlay(x0, x1) {
   const lo = Math.min(x0, x1), hi = Math.max(x0, x1);
-  const top = Math.min(y0, y1), bot = Math.max(y0, y1);
   selOverlay.style.left = lo + 'px';
   selOverlay.style.width = Math.max(0, hi - lo) + 'px';
-  selOverlay.style.top = top + 'px';
-  selOverlay.style.height = Math.max(0, bot - top) + 'px';
 }
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -1344,13 +1380,13 @@ canvas.addEventListener('pointerdown', (e) => {
     drag = { mode: 'box', x0: x, y0: y };
     canvas.classList.add('boxing');
     selOverlay.style.display = 'block';
-    setSelOverlay(x, y, x, y);
+    setSelOverlay(x, x);
   } else {
     drag = {
       mode: 'pan', x0: x, y0: y,
       rankLo0: state.rankLo, rankHi0: state.rankHi,
-      yLock0: state.yLock ? { lo: state.yLock.lo, hi: state.yLock.hi } : null,
-      autoY0: lastRender.autoY, plotW0: lastRender.plotW, plotH0: lastRender.plotH,
+      yView0: { lo: state.yView.lo, hi: state.yView.hi },
+      yBounds0: lastRender.yBounds, plotW0: lastRender.plotW, plotH0: lastRender.plotH,
       visibleCount0: lastRender.visibleCount, nVis0: lastRender.nVis,
     };
     canvas.classList.add('panning');
@@ -1360,23 +1396,19 @@ canvas.addEventListener('pointerdown', (e) => {
 canvas.addEventListener('pointermove', (e) => {
   const rect = canvas.getBoundingClientRect();
   const xCss = e.clientX - rect.left, yCss = e.clientY - rect.top;
-  if (drag && drag.mode === 'box') { setSelOverlay(drag.x0, drag.y0, xCss, yCss); return; }
+  if (drag && drag.mode === 'box') { setSelOverlay(drag.x0, xCss); return; }
   if (drag && drag.mode === 'pan') {
     // Grab-and-move: dragging right shows earlier ranks, dragging down
     // shows lower latencies -- the content follows the pointer.
     const dRank = -(xCss - drag.x0) / drag.plotW0 * drag.visibleCount0;
     const w = panWindow(drag.rankLo0, drag.rankHi0, Math.round(dRank), 0, drag.nVis0);
     state.rankLo = w.lo; state.rankHi = w.hi;
-    if (drag.yLock0) {
-      const range = drag.yLock0.hi - drag.yLock0.lo;
+    {
+      const range = drag.yView0.hi - drag.yView0.lo;
       const dNs = (yCss - drag.y0) / drag.plotH0 * range;
-      // Panning is bounded by the auto-fit domain united with wherever
-      // the lock already sits, so a lock that starts partly outside the
-      // data stays reachable instead of snapping on the first drag.
-      const yMin = Math.min(drag.autoY0.lo, drag.yLock0.lo);
-      const yMax = Math.max(drag.autoY0.hi, drag.yLock0.hi);
-      const v = panWindow(drag.yLock0.lo, drag.yLock0.hi, dNs, yMin, yMax);
-      state.yLock = { lo: v.lo, hi: v.hi };
+      const v = panWindow(drag.yView0.lo, drag.yView0.hi, dNs,
+                          drag.yBounds0.lo, drag.yBounds0.hi);
+      state.yView = { lo: v.lo, hi: v.hi };
     }
     schedulePanDraw();
     return;
@@ -1396,26 +1428,20 @@ canvas.addEventListener('pointerup', (e) => {
     // A click that never moved is not a pan: recomputing the 33-segment
     // table costs real time at capture scale, and nothing changed.
     if (state.rankLo !== d.rankLo0 || state.rankHi !== d.rankHi0 ||
-        JSON.stringify(state.yLock) !== JSON.stringify(d.yLock0)) redrawAll();
+        state.yView.lo !== d.yView0.lo || state.yView.hi !== d.yView0.hi) redrawAll();
     return;
   }
   selOverlay.style.display = 'none';
   const lr = lastRender;
-  const dx = Math.abs(x - d.x0), dy = Math.abs(y - d.y0);
-  if (dx < 4 && dy < 8) return; // a click, not a box
-  if (dx >= 4) {
-    const f0 = plotFrac(Math.min(d.x0, x)), f1 = plotFrac(Math.max(d.x0, x));
-    const newLo = lr.rankLo + Math.floor(f0 * lr.visibleCount);
-    const newHi = lr.rankLo + Math.max(newLo - lr.rankLo + 1, Math.ceil(f1 * lr.visibleCount));
-    state.rankLo = newLo; state.rankHi = Math.min(newHi, currentOrder().length);
-  }
-  // A near-horizontal drag is a rank selection, not a request for a
-  // sliver of an axis: only take the vertical extent once it is tall
-  // enough to have been meant.
-  if (dy >= 8) {
-    const hiNs = lr.fromY(Math.min(d.y0, y)), loNs = lr.fromY(Math.max(d.y0, y));
-    state.yLock = { lo: loNs, hi: hiNs };
-  }
+  // Rank axis only: the vertical extent of the drag is deliberately
+  // ignored, so the selection cannot disturb the latency scale that
+  // makes two rank windows comparable. The overlay is drawn full-height
+  // to say so before the button is released.
+  if (Math.abs(x - d.x0) < 4) return; // a click, not a selection
+  const f0 = plotFrac(Math.min(d.x0, x)), f1 = plotFrac(Math.max(d.x0, x));
+  const newLo = lr.rankLo + Math.floor(f0 * lr.visibleCount);
+  const newHi = lr.rankLo + Math.max(newLo - lr.rankLo + 1, Math.ceil(f1 * lr.visibleCount));
+  state.rankLo = newLo; state.rankHi = Math.min(newHi, currentOrder().length);
   redrawAll();
 });
 
@@ -1433,7 +1459,7 @@ canvas.addEventListener('wheel', (e) => {
     const w = zoomRankWindow(state.rankLo, state.rankHi, factor, plotFrac(x), lr.nVis);
     state.rankLo = w.lo; state.rankHi = w.hi;
   } else {
-    state.yLock = zoomYRange(state.yLock, lr.autoY, factor, lr.fromY(y));
+    state.yView = zoomYRange(state.yView, lr.yBounds, factor, lr.fromY(y));
   }
   redrawAll();
 }, { passive: false });
@@ -1448,7 +1474,7 @@ function zoomY(factor) {
   if (!lastRender) return;
   const lr = lastRender;
   const mid = (lr.yDomainMin + lr.yDomainMax) / 2;
-  state.yLock = zoomYRange(state.yLock, lr.autoY, factor, mid);
+  state.yView = zoomYRange(state.yView, lr.yBounds, factor, mid);
   redrawAll();
 }
 document.getElementById('xZoomInBtn').addEventListener('click', () => zoomX(0.5));
@@ -1456,7 +1482,10 @@ document.getElementById('xZoomOutBtn').addEventListener('click', () => zoomX(2))
 document.getElementById('yZoomInBtn').addEventListener('click', () => zoomY(0.5));
 document.getElementById('yZoomOutBtn').addEventListener('click', () => zoomY(2));
 document.getElementById('resetZoomBtn').addEventListener('click', () => {
-  state.rankLo = 0; state.rankHi = currentOrder().length; state.yLock = null; redrawAll();
+  state.rankLo = 0; state.rankHi = currentOrder().length;
+  const b = yRefFor(state.linkModel).base;
+  state.yView = { lo: b.lo, hi: b.hi };
+  redrawAll();
 });
 
 // ---------------------------------------------------------------------
@@ -1554,19 +1583,16 @@ const updateHScroll = makeScrollbar('hScrollTrack', 'hScrollThumb', {
 const updateVScroll = makeScrollbar('vScrollTrack', 'vScrollThumb', {
   vertical: true,
   model: () => {
-    if (!lastRender || !state.yLock) return null;
-    const a = lastRender.autoY, l = state.yLock;
-    return { min: Math.min(a.lo, l.lo), max: Math.max(a.hi, l.hi), lo: l.lo, hi: l.hi };
+    if (!lastRender) return null;
+    const b = lastRender.yBounds;
+    return { min: b.lo, max: b.hi, lo: state.yView.lo, hi: state.yView.hi };
   },
-  apply: (lo, hi) => { state.yLock = { lo, hi }; schedulePanDraw(); },
+  apply: (lo, hi) => { state.yView = { lo, hi }; schedulePanDraw(); },
   commit: () => drawChart(),
 });
 function updateScrollbars() {
   updateHScroll();
   updateVScroll();
-  // The latency scrollbar only exists while the axis is locked -- with
-  // the axis auto-fitting there is nothing off-screen to scroll to.
-  document.querySelector('.vscroll-col').style.visibility = state.yLock ? 'visible' : 'hidden';
 }
 
 // ---------------------------------------------------------------------
@@ -1813,7 +1839,21 @@ document.getElementById('sortModeSel').addEventListener('change', (e) => {
   redrawAll();
 });
 document.getElementById('linkModelSel').addEventListener('change', (e) => {
+  const wasBase = state.yView.lo === yRefFor(state.linkModel).base.lo &&
+                  state.yView.hi === yRefFor(state.linkModel).base.hi;
   state.linkModel = e.target.value;
+  // The two models can put the axis floor in different places (only a
+  // negative segment pushes it below zero, and which segments go
+  // negative is model-dependent). Follow the new model's default if the
+  // axis was sitting on the old one's; otherwise keep the user's own
+  // range, clamped into what the new model can show.
+  const ref = yRefFor(state.linkModel);
+  state.yView = wasBase
+    ? { lo: ref.base.lo, hi: ref.base.hi }
+    : {
+        lo: Math.max(ref.bounds.lo, Math.min(state.yView.lo, ref.bounds.hi)),
+        hi: Math.min(ref.bounds.hi, Math.max(state.yView.hi, ref.bounds.lo)),
+      };
   redrawAll();
 });
 document.getElementById('hideNegChk').addEventListener('change', (e) => {

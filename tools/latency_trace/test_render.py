@@ -252,28 +252,38 @@ class TestPureMath(unittest.TestCase):
                          {"lo": 10, "hi": 11})
 
     # -- zoomYRange ------------------------------------------------------
+    #
+    # The latency axis is always an explicit range -- there is no
+    # auto-fit state to return to -- so every case here is a clamp
+    # inside the whole sample's extent, never a handover.
 
-    def test_y_zoom_in_from_auto_snapshots_the_auto_domain(self):
-        # First vertical zoom with no lock yet: the current auto-fit
-        # domain becomes the thing being halved.
-        auto = {"lo": 0, "hi": 1000}
-        got = self.run_js(f"zoomYRange(null, {json.dumps(auto)}, 0.5, 500)")
+    def test_y_zoom_in_halves_about_the_anchor(self):
+        b = {"lo": 0, "hi": 1000}
+        got = self.run_js(f"zoomYRange({{lo:0,hi:1000}}, {json.dumps(b)}, 0.5, 500)")
         self.assertEqual(got, {"lo": 250, "hi": 750})
 
     def test_y_zoom_anchors_on_the_cursor(self):
-        auto = {"lo": 0, "hi": 1000}
-        got = self.run_js(f"zoomYRange(null, {json.dumps(auto)}, 0.5, 0)")
+        b = {"lo": 0, "hi": 1000}
+        got = self.run_js(f"zoomYRange({{lo:0,hi:1000}}, {json.dumps(b)}, 0.5, 0)")
         self.assertEqual(got, {"lo": 0, "hi": 500})
 
-    def test_y_zoom_out_past_the_auto_domain_returns_to_auto(self):
-        # The design's "zoom out to the bottom and the axis goes back to
-        # auto-fitting" rule: null, not a range that happens to contain
-        # the data, so a later x-zoom refits instead of staying frozen.
-        auto = {"lo": 0, "hi": 1000}
-        self.assertIsNone(self.run_js(f"zoomYRange({{lo:250,hi:750}}, {json.dumps(auto)}, 4, 500)"))
-        # But a zoom-out that still crops the data keeps the lock.
-        self.assertEqual(self.run_js(f"zoomYRange({{lo:400,hi:600}}, {json.dumps(auto)}, 2, 500)"),
+    def test_y_zoom_out_stops_at_the_full_extent(self):
+        # Zooming out past the whole sample would show empty space above
+        # the slowest request; it stops there instead, which is also the
+        # state in which nothing is cropped.
+        b = {"lo": 0, "hi": 1000}
+        self.assertEqual(self.run_js(f"zoomYRange({{lo:250,hi:750}}, {json.dumps(b)}, 4, 500)"),
+                         {"lo": 0, "hi": 1000})
+        # A zoom-out that still crops keeps cropping.
+        self.assertEqual(self.run_js(f"zoomYRange({{lo:400,hi:600}}, {json.dumps(b)}, 2, 500)"),
                          {"lo": 300, "hi": 700})
+
+    def test_y_zoom_out_near_an_edge_keeps_its_full_width(self):
+        # Clamping at the top must not eat the width at the bottom --
+        # zooming out from a window against the ceiling still doubles it.
+        b = {"lo": 0, "hi": 1000}
+        self.assertEqual(self.run_js(f"zoomYRange({{lo:800,hi:1000}}, {json.dumps(b)}, 2, 900)"),
+                         {"lo": 600, "hi": 1000})
 
     # -- panWindow -------------------------------------------------------
 
@@ -316,5 +326,9 @@ class TestUpgradeShipsInThePage(unittest.TestCase):
         self.assertIn("metaKey", self.html)
         self.assertIn("shiftKey", self.html)
         self.assertIn("'wheel'", self.html)
-        # Drag pans; shift+drag box-zooms both axes.
-        self.assertIn("yLock", self.html)
+        # Drag pans; shift+drag selects a rank range only.
+        self.assertIn("yView", self.html)
+        # The latency axis is a fixed reference computed over the whole
+        # sample, not refitted per visible window.
+        self.assertIn("Y_REF", self.html)
+        self.assertIn("zoomYRange", self.html)
