@@ -61,7 +61,7 @@ public:
     // need public read access rather than friendship.
     uint64_t lt_wake() const { return _lt_wake; }
     uint64_t lt_onedge_start() const { return _lt_onedge_start; }
-    uint64_t lt_readv_start() const { return _lt_readv_start; }
+    uint64_t lt_read_start() const { return _lt_read_start; }
     uint64_t lt_msg_recv_done() const { return _lt_msg_recv_done; }
 #endif
 
@@ -80,7 +80,7 @@ friend class Transport;
     const void* _arg;
 #if defined(BRPC_LATENCY_TRACE)
     // Copied from the owning Socket's _lt_wake/_lt_onedge_start/
-    // _lt_readv_start at the moment this message was cut out of the read
+    // _lt_read_start at the moment this message was cut out of the read
     // buffer in InputMessenger::ProcessNewMessage, plus the cut-out time
     // itself. The handle needed to write these into a trace record is
     // still unknown at that point (the message hasn't been parsed as an
@@ -89,7 +89,7 @@ friend class Transport;
     // stamps them. See design doc sec.8.2.
     uint64_t _lt_wake;
     uint64_t _lt_onedge_start;
-    uint64_t _lt_readv_start;
+    uint64_t _lt_read_start;
     uint64_t _lt_msg_recv_done;
 #endif
 };

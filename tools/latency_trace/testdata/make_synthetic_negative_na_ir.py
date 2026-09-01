@@ -60,8 +60,8 @@ def build():
     # Record B: RDMA polling-mode client (design doc sec.8.5) -- C09/C10
     # (wake/onedge_start) are LT_TS_NOT_APPLICABLE, not 0. Exercises the
     # N/A rendering path (dashed tick, "N/A" tooltip) for
-    # cli_wake_to_onedge/cli_onedge_to_readv, and -- since the fix-round
-    # RDMA fix -- still produces a real link_total via the readv_start
+    # cli_wake_to_onedge/cli_onedge_to_read, and -- since the fix-round
+    # RDMA fix -- still produces a real link_total via the read_start
     # fallback rather than going N/A itself.
     # step asymmetry (client 1000, server 100) keeps this record's
     # link_total POSITIVE (C11-C08 spans 3 client-side steps = 3000

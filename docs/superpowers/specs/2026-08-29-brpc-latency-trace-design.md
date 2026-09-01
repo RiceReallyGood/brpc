@@ -16,7 +16,7 @@
 2. **每个点位都非零**：`ts[i] == 0` 意味着该点位从未触发。这是唯一能发现「某条代码路径漏埋」的检查。
 3. **单调不减**：`ts[i] <= ts[i+1]`，捕获点位落在错误的时间顺序上。
 4. **每个分解项非负**（低并发 outstanding=1 下），捕获点位落在错误的位置。
-5. **每个点位遵循它自己的写入策略**：绝大多数点位是瞬时事件，只应写入一次——重复写入意味着该事件触发了两次，是 bug，必须首次写入优先（后写丢弃）。但 `write_start`/`readv_start` 这一对点位的含义是「真正完成本单元这次操作的那次尝试的起点」，同一单元排在队列里时会被前面单元的尝试重入多次，只有最后一次尝试才是真正搬动本单元字节的那次，因此这一对必须最后写入优先（见 §10.1）。
+5. **每个点位遵循它自己的写入策略**：绝大多数点位是瞬时事件，只应写入一次——重复写入意味着该事件触发了两次，是 bug，必须首次写入优先（后写丢弃）。但 `write_start`/`read_start` 这一对点位的含义是「真正完成本单元这次操作的那次尝试的起点」，同一单元排在队列里时会被前面单元的尝试重入多次，只有最后一次尝试才是真正搬动本单元字节的那次，因此这一对必须最后写入优先（见 §10.1）。
 6. 打点开销经 microbenchmark 实测，并据此确定最终点位集。
 7. HTML 支持 1 万~10 万条记录的渲染与逐请求 hover 下钻。
 
@@ -139,7 +139,7 @@ D14：`rsp_process_start` / `rsp_process_end`（原 C17/C18，包住用户回调
 | C08 | `write_end` | `Socket::DoWrite()` 中 `CutFromIOBufList()` **返回后**立即遍历本批次，对 `data` 已清空的 WriteRequest 就地打戳（见 §8.4） |
 | C09 | `wake` | `epoll_wait` 返回（RDMA：CQE 被 poll 出） |
 | C10 | `onedge_start` | `Transport::OnEdge` 入口（`transport.h:31`） |
-| C11 | `readv_start` | `InputMessenger::OnNewMessages` 循环内 `m->DoRead()` 前 |
+| C11 | `read_start` | `InputMessenger::OnNewMessages` 循环内 `m->DoRead()` 前 |
 | C12 | `msg_recv_done` | 该消息在 `ProcessNewMessage` 中切分成功 |
 | C13 | `rsp_meta_deser_start` | `ProcessRpcResponse` 入口（`baidu_rpc_protocol.cpp:937`） |
 | C14 | `rsp_meta_deser_end` | `ParsePbFromIOBuf(&meta, ...)` 返回后（`:940`） |
@@ -153,7 +153,7 @@ D14：`rsp_process_start` / `rsp_process_end`（原 C17/C18，包住用户回调
 |---|---|---|
 | S01 | `wake` | 同 C09 |
 | S02 | `onedge_start` | 同 C10 |
-| S03 | `readv_start` | 同 C11 |
+| S03 | `read_start` | 同 C11 |
 | S04 | `msg_recv_done` | 同 C12（**用户原清单未列，本设计补充**；无此点则「服务端收包时间」与「服务端处理排队时间」无分界） |
 | S05 | `req_meta_deser_start` | `ProcessRpcRequest` 入口 |
 | S06 | `req_meta_deser_end` | `ParsePbFromIOBuf(&meta, ...)` 返回后 |
@@ -221,7 +221,7 @@ D14：`rsp_process_start` / `rsp_process_end`（原 C17/C18，包住用户回调
 | ★ `cli_req_meta_ser` | C04→C05 | 客户端 metadata 序列化 |
 | ○ `cli_pack_to_write` | C05→C06 | `PackRpcRequest` 收尾、IOBuf 拼装 |
 | ★ `cli_write_queue` | C06→C07 | 客户端 write 排队（含 bthread 调度与写竞争） |
-| ★ `cli_write_syscall` | C07→C08 | 客户端 write 接口 |
+| ★ `cli_write` | C07→C08 | 客户端 write 接口 |
 
 ### 5.2 链路与服务端（18 项）
 
@@ -229,8 +229,8 @@ D14：`rsp_process_start` / `rsp_process_end`（原 C17/C18，包住用户回调
 |---|---|---|
 | ★ `link_up` | 派生 | 上行链路时间 |
 | ★ `srv_wake_to_onedge` | S01→S02 | 服务端 wake → 收包 bthread 启动 |
-| ★ `srv_onedge_to_readv` | S02→S03 | 服务端收包 bthread 内排队 |
-| ★ `srv_readv` | S03→S04 | 服务端收包 |
+| ★ `srv_onedge_to_read` | S02→S03 | 服务端收包 bthread 内排队 |
+| ★ `srv_read` | S03→S04 | 服务端收包 |
 | ★ `srv_recv_to_deser` | S04→S05 | 服务端处理排队 |
 | ★ `srv_req_meta_deser` | S05→S06 | 服务端 metadata 反序列化 |
 | ○ `srv_dispatch` | S06→S07 | **查 service/method、并发限制（`ConcurrencyLimiter`）、建 Controller**。限流排队即卡在此段 |
@@ -243,7 +243,7 @@ D14：`rsp_process_start` / `rsp_process_end`（原 C17/C18，包住用户回调
 | ★ `srv_rsp_meta_ser` | S13→S14 | 服务端 metadata 序列化 |
 | ○ `srv_pack_to_write` | S14→S15 | 组包到入队 |
 | ★ `srv_write_queue` | S15→S16 | 服务端 write 排队 |
-| ★ `srv_write_syscall` | S16→S17 | 服务端 write 接口 |
+| ★ `srv_write` | S16→S17 | 服务端 write 接口 |
 | ★ `link_down` | 派生 | 下行链路时间 |
 
 ### 5.3 客户端接收段（8 项）
@@ -251,8 +251,8 @@ D14：`rsp_process_start` / `rsp_process_end`（原 C17/C18，包住用户回调
 | 分解项 | 区间 | 说明 |
 |---|---|---|
 | ★ `cli_wake_to_onedge` | C09→C10 | 客户端 wake → 收包 bthread 启动 |
-| ★ `cli_onedge_to_readv` | C10→C11 | 客户端收包 bthread 内排队 |
-| ★ `cli_readv` | C11→C12 | 客户端收包 |
+| ★ `cli_onedge_to_read` | C10→C11 | 客户端收包 bthread 内排队 |
+| ★ `cli_read` | C11→C12 | 客户端收包 |
 | ★ `cli_recv_to_deser` | C12→C13 | 客户端处理排队 |
 | ★ `cli_rsp_meta_deser` | C13→C14 | 客户端 metadata 反序列化 |
 | ○ `cli_lookup_cntl` | C14→C15 | 按 correlation_id 取回 Controller（`bthread_id_lock`） |
@@ -261,7 +261,17 @@ D14：`rsp_process_start` / `rsp_process_end`（原 C17/C18，包住用户回调
 
 合计：★ 23 项（含 2 个派生链路项），○ 10 项，共 31 个区间项 + 2 个派生项 = 33。
 
-注意 ★ 不是 24：用户原始清单的「服务端收包排队时间」与「客户端收包排队时间」各自跨越了两个点位区间（`wake → onedge_start` 与 `onedge_start → readv_start`），本设计按 D5 各拆为 2 项（22 + 2 = 24 项，见 D14 之前的版本）；D14 又把 `cli_callback` 这一项（原 ★）连同两个 ○ 项一起合并成一个 ○ 项，净减 1 项 ★、1 项 ○，故 24 → 23、11 → 10。
+**关于 `*_read` / `*_write` 的命名**：这四项框住的是**传输层真正搬字节**的那一段，
+名字只承诺这个，不承诺机制。写侧括的是 `_conn->CutMessageIntoFileDescriptor` /
+`_transport->CutFromIOBufList`，读侧括的是 `InputMessenger::OnNewMessages` 里的 `DoRead` ——
+只有在裸 TCP 上它们才分别是 `writev` 和 `readv`；RDMA 下同样的区间是 `ibv_post_send`
+和 RdmaEndpoint 的收包路径，**两者都不是系统调用**，SSL 下又是第三条路径。
+
+这四项曾叫 `*_readv` 与 `*_write_syscall`：前者继承自 C++ 点位名 `LT_C_READV_START`，
+后者是分析层自己贴的类别标签。两个名字各自承诺了区间并不具备的机制，而且连承诺的方式
+都不一致（一个说机制、一个说类别）。C++ 点位已同步改名为 `LT_*_READ_START`。
+
+注意 ★ 不是 24：用户原始清单的「服务端收包排队时间」与「客户端收包排队时间」各自跨越了两个点位区间（`wake → onedge_start` 与 `onedge_start → read_start`），本设计按 D5 各拆为 2 项（22 + 2 = 24 项，见 D14 之前的版本）；D14 又把 `cli_callback` 这一项（原 ★）连同两个 ○ 项一起合并成一个 ○ 项，净减 1 项 ★、1 项 ○，故 24 → 23、11 → 10。
 
 ---
 
@@ -374,9 +384,9 @@ link_up = link_down = L / 2
 | 经 `StampAt` 写入（S01–S06） | 撞上 `raw < base` 的 clamp，全部塌成 `ts = 1`。错，但不刺眼 |
 | 经 `Stamp()` 写入（S09 起） | **没有 clamp**。`clock_cycles() − ~0ULL` 回绕成 `clock_cycles()+1`；而计数器是**自开机**计数，主机开机超过约 43 秒即饱和到 `0xFFFFFFFE`。**每一条轮询模式的服务端记录都显示 S09–S17 耗时约 43 秒**，确定性发生 |
 
-**因此：`AllocSlot` 的三参重载必须拒绝哨兵基准。** 轮询模式下服务端改传 `readv_start`——§8.5 自己的表格已经写明该点位在两种模式下都是真实值。哨兵只属于 `ts[]` 的某一格，永远不属于 `base_counter`。
+**因此：`AllocSlot` 的三参重载必须拒绝哨兵基准。** 轮询模式下服务端改传 `read_start`——§8.5 自己的表格已经写明该点位在两种模式下都是真实值。哨兵只属于 `ts[]` 的某一格，永远不属于 `base_counter`。
 
-**一条未被断言保护的隐式耦合**：轮询模式下 `base_counter` 的回退值 `readv_start`、以及事件模式下从 CQ socket 拷来的 `_lt_wake`，都依赖 `InputMessenger::ProcessNewMessage` 里那段把 `Socket` 上的三个字段拷进 `InputMessageBase` 的逻辑 —— TCP 与 RDMA 两条路径调用的是同一份代码。今天成立，但**没有任何断言在守它**，而 RDMA 测试只在有 Soft-RoCE 的机器上跑、不在默认套件里。将来重构那段拷贝逻辑，可能悄无声息地打断 RDMA 侧，而默认 CI 全绿。改动 `ProcessNewMessage` 的人需要知道这条依赖。
+**一条未被断言保护的隐式耦合**：轮询模式下 `base_counter` 的回退值 `read_start`、以及事件模式下从 CQ socket 拷来的 `_lt_wake`，都依赖 `InputMessenger::ProcessNewMessage` 里那段把 `Socket` 上的三个字段拷进 `InputMessageBase` 的逻辑 —— TCP 与 RDMA 两条路径调用的是同一份代码。今天成立，但**没有任何断言在守它**，而 RDMA 测试只在有 Soft-RoCE 的机器上跑、不在默认套件里。将来重构那段拷贝逻辑，可能悄无声息地打断 RDMA 侧，而默认 CI 全绿。改动 `ProcessNewMessage` 的人需要知道这条依赖。
 
 **RDMA 事件模式的 `wake` 必须取 CQ socket 上已有的值，不能重新采样。** `Socket::OnInputEvent` 已经在真正的「epoll 返回、尚未分发」时刻把 `_lt_wake` 设好了（与 TCP 走同一套 TLS 机制）。若在 `GetAndAckEvents()` 返回**之后**重新读一次 `clock_cycles()`，得到的时刻晚于 `onedge_start`，与 TCP 的结构顺序相反 —— 而 clamp 会把这个倒挂悄悄抹平成两个 `ts = 1`，于是 `srv_wake_to_onedge` 与 `cli_wake_to_onedge` 这两个主分解项恒为零，且断言 `wake <= onedge_start` 空洞通过。正确做法是把 CQ socket 的 `_lt_wake` **拷贝**过去。
 
@@ -528,10 +538,10 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 |---|---|---|---|
 | `wake` | `epoll_wait` 返回 | `comp_channel->fd` 的 epoll 唤醒（`GetAndAckEvents`） | **不存在**：无唤醒事件 |
 | `onedge_start` | `Transport::OnEdge` 入口 | 同左（回调为 `PollCq`） | **不存在**：poller 线程直接调 `PollCq`（`:1733`），无 bthread 切换 |
-| `readv_start` | `m->DoRead()` 前 | `ibv_poll_cq()` 前（`:1500`） | 同左 |
+| `read_start` | `m->DoRead()` 前 | `ibv_poll_cq()` 前（`:1500`） | 同左 |
 | `msg_recv_done` | `ProcessNewMessage` 内 | **共用**（`:1599` 调用同一函数） | **共用** |
 
-**轮询模式下 `wake` 与 `onedge_start` 记为哨兵值而非 0**，分析工具将 `cli_wake_to_onedge` / `cli_onedge_to_readv` / `srv_wake_to_onedge` / `srv_onedge_to_readv` 四项判定为 N/A 并在 HTML 中显式标注「该模式下不存在」。这四项恒为零是物理真实（轮询以 CPU 占用换掉了这段延迟），但若不标注会被误读为埋点缺失。Σ 恒等式不受影响 —— N/A 项以 0 参与求和，而这些区间的真实长度确实为 0。
+**轮询模式下 `wake` 与 `onedge_start` 记为哨兵值而非 0**，分析工具将 `cli_wake_to_onedge` / `cli_onedge_to_read` / `srv_wake_to_onedge` / `srv_onedge_to_read` 四项判定为 N/A 并在 HTML 中显式标注「该模式下不存在」。这四项恒为零是物理真实（轮询以 CPU 占用换掉了这段延迟），但若不标注会被误读为埋点缺失。Σ 恒等式不受影响 —— N/A 项以 0 参与求和，而这些区间的真实长度确实为 0。
 
 ## 9. 分析工具 `tools/latency_trace/`
 
@@ -584,7 +594,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 |---|---|---|---|
 | **某条代码路径漏埋**（例：SSL 与 `_conn` 分支未插 `write_start`/`write_end`，两点恒为 0） | ✅ 通过（`C08=0` 时 `link` 项吸收了差额，等式仍成立） | ✅ 通过 | **点位非零检查**。且 `RTT = C09 − 0` 会变成一个巨大的正数，链路时间随之荒谬 —— 但没有任何断言会看它 |
 | **瞬时事件点位被重复写入**（例：某个只应触发一次的点位因为代码路径重入被写了两次，第二次的时刻覆盖了第一次） | ✅ 通过 | 视情况 | **写入次数检查**：瞬时事件类点位至多写一次。否则该点位的真实首次触发时刻会被后一次覆盖，污染其后所有分解项 |
-| **「完成本单元的那次尝试」点位被首次写入锁死**（例：`write_start`/`readv_start` 若误用首次写入优先，`KeepWrite`/多次 `DoRead` 重入时会永久锁在第一次尝试的时刻，把本该属于「排队」的时间错记成「系统调用」） | ✅ 通过 | ✅ 通过（`C06 ≤ C07 ≤ C08` 单调性检查不到方向反了） | 专项断言 + 人工审查；这两点的正确策略是**最后写入优先**，见下 |
+| **「完成本单元的那次尝试」点位被首次写入锁死**（例：`write_start`/`read_start` 若误用首次写入优先，`KeepWrite`/多次 `DoRead` 重入时会永久锁在第一次尝试的时刻，把本该属于「排队」的时间错记成「传输」） | ✅ 通过 | ✅ 通过（`C06 ≤ C07 ≤ C08` 单调性检查不到方向反了） | 专项断言 + 人工审查；这两点的正确策略是**最后写入优先**，见下 |
 | **点位落在错误位置**（例：`write_end` 落在 `ReturnSuccessfulWriteRequest`） | ✅ 通过 | 视情况 | **跨端非负检查**：`C09 ≥ C08`（负 RTT），以及低并发下每个分解项非负 |
 
 **共同点**：这几类缺陷都产出「看起来合理」的数字，都不会让任何构建变红。它们只能被针对性的断言捕获，而不能被一条恒真的等式捕获。
@@ -593,10 +603,10 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 
 **因此实现要求是按点位分策略，而不是一条对全体点位通用的规则**：`LatencyTraceBuffer::Stamp()` 对同一点位的重复写入**首次写入优先**（后续写入丢弃），适用于绝大多数点位——它们是瞬时事件，第二次写入意味着该事件触发了两次，是 bug，第一次（正确的）那次不能被冲掉。
 
-`write_start`（`Socket::DoWrite`，被 `KeepWrite` 为同一个还未写完的 `WriteRequest` 反复重入）和 `readv_start`（`InputMessenger::OnNewMessages`，在同一条尚未拼完的消息上被反复重入）是例外：它们的含义不是「这个单元的操作第一次被尝试」，而是「真正完成这个单元的那次操作的起点」。当一个单元排在队列里、前面还有别的单元占用同一个 socket 时，靠前的几次尝试服务的是*别的*单元（读侧是别的、已经在缓冲区里就绪的消息），只有最后一次尝试才真正搬动了本单元的字节。若这两个点位仍用首次写入优先，第一次尝试的时刻会被永久锁定，本该计入排队时间的间隔会被静默并入系统调用耗时——这正是上表第二类缺陷。两个点位实现「最后写入优先」的机制并不相同，取决于打点发生时 `LatencyTraceHandle` 是否已经存在：
+`write_start`（`Socket::DoWrite`，被 `KeepWrite` 为同一个还未写完的 `WriteRequest` 反复重入）和 `read_start`（`InputMessenger::OnNewMessages`，在同一条尚未拼完的消息上被反复重入）是例外：它们的含义不是「这个单元的操作第一次被尝试」，而是「真正完成这个单元的那次操作的起点」。当一个单元排在队列里、前面还有别的单元占用同一个 socket 时，靠前的几次尝试服务的是*别的*单元（读侧是别的、已经在缓冲区里就绪的消息），只有最后一次尝试才真正搬动了本单元的字节。若这两个点位仍用首次写入优先，第一次尝试的时刻会被永久锁定，本该计入排队时间的间隔会被静默并入传输耗时——这正是上表第二类缺陷。两个点位实现「最后写入优先」的机制并不相同，取决于打点发生时 `LatencyTraceHandle` 是否已经存在：
 
 - `write_start` 打点时 `WriteRequest::lt_handle` 已经存在（`Socket::Write()` 入口就已分配），`DoWrite` 每次被 `KeepWrite` 重入都能直接对同一个 handle 再打一次，因此**在 `LatencyTraceBuffer` 层**新增 `StampLast()`：语义与 `Stamp()` 相反，每次调用无条件覆盖 `ts[point]`，供 `write_start` 调用点直接使用。
-- `readv_start` 打点时消息尚未解析出 `trace_id`，`LatencyTraceHandle` 根本不存在（同 §8.2 的透传问题）：每次 `DoRead` 直接覆盖 `Socket::_lt_readv_start` 这个原始 `uint64_t` 字段本身（不经过 `LatencyTraceBuffer`），message 被切出时才把该字段的（此时已经是最后一次 `DoRead` 的）值拷进 `InputMessageBase`，再用 `StampAt()`（首次写入优先）一次性写入 `ts[point]`——因为对 `ts[point]` 这一层而言只会写一次，「最后写入优先」的效果已经在更早的原始字段覆盖阶段完成，不需要也不能用 `StampLast()`（那一层根本没有 handle 可用）。
+- `read_start` 打点时消息尚未解析出 `trace_id`，`LatencyTraceHandle` 根本不存在（同 §8.2 的透传问题）：每次 `DoRead` 直接覆盖 `Socket::_lt_read_start` 这个原始 `uint64_t` 字段本身（不经过 `LatencyTraceBuffer`），message 被切出时才把该字段的（此时已经是最后一次 `DoRead` 的）值拷进 `InputMessageBase`，再用 `StampAt()`（首次写入优先）一次性写入 `ts[point]`——因为对 `ts[point]` 这一层而言只会写一次，「最后写入优先」的效果已经在更早的原始字段覆盖阶段完成，不需要也不能用 `StampLast()`（那一层根本没有 handle 可用）。
 
 两种机制殊途同归：不论在哪一层实现覆盖，最终躺进 `ts[point]` 的都是「真正完成本单元这次操作」那次尝试的时刻。
 
@@ -636,7 +646,7 @@ tag 9 空闲（已核）。optional 字段向后兼容，未打补丁的对端�
 | 2 | TCP + baidu_std 全部 34 点位埋点 | 端到端跑通，34 点位齐全且单调 |
 | 3 | 落盘 + `merge.py` | `Σ` 恒等断言通过，join 率 100% |
 | 4 | HTML 渲染 | 1 万~10 万条可交互，hover 与缩放可用 |
-| 5 | RDMA 收侧三点位（`wake` / `onedge_start` / `readv_start`）在 `PollCq` 中重新实现，并区分事件模式与轮询模式；写侧零增量 | TCP / RDMA 分解对比图；轮询模式下四项正确标注为 N/A |
+| 5 | RDMA 收侧三点位（`wake` / `onedge_start` / `read_start`）在 `PollCq` 中重新实现，并区分事件模式与轮询模式；写侧零增量 | TCP / RDMA 分解对比图；轮询模式下四项正确标注为 N/A |
 
 ---
 

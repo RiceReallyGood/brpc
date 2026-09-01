@@ -45,11 +45,19 @@ enum LatencyTracePoint {
     LT_C_REQ_META_SER_START,
     LT_C_REQ_META_SER_END,
     LT_C_WRITE_ENQUEUE,
+    // WRITE_START/WRITE_END bracket the transport handing the bytes off
+    // (Socket::DoWrite's _conn->CutMessageIntoFileDescriptor /
+    // _transport->CutFromIOBufList), and READ_START the transport
+    // fetching them (the DoRead in InputMessenger::OnNewMessages).
+    // Deliberately named for what they bound rather than for how it is
+    // done: that is writev/readv on TCP, ibv_post_send and an RdmaEndpoint
+    // read under RDMA -- not a syscall at all -- and different again
+    // under SSL.
     LT_C_WRITE_START,
     LT_C_WRITE_END,
     LT_C_WAKE,
     LT_C_ONEDGE_START,
-    LT_C_READV_START,
+    LT_C_READ_START,
     LT_C_MSG_RECV_DONE,
     LT_C_RSP_META_DESER_START,
     LT_C_RSP_META_DESER_END,
@@ -59,7 +67,7 @@ enum LatencyTracePoint {
     // ---- server, 17 points ----
     LT_S_WAKE,
     LT_S_ONEDGE_START,
-    LT_S_READV_START,
+    LT_S_READ_START,
     LT_S_MSG_RECV_DONE,
     LT_S_REQ_META_DESER_START,
     LT_S_REQ_META_DESER_END,
@@ -340,12 +348,12 @@ public:
     // whose meaning is "the start of the operation that actually
     // completed this unit" rather than "an instantaneous event" --
     // currently write_start (Socket::DoWrite, re-entered by KeepWrite for
-    // every retried writev) and readv_start (InputMessenger::OnNewMessages,
+    // every retried writev) and read_start (InputMessenger::OnNewMessages,
     // re-entered on every DoRead of the same still-incomplete message).
     // A unit sitting behind others queued ahead of it sees the operation
     // attempted repeatedly; only the LAST attempt is the one that actually
     // moved *this* unit's bytes, so it is the correct boundary between
-    // "queueing" and "syscall" time for this unit -- see design doc
+    // "queueing" and "transferring" time for this unit -- see design doc
     // sec.10.1. Silently ignores an invalid or stale handle, same as
     // Stamp().
     void StampLast(LatencyTraceHandle h, int point);

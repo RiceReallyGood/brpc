@@ -1542,7 +1542,7 @@ void RdmaEndpoint::PollCq(Socket* m) {
     ibv_wc wc[FLAGS_rdma_cqe_poll_once];
     while (true) {
 #if defined(BRPC_LATENCY_TRACE)
-        s->_lt_readv_start = butil::detail::clock_cycles();
+        s->_lt_read_start = butil::detail::clock_cycles();
 #endif
         int cnt = ibv_poll_cq(cq, FLAGS_rdma_cqe_poll_once, wc);
         if (cnt < 0) {

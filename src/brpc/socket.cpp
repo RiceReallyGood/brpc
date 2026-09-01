@@ -499,7 +499,7 @@ Socket::Socket(Forbidden f)
 #if defined(BRPC_LATENCY_TRACE)
     , _lt_wake(0)
     , _lt_onedge_start(0)
-    , _lt_readv_start(0)
+    , _lt_read_start(0)
 #endif
     , _parsing_context(nullptr)
     , _correlation_id(0)

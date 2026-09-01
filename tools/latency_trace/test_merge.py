@@ -575,10 +575,10 @@ class TestAssertionsAndSentinels(unittest.TestCase):
         # N/A is a different, legitimate state (see check_points_nonzero).
         self.assertNotIn(merge.REJECT_UNSTAMPED, m["reasons"])
         self.assertIsNone(m["items_ns"]["cli_wake_to_onedge"])
-        self.assertIsNone(m["items_ns"]["cli_onedge_to_readv"])
+        self.assertIsNone(m["items_ns"]["cli_onedge_to_read"])
         # The other 29 items are unaffected -- still real numbers.
         for name, val in m["items_ns"].items():
-            if name in ("cli_wake_to_onedge", "cli_onedge_to_readv"):
+            if name in ("cli_wake_to_onedge", "cli_onedge_to_read"):
                 continue
             self.assertIsNotNone(val, msg=name)
         # fix-round review's RDMA-polling fix: wake (C09) being N/A used
@@ -589,15 +589,15 @@ class TestAssertionsAndSentinels(unittest.TestCase):
         # page still claimed the bar top was always exactly the
         # end-to-end latency. Design doc sec.8.5 is explicit that this is
         # fixable, not a fundamental gap: under polling, wake,
-        # onedge_start and readv_start are literally the same instant
+        # onedge_start and read_start are literally the same instant
         # (those two intervals are genuinely zero), so RTT falls back to
-        # C11 (readv_start) - C08 -- still a real timestamp under polling
+        # C11 (read_start) - C08 -- still a real timestamp under polling
         # -- and the identity keeps holding exactly, because
-        # cli_wake_to_onedge/cli_onedge_to_readv are still correctly
+        # cli_wake_to_onedge/cli_onedge_to_read are still correctly
         # counted as 0 (via being N/A) in the item sum. Confirmed exactly,
         # not just "not None", so a regression that produces some other
         # value doesn't slip through as "good enough":
-        self.assertEqual(m["rtt_ns"], m["c_ns"][merge.C_READV_START] - m["c_ns"][merge.C_WRITE_END])
+        self.assertEqual(m["rtt_ns"], m["c_ns"][merge.C_READ_START] - m["c_ns"][merge.C_WRITE_END])
         self.assertIsNotNone(m["link_total_ns"])
         self.assertIsNotNone(m["identity_ok"])
         self.assertTrue(m["identity_ok"],

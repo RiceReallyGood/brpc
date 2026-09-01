@@ -744,7 +744,7 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         // Under RDMA polling mode `wake` is LT_RAW_NOT_APPLICABLE (design
         // doc sec.8.5: there is no epoll wake-up to sample in that mode) --
         // a sentinel must never become base_counter (sec.8.1's
-        // reconciliation paragraph), so fall back to `readv_start`, which
+        // reconciliation paragraph), so fall back to `read_start`, which
         // the same section's table guarantees is a real timestamp in both
         // RDMA modes (and equals `wake` on plain TCP/RDMA-event paths only
         // in the degenerate case where wake itself is unset, which cannot
@@ -752,7 +752,7 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         LatencyTraceBuffer* lt_buffer = LatencyTraceBuffer::instance();
         const uint64_t lt_base_counter =
             (msg->lt_wake() != LT_RAW_NOT_APPLICABLE) ? msg->lt_wake()
-                                                       : msg->lt_readv_start();
+                                                       : msg->lt_read_start();
         const LatencyTraceHandle lt_handle = lt_buffer->AllocSlot(
             request_meta.latency_trace_id(), LT_ROLE_SERVER, lt_base_counter);
         accessor.set_latency_trace(request_meta.latency_trace_id(), lt_handle);
@@ -761,7 +761,7 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         // two locals captured above, for the same reason.
         lt_buffer->StampAt(lt_handle, LT_S_WAKE, msg->lt_wake());
         lt_buffer->StampAt(lt_handle, LT_S_ONEDGE_START, msg->lt_onedge_start());
-        lt_buffer->StampAt(lt_handle, LT_S_READV_START, msg->lt_readv_start());
+        lt_buffer->StampAt(lt_handle, LT_S_READ_START, msg->lt_read_start());
         lt_buffer->StampAt(lt_handle, LT_S_MSG_RECV_DONE, msg->lt_msg_recv_done());
         lt_buffer->StampAt(lt_handle, LT_S_REQ_META_DESER_START,
                             lt_req_meta_deser_start);
@@ -1121,7 +1121,7 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         const LatencyTraceHandle lt_handle = lt_response_handle;
         lt_buffer->StampAt(lt_handle, LT_C_WAKE, msg->lt_wake());
         lt_buffer->StampAt(lt_handle, LT_C_ONEDGE_START, msg->lt_onedge_start());
-        lt_buffer->StampAt(lt_handle, LT_C_READV_START, msg->lt_readv_start());
+        lt_buffer->StampAt(lt_handle, LT_C_READ_START, msg->lt_read_start());
         lt_buffer->StampAt(lt_handle, LT_C_MSG_RECV_DONE, msg->lt_msg_recv_done());
         lt_buffer->StampAt(lt_handle, LT_C_RSP_META_DESER_START,
                             lt_rsp_meta_deser_start);

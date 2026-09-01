@@ -106,13 +106,13 @@ LT_ROLE_SERVER = 1
 (
     C_RPC_START, C_REQ_PAYLOAD_SER_START, C_REQ_PAYLOAD_SER_END,
     C_REQ_META_SER_START, C_REQ_META_SER_END, C_WRITE_ENQUEUE,
-    C_WRITE_START, C_WRITE_END, C_WAKE, C_ONEDGE_START, C_READV_START,
+    C_WRITE_START, C_WRITE_END, C_WAKE, C_ONEDGE_START, C_READ_START,
     C_MSG_RECV_DONE, C_RSP_META_DESER_START, C_RSP_META_DESER_END,
     C_RSP_PAYLOAD_DESER_START, C_RSP_PAYLOAD_DESER_END, C_RPC_END,
 ) = range(17)
 
 (
-    S_WAKE, S_ONEDGE_START, S_READV_START, S_MSG_RECV_DONE,
+    S_WAKE, S_ONEDGE_START, S_READ_START, S_MSG_RECV_DONE,
     S_REQ_META_DESER_START, S_REQ_META_DESER_END,
     S_REQ_PAYLOAD_DESER_START, S_REQ_PAYLOAD_DESER_END,
     S_SERVICE_START, S_SERVICE_END, S_RSP_PAYLOAD_SER_START,
@@ -129,11 +129,11 @@ POINT_NAMES = {
     C_REQ_META_SER_END: "C05_req_meta_ser_end", C_WRITE_ENQUEUE: "C06_write_enqueue",
     C_WRITE_START: "C07_write_start", C_WRITE_END: "C08_write_end",
     C_WAKE: "C09_wake", C_ONEDGE_START: "C10_onedge_start",
-    C_READV_START: "C11_readv_start", C_MSG_RECV_DONE: "C12_msg_recv_done",
+    C_READ_START: "C11_read_start", C_MSG_RECV_DONE: "C12_msg_recv_done",
     C_RSP_META_DESER_START: "C13_rsp_meta_deser_start", C_RSP_META_DESER_END: "C14_rsp_meta_deser_end",
     C_RSP_PAYLOAD_DESER_START: "C15_rsp_payload_deser_start", C_RSP_PAYLOAD_DESER_END: "C16_rsp_payload_deser_end",
     C_RPC_END: "C17_rpc_end",
-    S_WAKE: "S01_wake", S_ONEDGE_START: "S02_onedge_start", S_READV_START: "S03_readv_start",
+    S_WAKE: "S01_wake", S_ONEDGE_START: "S02_onedge_start", S_READ_START: "S03_read_start",
     S_MSG_RECV_DONE: "S04_msg_recv_done", S_REQ_META_DESER_START: "S05_req_meta_deser_start",
     S_REQ_META_DESER_END: "S06_req_meta_deser_end", S_REQ_PAYLOAD_DESER_START: "S07_req_payload_deser_start",
     S_REQ_PAYLOAD_DESER_END: "S08_req_payload_deser_end", S_SERVICE_START: "S09_service_start",
@@ -158,13 +158,24 @@ DECOMPOSITION_ITEMS_CLIENT_SEND = [
     ("cli_req_meta_ser", C_REQ_META_SER_START, C_REQ_META_SER_END, True),
     ("cli_pack_to_write", C_REQ_META_SER_END, C_WRITE_ENQUEUE, False),
     ("cli_write_queue", C_WRITE_ENQUEUE, C_WRITE_START, True),
-    ("cli_write_syscall", C_WRITE_START, C_WRITE_END, True),
+    ("cli_write", C_WRITE_START, C_WRITE_END, True),
 ]
 
+# On `cli_read`/`srv_read` and `cli_write`/`srv_write`: these bound the
+# transport moving the bytes, and are deliberately named for that rather
+# than for how it is done. The write pair brackets
+# `_conn->CutMessageIntoFileDescriptor` / `_transport->CutFromIOBufList`
+# and the read pair the `DoRead` in `InputMessenger::OnNewMessages` --
+# which is writev/readv only on plain TCP. Under RDMA the same intervals
+# cover `ibv_post_send` and an RdmaEndpoint read, neither of which is a
+# syscall at all, and SSL takes a third path. They were once called
+# `*_readv` and `*_write_syscall`; both names promised a mechanism the
+# interval does not have, and they did not even promise it in the same
+# style as each other.
 DECOMPOSITION_ITEMS_SERVER = [
     ("srv_wake_to_onedge", S_WAKE, S_ONEDGE_START, True),
-    ("srv_onedge_to_readv", S_ONEDGE_START, S_READV_START, True),
-    ("srv_readv", S_READV_START, S_MSG_RECV_DONE, True),
+    ("srv_onedge_to_read", S_ONEDGE_START, S_READ_START, True),
+    ("srv_read", S_READ_START, S_MSG_RECV_DONE, True),
     ("srv_recv_to_deser", S_MSG_RECV_DONE, S_REQ_META_DESER_START, True),
     ("srv_req_meta_deser", S_REQ_META_DESER_START, S_REQ_META_DESER_END, True),
     ("srv_dispatch", S_REQ_META_DESER_END, S_REQ_PAYLOAD_DESER_START, False),
@@ -177,13 +188,13 @@ DECOMPOSITION_ITEMS_SERVER = [
     ("srv_rsp_meta_ser", S_RSP_META_SER_START, S_RSP_META_SER_END, True),
     ("srv_pack_to_write", S_RSP_META_SER_END, S_WRITE_ENQUEUE, False),
     ("srv_write_queue", S_WRITE_ENQUEUE, S_WRITE_START, True),
-    ("srv_write_syscall", S_WRITE_START, S_WRITE_END, True),
+    ("srv_write", S_WRITE_START, S_WRITE_END, True),
 ]
 
 DECOMPOSITION_ITEMS_CLIENT_RECV = [
     ("cli_wake_to_onedge", C_WAKE, C_ONEDGE_START, True),
-    ("cli_onedge_to_readv", C_ONEDGE_START, C_READV_START, True),
-    ("cli_readv", C_READV_START, C_MSG_RECV_DONE, True),
+    ("cli_onedge_to_read", C_ONEDGE_START, C_READ_START, True),
+    ("cli_read", C_READ_START, C_MSG_RECV_DONE, True),
     ("cli_recv_to_deser", C_MSG_RECV_DONE, C_RSP_META_DESER_START, True),
     ("cli_rsp_meta_deser", C_RSP_META_DESER_START, C_RSP_META_DESER_END, True),
     ("cli_lookup_cntl", C_RSP_META_DESER_END, C_RSP_PAYLOAD_DESER_START, False),
@@ -202,8 +213,8 @@ assert len(DECOMPOSITION_ITEMS_31) == 31
 # Names of the 4 items that are N/A (not 0) under RDMA polling mode --
 # design doc sec.8.5.
 NA_UNDER_POLLING = {
-    "cli_wake_to_onedge", "cli_onedge_to_readv",
-    "srv_wake_to_onedge", "srv_onedge_to_readv",
+    "cli_wake_to_onedge", "cli_onedge_to_read",
+    "srv_wake_to_onedge", "srv_onedge_to_read",
 }
 
 # Full 33-item canonical order (design doc sec.5): 7 client-send + link_up
@@ -627,17 +638,17 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
     # link_total None for every polling-mode record, silently dropping
     # both link items AND the identity check for the entire capture. The
     # design doc's fix is exact, not an approximation: under polling,
-    # wake/onedge_start/readv_start are the SAME instant (those two
-    # intervals are genuinely zero), so substituting readv_start (C11 /
+    # wake/onedge_start/read_start are the SAME instant (those two
+    # intervals are genuinely zero), so substituting read_start (C11 /
     # S03 -- still a real timestamp under polling, see sec.8.5's table)
     # for wake (C09 / S01) reproduces the same RTT/S/link_total/identity
     # algebra as the non-polling case: cli_wake_to_onedge and
-    # cli_onedge_to_readv (srv_ likewise) are still correctly N/A (0) in
+    # cli_onedge_to_read (srv_ likewise) are still correctly N/A (0) in
     # `items` above, and the telescoping sum still lands on C17-C01
     # exactly because the same substitute point is used on both sides of
     # the identity (see the fix-round report for the worked-out algebra).
     c09_kind, _ = cpts[C_WAKE]
-    c09 = c_ns.get(C_READV_START) if c09_kind == "na" else c_ns.get(C_WAKE)
+    c09 = c_ns.get(C_READ_START) if c09_kind == "na" else c_ns.get(C_WAKE)
     c08 = c_ns.get(C_WRITE_END)
     negative_rtt = False
     rtt = None
@@ -645,16 +656,16 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
         rtt = c09 - c08
         # The negative-RTT write-stamp-anomaly reason is specifically
         # about the ordinary (non-polling) C09 vs C08 relationship
-        # (design doc sec.8.4/10.1); don't fire it off the readv_start
+        # (design doc sec.8.4/10.1); don't fire it off the read_start
         # substitute, which has a different, non-anomalous relationship
-        # to C08 (readv_start is a receive-side event, not a response to
+        # to C08 (read_start is a receive-side event, not a response to
         # this request's own write at all under polling).
         if rtt < 0 and c09_kind != "na":
             negative_rtt = True
             reasons.add(REJECT_NEGATIVE_RTT_LATE_WRITE_STAMP)
 
     s01_kind, _ = spts[S_WAKE]
-    s01 = s_ns.get(S_READV_START) if s01_kind == "na" else s_ns.get(S_WAKE)
+    s01 = s_ns.get(S_READ_START) if s01_kind == "na" else s_ns.get(S_WAKE)
     s17 = s_ns.get(S_WRITE_END)
     srv_span = None
     if s01 is not None and s17 is not None:
@@ -733,7 +744,7 @@ def merge_one(client_rec, server_rec, client_scale, server_scale, methods_client
         "any_negative_item": any_negative_item,
         "saturated_items": saturated_items,
         "unstamped_points": unstamped_points,
-        # The (possibly readv_start-substituted, under RDMA polling mode --
+        # The (possibly read_start-substituted, under RDMA polling mode --
         # see the comment above rtt's computation) anchors actually used
         # for rtt/srv_span/link_total. Model B's a/b/c/d (apply_model_b(),
         # estimate_offsets_model_b()) MUST read these rather than
@@ -849,9 +860,9 @@ def apply_model_b(joined_entry):
         m["link_down_b_ns"] = None
         return
     a = m["c_ns"][C_WRITE_END]
-    b = m["s01_anchor_ns"]  # S01, or its readv_start substitute under RDMA polling
+    b = m["s01_anchor_ns"]  # S01, or its read_start substitute under RDMA polling
     c = m["s_ns"][S_WRITE_END]
-    d = m["c09_anchor_ns"]  # C09, or its readv_start substitute under RDMA polling
+    d = m["c09_anchor_ns"]  # C09, or its read_start substitute under RDMA polling
     link_up_b = (b + O) - a
     link_down_b = d - (c + O)
     m["link_up_b_ns"] = link_up_b

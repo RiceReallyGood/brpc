@@ -263,7 +263,7 @@ TEST_F(LatencyTraceBufferTest, StampWritesNonZeroDelta) {
 
 TEST_F(LatencyTraceBufferTest, StampIsFirstWriteWins) {
     // The property design doc sec.10.1 requires for instantaneous-event
-    // points (the default, and every point except write_start/readv_start
+    // points (the default, and every point except write_start/read_start
     // -- see StampLastIsLastWriteWins below for that pair): a point
     // already holding a non-zero value is left alone, and a later write
     // is discarded. Using LT_C_RPC_END here deliberately -- an
@@ -1402,7 +1402,7 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
         { brpc::LT_C_REQ_META_SER_START,    brpc::LT_C_REQ_META_SER_END,     "cli_req_meta_ser" },
         { brpc::LT_C_REQ_META_SER_END,      brpc::LT_C_WRITE_ENQUEUE,        "cli_pack_to_write" },
         { brpc::LT_C_WRITE_ENQUEUE,         brpc::LT_C_WRITE_START,          "cli_write_queue" },
-        { brpc::LT_C_WRITE_START,           brpc::LT_C_WRITE_END,            "cli_write_syscall" },
+        { brpc::LT_C_WRITE_START,           brpc::LT_C_WRITE_END,            "cli_write" },
     };
     for (const auto& it : kClientItems) {
         ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
@@ -1411,8 +1411,8 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
     // 16 server items (S01-S17, sec.5.2).
     static const struct { int lo, hi; const char* name; } kServerItems[] = {
         { brpc::LT_S_WAKE,                  brpc::LT_S_ONEDGE_START,          "srv_wake_to_onedge" },
-        { brpc::LT_S_ONEDGE_START,          brpc::LT_S_READV_START,           "srv_onedge_to_readv" },
-        { brpc::LT_S_READV_START,           brpc::LT_S_MSG_RECV_DONE,         "srv_readv" },
+        { brpc::LT_S_ONEDGE_START,          brpc::LT_S_READ_START,           "srv_onedge_to_read" },
+        { brpc::LT_S_READ_START,           brpc::LT_S_MSG_RECV_DONE,         "srv_read" },
         { brpc::LT_S_MSG_RECV_DONE,         brpc::LT_S_REQ_META_DESER_START,  "srv_recv_to_deser" },
         { brpc::LT_S_REQ_META_DESER_START,  brpc::LT_S_REQ_META_DESER_END,    "srv_req_meta_deser" },
         { brpc::LT_S_REQ_META_DESER_END,    brpc::LT_S_REQ_PAYLOAD_DESER_START, "srv_dispatch" },
@@ -1425,7 +1425,7 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
         { brpc::LT_S_RSP_META_SER_START,    brpc::LT_S_RSP_META_SER_END,      "srv_rsp_meta_ser" },
         { brpc::LT_S_RSP_META_SER_END,      brpc::LT_S_WRITE_ENQUEUE,         "srv_pack_to_write" },
         { brpc::LT_S_WRITE_ENQUEUE,         brpc::LT_S_WRITE_START,           "srv_write_queue" },
-        { brpc::LT_S_WRITE_START,           brpc::LT_S_WRITE_END,             "srv_write_syscall" },
+        { brpc::LT_S_WRITE_START,           brpc::LT_S_WRITE_END,             "srv_write" },
     };
     for (const auto& it : kServerItems) {
         ASSERT_GE((int64_t)s->ts[it.hi] - (int64_t)s->ts[it.lo], 0) << it.name;
@@ -1435,8 +1435,8 @@ TEST(LatencyTraceE2ETest, AllDecompositionItemsNonNegativeAtOutstandingOne) {
     // cli_post_deser/cli_callback/cli_rpc_finish into one item).
     static const struct { int lo, hi; const char* name; } kClientRecvItems[] = {
         { brpc::LT_C_WAKE,                  brpc::LT_C_ONEDGE_START,          "cli_wake_to_onedge" },
-        { brpc::LT_C_ONEDGE_START,          brpc::LT_C_READV_START,           "cli_onedge_to_readv" },
-        { brpc::LT_C_READV_START,           brpc::LT_C_MSG_RECV_DONE,         "cli_readv" },
+        { brpc::LT_C_ONEDGE_START,          brpc::LT_C_READ_START,           "cli_onedge_to_read" },
+        { brpc::LT_C_READ_START,           brpc::LT_C_MSG_RECV_DONE,         "cli_read" },
         { brpc::LT_C_MSG_RECV_DONE,         brpc::LT_C_RSP_META_DESER_START,  "cli_recv_to_deser" },
         { brpc::LT_C_RSP_META_DESER_START,  brpc::LT_C_RSP_META_DESER_END,    "cli_rsp_meta_deser" },
         { brpc::LT_C_RSP_META_DESER_END,    brpc::LT_C_RSP_PAYLOAD_DESER_START, "cli_lookup_cntl" },
@@ -1695,7 +1695,7 @@ static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
         { brpc::LT_C_REQ_META_SER_START,    brpc::LT_C_REQ_META_SER_END,      "cli_req_meta_ser" },
         { brpc::LT_C_REQ_META_SER_END,      brpc::LT_C_WRITE_ENQUEUE,         "cli_pack_to_write" },
         { brpc::LT_C_WRITE_ENQUEUE,         brpc::LT_C_WRITE_START,           "cli_write_queue" },
-        { brpc::LT_C_WRITE_START,           brpc::LT_C_WRITE_END,             "cli_write_syscall" },
+        { brpc::LT_C_WRITE_START,           brpc::LT_C_WRITE_END,             "cli_write" },
     };
     for (const auto& it : kClientItems) {
         ASSERT_GE((int64_t)c->ts[it.hi] - (int64_t)c->ts[it.lo], 0) << it.name;
@@ -1703,8 +1703,8 @@ static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
 
     static const struct { int lo, hi; const char* name; } kServerItems[] = {
         { brpc::LT_S_WAKE,                   brpc::LT_S_ONEDGE_START,           "srv_wake_to_onedge" },
-        { brpc::LT_S_ONEDGE_START,           brpc::LT_S_READV_START,            "srv_onedge_to_readv" },
-        { brpc::LT_S_READV_START,            brpc::LT_S_MSG_RECV_DONE,          "srv_readv" },
+        { brpc::LT_S_ONEDGE_START,           brpc::LT_S_READ_START,            "srv_onedge_to_read" },
+        { brpc::LT_S_READ_START,            brpc::LT_S_MSG_RECV_DONE,          "srv_read" },
         { brpc::LT_S_MSG_RECV_DONE,          brpc::LT_S_REQ_META_DESER_START,   "srv_recv_to_deser" },
         { brpc::LT_S_REQ_META_DESER_START,   brpc::LT_S_REQ_META_DESER_END,     "srv_req_meta_deser" },
         { brpc::LT_S_REQ_META_DESER_END,     brpc::LT_S_REQ_PAYLOAD_DESER_START, "srv_dispatch" },
@@ -1717,7 +1717,7 @@ static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
         { brpc::LT_S_RSP_META_SER_START,     brpc::LT_S_RSP_META_SER_END,       "srv_rsp_meta_ser" },
         { brpc::LT_S_RSP_META_SER_END,       brpc::LT_S_WRITE_ENQUEUE,          "srv_pack_to_write" },
         { brpc::LT_S_WRITE_ENQUEUE,          brpc::LT_S_WRITE_START,            "srv_write_queue" },
-        { brpc::LT_S_WRITE_START,            brpc::LT_S_WRITE_END,              "srv_write_syscall" },
+        { brpc::LT_S_WRITE_START,            brpc::LT_S_WRITE_END,              "srv_write" },
     };
     for (const auto& it : kServerItems) {
         ASSERT_GE((int64_t)s->ts[it.hi] - (int64_t)s->ts[it.lo], 0) << it.name;
@@ -1725,8 +1725,8 @@ static void AssertAllWeightBearingInvariants(const brpc::LatencyTraceRecord* c,
 
     static const struct { int lo, hi; const char* name; } kClientRecvItems[] = {
         { brpc::LT_C_WAKE,                    brpc::LT_C_ONEDGE_START,           "cli_wake_to_onedge" },
-        { brpc::LT_C_ONEDGE_START,            brpc::LT_C_READV_START,            "cli_onedge_to_readv" },
-        { brpc::LT_C_READV_START,             brpc::LT_C_MSG_RECV_DONE,          "cli_readv" },
+        { brpc::LT_C_ONEDGE_START,            brpc::LT_C_READ_START,            "cli_onedge_to_read" },
+        { brpc::LT_C_READ_START,             brpc::LT_C_MSG_RECV_DONE,          "cli_read" },
         { brpc::LT_C_MSG_RECV_DONE,           brpc::LT_C_RSP_META_DESER_START,   "cli_recv_to_deser" },
         { brpc::LT_C_RSP_META_DESER_START,    brpc::LT_C_RSP_META_DESER_END,     "cli_rsp_meta_deser" },
         { brpc::LT_C_RSP_META_DESER_END,      brpc::LT_C_RSP_PAYLOAD_DESER_START, "cli_lookup_cntl" },
@@ -2795,7 +2795,7 @@ TEST(LatencyTraceMetaTest, DumpMethodTableResolvesRecordedMethodId) {
 // socket's edge-triggered callback is RdmaEndpoint::PollCq
 // (src/brpc/rdma/rdma_endpoint.cpp), which only rejoins the TCP path at the
 // shared ProcessNewMessage() call (already covered by Task 9's threading of
-// Socket::_lt_wake/_lt_onedge_start/_lt_readv_start through
+// Socket::_lt_wake/_lt_onedge_start/_lt_read_start through
 // InputMessageBase). Under -rdma_use_polling a standalone poller thread
 // calls PollCq directly in a loop: there is no epoll wake-up and no OnEdge
 // bthread switch, so `wake`/`onedge_start` do not physically exist and must
@@ -2871,9 +2871,9 @@ TEST(LatencyTraceRdmaTest, ReceivePathStampsWakeOnedgeReadv) {
     const brpc::LatencyTraceRecord* s = FindServerRecordForTest();
     ASSERT_TRUE(s != nullptr);
 
-    // readv_start exists in both modes -- see design doc sec.8.5's table.
-    ASSERT_GT(s->ts[brpc::LT_S_READV_START], 0u);
-    ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_READV_START]);
+    // read_start exists in both modes -- see design doc sec.8.5's table.
+    ASSERT_GT(s->ts[brpc::LT_S_READ_START], 0u);
+    ASSERT_NE(brpc::LT_TS_NOT_APPLICABLE, s->ts[brpc::LT_S_READ_START]);
 
     // Fix-round item 1 regression coverage. S09 (LT_S_SERVICE_START) is
     // written through plain Stamp() (see baidu_rpc_protocol.cpp and design
@@ -2931,7 +2931,7 @@ TEST(LatencyTraceRdmaTest, ReceivePathStampsWakeOnedgeReadv) {
             << "value by StampAt()'s raw<base guard rather than "
             << "genuinely ordered (design doc sec.8.1's RDMA event-mode "
             << "wake paragraph)";
-        ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READV_START]);
+        ASSERT_LE(s->ts[brpc::LT_S_ONEDGE_START], s->ts[brpc::LT_S_READ_START]);
     }
 
     server.Stop(0);

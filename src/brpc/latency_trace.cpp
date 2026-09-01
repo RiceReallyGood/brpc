@@ -411,7 +411,7 @@ void LatencyTraceBuffer::Stamp(LatencyTraceHandle h, int point) {
     // that event fired twice, which is a bug, and the first (correct) one
     // must not be clobbered by it. NOT every point uses this policy: the
     // "start of the operation that actually completed this unit" points
-    // (write_start, readv_start) are deliberately re-entered while earlier,
+    // (write_start, read_start) are deliberately re-entered while earlier,
     // unrelated attempts drain other units ahead of this one in the same
     // queue -- see StampLast() and design doc sec.10.1 for that pair and
     // why last-write-wins is the correct policy for them specifically.
@@ -433,7 +433,7 @@ void LatencyTraceBuffer::StampLast(LatencyTraceHandle h, int point) {
     // Last-write-wins -- the opposite policy from Stamp(), and just as
     // deliberate. write_start (Socket::DoWrite, re-entered by KeepWrite
     // for a request that needs more than one writev -- EAGAIN,
-    // backpressure, a batch capped by DATA_LIST_MAX) and readv_start
+    // backpressure, a batch capped by DATA_LIST_MAX) and read_start
     // (InputMessenger::OnNewMessages, re-entered on every DoRead while the
     // message being assembled is still incomplete) both name "the start
     // of the operation that actually completed this unit", not "the first

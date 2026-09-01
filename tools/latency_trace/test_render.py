@@ -93,14 +93,14 @@ class TestSyntheticNegativeAndNA(unittest.TestCase):
 
     def test_record_b_has_na_items_in_the_blob(self):
         # Record B: RDMA polling client -> cli_wake_to_onedge and
-        # cli_onedge_to_readv are both N/A (design doc sec.8.5). This is
+        # cli_onedge_to_read are both N/A (design doc sec.8.5). This is
         # the byte pattern the dashed-tick / "N/A" tooltip path
         # (drawOneBar's seg.isNA branch) keys off of.
         row = self._row("0xb000000000000002")
         layout = self.ir["record_layout"]
         na = self.ir["na_sentinel_i32"]
         self.assertEqual(row[layout.index("cli_wake_to_onedge")], na)
-        self.assertEqual(row[layout.index("cli_onedge_to_readv")], na)
+        self.assertEqual(row[layout.index("cli_onedge_to_read")], na)
         # But link_total/link items are real numbers (the RDMA-polling
         # fix's whole point) -- NOT also N/A.
         self.assertNotEqual(row[layout.index("link_up_model_a")], na)
