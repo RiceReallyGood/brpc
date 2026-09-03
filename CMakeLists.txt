@@ -31,6 +31,7 @@ option(WITH_UBRING "With UB" OFF)
 option(WITH_DEBUG_BTHREAD_SCHE_SAFETY "With debugging bthread sche safety" OFF)
 option(WITH_DEBUG_LOCK "With debugging lock" OFF)
 option(WITH_CPU_FREQUENCY "Use CPU frequency for cpuwide_time" OFF)
+option(WITH_LATENCY_TRACE "With per-request latency trace instrumentation" OFF)
 option(WITH_ASAN "With AddressSanitizer" OFF)
 option(BUILD_UNIT_TESTS "Whether to build unit tests" OFF)
 option(BUILD_FUZZ_TESTS "Whether to build fuzz tests" OFF)
@@ -174,6 +175,15 @@ list(APPEND BRPC_COMMON_DEFINITIONS
     __STDC_CONSTANT_MACROS
     __STRICT_ANSI__
 )
+
+# BRPC_LATENCY_TRACE must stay entirely UNDEFINED (not merely defined as 0)
+# when the switch is off: latency_trace.h guards LT_STAMP/LT_ALLOC with
+# `#if defined(BRPC_LATENCY_TRACE)`, so listing it unconditionally as
+# BRPC_LATENCY_TRACE=${VAL} like the flags above would flip that check to
+# true and defeat the switch. Append it only in the ON branch.
+if(WITH_LATENCY_TRACE)
+    list(APPEND BRPC_COMMON_DEFINITIONS BRPC_LATENCY_TRACE=1)
+endif()
 
 if(NOT DEBUG)
     list(APPEND BRPC_COMMON_DEFINITIONS NDEBUG)

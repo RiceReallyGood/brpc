@@ -42,6 +42,12 @@ config_setting(
     visibility = ["//visibility:public"],
 )
 
+config_setting(
+    name = "brpc_with_latency_trace",
+    define_values = {"BRPC_LATENCY_TRACE": "true"},
+    visibility = ["//visibility:public"],
+)
+
 selects.config_setting_group(
     name = "brpc_with_mesalink",
     match_any = [

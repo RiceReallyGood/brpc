@@ -66,6 +66,14 @@ DEFINES = [
  }) + select({
     "//bazel/config:brpc_with_cpu_frequency": ["BUTIL_USE_CPU_FREQUENCY=1"],
     "//conditions:default": ["BUTIL_USE_CPU_FREQUENCY=0"],
+}) + select({
+    # BRPC_LATENCY_TRACE must stay entirely UNDEFINED (not merely defined as
+    # 0) in the default branch: latency_trace.h guards LT_STAMP/LT_ALLOC with
+    # `#if defined(BRPC_LATENCY_TRACE)`, so a "BRPC_LATENCY_TRACE=0" default
+    # like the two selects above would flip that check to true and defeat the
+    # switch. Enable with `--config=latency_trace` (see .bazelrc).
+    "//bazel/config:brpc_with_latency_trace": ["BRPC_LATENCY_TRACE=1"],
+    "//conditions:default": [],
 })
 
 LINKOPTS = [

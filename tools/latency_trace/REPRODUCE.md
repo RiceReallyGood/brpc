@@ -46,27 +46,56 @@ python3 render.py --client testdata/client.dump --server testdata/server.dump -o
 （`WriteRequest` 保持 64 字节，`BAIDU_CASSERT` 那条断言照常成立）。开关打开后
 该结构体扩到 128 字节。
 
+三种构建方式都支持这个开关，做的事情完全一样：往编译命令里加
+`-DBRPC_LATENCY_TRACE=1`。
+
 ```bash
+# Make
 ./config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-latency-trace
 make -j$(nproc)
+
+# CMake（用一个独立的 build 目录，别和默认构建共用）
+mkdir build-lt && cd build-lt
+cmake -DCMAKE_BUILD_TYPE=Release -DWITH_LATENCY_TRACE=ON ..
+make -j$(nproc)
+# 要跑单测再加 -DBUILD_UNIT_TESTS=ON，然后 make brpc_latency_trace_unittest
+
+# Bazel
+bazel build --config=latency_trace -- //:brpc
+# 单测同理（不带 --config 只跑 26/46 个：20 个打点用例被 #if 掉，仍然显示全绿）：
+bazel test --config=latency_trace //test:brpc_latency_trace_unittest
 ```
 
-`--with-latency-trace` 会在 `config.mk` 里加上 `-DBRPC_LATENCY_TRACE=1`。
+`--config=latency_trace` 是 `.bazelrc` 里的别名，展开成
+`--define BRPC_LATENCY_TRACE=true`；直接手写这个 `--define` 等价。
 
 ⚠️ **三件必须知道的事：**
 
-1. **只有 Make 支持这个开关。** CMake 和 Bazel 没有对应选项 —— 用它们构建出来的
-   是无打点版本，且不会报错。
+1. **不带开关构建不会报错，只是没有打点。** 三种构建方式的默认值都是关闭，
+   忘了传开关的症状是 dump 文件为空，而不是编译失败。
 2. **开关改变了头文件里的结构体大小。** 同一棵树上来回切换配置而不 `make clean`，
-   后果是**运行时堆损坏，不是编译错误**。所以建议：**一种配置一棵树**，不要原地切。
+   后果是**运行时堆损坏，不是编译错误**。所以 Make 和 CMake 都要**一种配置一棵树**
+   （CMake 用两个 build 目录），不要原地切。Bazel 不受此影响 —— `--define` 是
+   action key 的一部分，换配置会自动重建。
 3. 关闭时 `BRPC_LATENCY_TRACE` 必须**完全不定义**，而不是定义成 0 ——
-   宏用的是 `#if defined(...)`，写成 `=0` 反而会把打点打开。`config_brpc.sh` 已按此处理。
+   宏用的是 `#if defined(...)`，写成 `=0` 反而会把打点打开。三处开关
+   （`config_brpc.sh`、`CMakeLists.txt`、`BUILD.bazel` 的 `DEFINES`）都已按此处理：
+   关闭分支是「什么都不加」，不是「加 `=0`」。
 
 验证这次真的构建出了打点版本（别只信退出码）：
 
 ```bash
-nm libbrpc.a | grep -q LatencyTraceBuffer && echo "TRACED" || echo "default"
+nm -C libbrpc.a | grep -q "U .*LatencyTraceBuffer::Stamp" && echo "TRACED" || echo "default"
+# Make:   ./libbrpc.a
+# CMake:  build-lt/output/lib/libbrpc.a
+# Bazel:  bazel-bin/libbrpc.a
 ```
+
+必须看**未定义引用**（`U`），也就是「有没有调用点」。光 `grep LatencyTraceBuffer`
+是判不出来的：`latency_trace.cpp` 没有顶层 `#if` 保护，默认构建照样把它编进去，
+所以两种构建里 `LatencyTraceBuffer` 的**定义**都在。开关真正改变的是
+`socket.cpp` / `controller.cpp` 这些**调用点**里 `LT_STAMP` 是否展开成真实调用 ——
+关闭时它们是 `((void)0)`，`socket.cpp.o` 里一条 `Stamp` 引用都没有。
 
 ---
 
@@ -299,7 +328,9 @@ python3 test_merge.py && python3 test_render.py     # 42 个测试
 | 页面写着 100% join 却总觉得少 | 缓冲溢出 | 看 `dropped_count` 告警 |
 | 图上完全没有链路段 | RDMA 轮询模式 | 已有等价锚点回退，确认用当前版本 |
 | 某段柱子恰好 2.147 秒 | 时间戳溢出饱和 | 页面会标为**下界**，真实值更大 |
-| CMake 构建出来没有打点 | 开关只支持 Make | 用 `config_brpc.sh --with-latency-trace` |
+| 构建出来没有打点 | 忘了传开关（默认关闭，且不报错） | Make `--with-latency-trace` / CMake `-DWITH_LATENCY_TRACE=ON` / Bazel `--config=latency_trace` |
+| `nm \| grep LatencyTraceBuffer` 有结果但其实没打点 | 该模块在默认构建里也照样链接 | 改判 `U ...::Stamp` 这个未定义引用，见 §1 |
+| Bazel 报 `.pb.h ... newer version of protoc` | 树里残留了 Make 生成的 `*.pb.h` | 在干净的树上跑 bazel，或先删掉源码树里的 `*.pb.h`/`*.pb.cc` |
 
 ---
 

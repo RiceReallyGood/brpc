@@ -63,6 +63,8 @@ tar czf - \
     --exclude='*.pb.cc' \
     --exclude='*.pb.h' \
     src test tools Makefile config_brpc.sh CMakeLists.txt \
+    cmake config.h.in RELEASE_VERSION \
+    .bazelrc BUILD.bazel MODULE.bazel WORKSPACE WORKSPACE.bzlmod bazel registry \
   | ssh "$HOST" "mkdir -p \"$DEST\" && tar xzf - -C \"$DEST\" && \
        cd \"$DEST\" && find src test tools -type f -newermt '-180 seconds' \
          -exec touch {} + 2>/dev/null; true"

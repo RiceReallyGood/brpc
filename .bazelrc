@@ -89,3 +89,14 @@ build:macos-asan --dynamic_mode=off
 test:asan --test_env=ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1
 
 build:ubring --define BRPC_WITH_UBRING=true
+
+# Per-request latency trace instrumentation (src/brpc/latency_trace.h).
+# Off by default. The define changes the layout of Socket::WriteRequest and
+# friends, but it is build-wide (part of every action key), so there is no
+# way to end up with a half-traced binary -- the only failure mode is
+# forgetting it, which builds a silently untraced library and still leaves
+# //test:brpc_latency_trace_unittest green -- the 20 cases that exercise the
+# instrumentation are behind #if defined(BRPC_LATENCY_TRACE) and simply do
+# not exist (26 of 46 run). Pass it to `bazel test` too, e.g.
+# `bazel test --config=latency_trace //test:brpc_latency_trace_unittest`.
+build:latency_trace --define BRPC_LATENCY_TRACE=true
